@@ -21,7 +21,7 @@ FRIEND_2_ID = 5544021969     # ID von Ali
 ERLAUBTE_USER = {ADMIN_ID, FRIEND_1_ID, FRIEND_2_ID}
 active_alerts = {}
 
-# Kostenlose Cloud-Datenbank URL (Basiert auf deiner Admin-ID, absolut sicher und anonym!)
+# Kostenlose Cloud-Datenbank URL
 DATABASE_URL = f"https://kvdb.io/Trade786Bot_SecureBucket_{ADMIN_ID}/active_alerts"
 
 # Namens-Mapping
@@ -31,41 +31,36 @@ USER_NAMES = {
     FRIEND_2_ID: "Ali"
 }
 
-# --- CLOUD SPEICHER FUNKTIONEN (100% KOSTENLOS & AUTOMATISCH) ---
+# --- CLOUD SPEICHER FUNKTIONEN ---
 def load_alerts():
-    """Lädt die aktiven Alarme beim Starten des Bots aus dem kostenlosen Cloud-Speicher."""
     global active_alerts
     try:
         response = requests.get(DATABASE_URL, timeout=8)
         if response.status_code == 200:
             loaded = response.json()
-            # JSON-Keys wieder in Integers (chat_id) umwandeln
             active_alerts = {int(k): v for k, v in loaded.items()}
             logging.info("Alarme erfolgreich aus der Cloud geladen!")
         elif response.status_code == 404:
-            # Noch keine Alarme gespeichert
             active_alerts = {}
-            logging.info("Keine alten Alarme in der Cloud gefunden (sauberer Start).")
+            logging.info("Keine alten Alarme in der Cloud gefunden.")
         else:
-            logging.error(f"Fehler beim Laden aus der Cloud. Status: {response.status_code}")
+            logging.error(f"Fehler beim Laden. Status: {response.status_code}")
             active_alerts = {}
     except Exception as e:
-        logging.error(f"Verbindungsfehler beim Laden der Alarme: {e}")
+        logging.error(f"Verbindungsfehler beim Laden: {e}")
         active_alerts = {}
 
 def save_alerts():
-    """Speichert alle aktuellen Alarme verschlüsselt im kostenlosen Cloud-Speicher."""
     try:
         headers = {'Content-type': 'application/json'}
-        # Konvertiere Chat-IDs zu Strings für JSON-Kompatibilität
         data_to_send = {str(k): v for k, v in active_alerts.items()}
         response = requests.put(DATABASE_URL, data=json.dumps(data_to_send), headers=headers, timeout=8)
         if response.status_code in [200, 201]:
             logging.info("Alarme erfolgreich in der Cloud gesichert!")
         else:
-            logging.error(f"Fehler beim Speichern in der Cloud. Status: {response.status_code}")
+            logging.error(f"Fehler beim Speichern. Status: {response.status_code}")
     except Exception as e:
-        logging.error(f"Verbindungsfehler beim Speichern der Alarme: {e}")
+        logging.error(f"Verbindungsfehler beim Speichern: {e}")
 
 # ---------------------------------------------------------
 
@@ -119,6 +114,15 @@ def generate_progress_bar(current, target, start_price, trade_type):
     bar = (fill_emoji * filled_blocks) + (empty_emoji * empty_blocks)
     return f"{bar} **{percentage}%**"
 
+# --- HILFSFUNKTION FÜR AUTOMATISCHES LÖSCHEN ---
+async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int):
+    """Löscht eine bestimmte Nachricht nach einer Verzögerung (Sekunden)."""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logging.warning(f"Nachricht konnte nicht gelöscht werden (vielleicht bereits manuell gelöscht): {e}")
+
 # --- ADMIN BEFEHLE ---
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -171,12 +175,27 @@ async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    user_message_id = update.message.message_id
+
+    # 1. Schritt: Sofort die getippte "/alarm" Nachricht des Users löschen
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=user_message_id)
+    except Exception as e:
+        logging.warning(f"Konnte User-Befehl nicht löschen: {e}")
+
     alerts = active_alerts.get(chat_id, [])
 
+    # 2. Schritt: Wenn keine Alarme aktiv sind -> "Keine Alarme"-Nachricht für GENAU 5 Sekunden zeigen und löschen!
     if not alerts:
-        await update.message.reply_text("🔔 Aktuell sind **keine** aktiven Alarme für diesen Chat eingerichtet.", parse_mode="Markdown")
+        no_alerts_msg = await update.message.reply_text(
+            "🔔 Aktuell sind **keine** aktiven Alarme für diesen Chat eingerichtet.", 
+            parse_mode="Markdown"
+        )
+        # Lösch-Task starten (5 Sekunden)
+        asyncio.create_task(delete_message_after_delay(context, chat_id, no_alerts_msg.message_id, 5))
         return
 
+    # 3. Schritt: Alarme existieren -> Zeigen für 60 Sekunden (1 Minute)
     text_lines = ["📊 **Aktive Alarme & aktuelle Kurse:**\n"]
     for idx, alert in enumerate(alerts, 1):
         symbol = alert["symbol"]
@@ -211,7 +230,14 @@ async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   📈 To Target: {progress_bar}\n"
             f"   🔗 {img_link}\n"
         )
-    await update.message.reply_text("\n".join(text_lines), parse_mode="Markdown", disable_web_page_preview=True)
+    
+    alerts_msg = await update.message.reply_text(
+        "\n".join(text_lines), 
+        parse_mode="Markdown", 
+        disable_web_page_preview=True
+    )
+    # Lösch-Task starten (60 Sekunden = 1 Minute)
+    asyncio.create_task(delete_message_after_delay(context, chat_id, alerts_msg.message_id, 60))
 
 # --- STANDARDFUNKTIONEN ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -226,7 +252,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ist_erlaubt(update.effective_user.id):
-        return  # Lautlos ignorieren
+        return
 
     chat_id = update.effective_chat.id
     caption = update.message.caption
@@ -289,7 +315,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "created_by": creator_name
         })
     
-    # Sofort in der Cloud sichern!
     save_alerts()
 
 async def price_checker_loop(application: Application):
@@ -329,7 +354,6 @@ async def price_checker_loop(application: Application):
             save_alerts()
 
 async def post_init(application: Application):
-    # Beim Bot-Neustart die Alarme sofort kostenlos aus der Cloud wiederherstellen!
     load_alerts()
     asyncio.create_task(price_checker_loop(application))
 
