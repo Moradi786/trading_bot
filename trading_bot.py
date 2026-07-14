@@ -11,11 +11,13 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # ---------------------------------------------------------
 TOKEN = "8766875036:AAEpSseVagPrhMph_Jr5iwFZusc3QxyLWW4"
-ADMIN_ID = 6147760453  # Deine ID bleibt fest
+ADMIN_ID = 6147760453       # Deine ID (Master-Admin)
+FRIEND_1_ID = 6673849133     # ID von Amiri
+FRIEND_2_ID = 5544021969     # ID von Ali
 # ---------------------------------------------------------
 
-# In-Memory-Liste der erlaubten User
-ERLAUBTE_USER = {ADMIN_ID}
+# In-Memory-Liste der erlaubten User (Ihr drei seid jetzt immer fest drin!)
+ERLAUBTE_USER = {ADMIN_ID, FRIEND_1_ID, FRIEND_2_ID}
 active_alerts = {}
 
 def get_crypto_price(symbol):
