@@ -160,12 +160,21 @@ async def price_checker_loop(application: Application):
 async def post_init(application: Application):
     asyncio.create_task(price_checker_loop(application))
 
-def main():
+async def main():
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
     print("Trading-Bot läuft und überwacht die Märkte...")
-    application.run_polling()
+    
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
