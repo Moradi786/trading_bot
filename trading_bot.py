@@ -2,6 +2,8 @@ import logging
 import asyncio
 import requests
 import re
+import os
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -13,18 +15,17 @@ TOKEN = "8766875036:AAEpSseVagPrhMph_Jr5iwFZusc3QxyLWW4"
 
 active_alerts = {}
 
-# HIER IST DIE NEUE, VERBESSERTE FUNKTION:
 def get_crypto_price(symbol):
     symbol = symbol.upper()
     try:
-        # 1. Versuch: Binance Futures API (für Coins wie HYPEUSDT Perp)
+        # 1. Versuch: Binance Futures API
         url_futures = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
         response = requests.get(url_futures, timeout=5)
         data = response.json()
         if "price" in data:
             return float(data["price"])
             
-        # 2. Versuch: Normaler Binance Spot-Markt (Fallback)
+        # 2. Versuch: Normaler Binance Spot-Markt
         url_spot = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
         response = requests.get(url_spot, timeout=5)
         data = response.json()
@@ -160,7 +161,25 @@ async def price_checker_loop(application: Application):
 async def post_init(application: Application):
     asyncio.create_task(price_checker_loop(application))
 
+# --- DUMMY WEB SERVER FÜR RENDER TIMEOUT-SCHUTZ ---
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render weist dynamisch einen Port über die Umgebungsvariable "PORT" zu (Standard: 10000)
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Web-Server läuft auf Port {port}...")
+
 async def main():
+    # Startet den Web-Server im Hintergrund für Render
+    await start_web_server()
+
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
