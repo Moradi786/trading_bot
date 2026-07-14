@@ -11,7 +11,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # ---------------------------------------------------------
 TOKEN = "8766875036:AAEpSseVagPrhMph_Jr5iwFZusc3QxyLWW4"
-ADMIN_ID = @Mo_radi786  # <--- ERSETZE DIESE ZAHL MIT DEINER ECHTEN TELEGRAM-ID!
+ADMIN_ID = 6147760453  # <--- ERSETZE DIESE ZAHL MIT DEINER ECHTEN TELEGRAM-ID!
 # ---------------------------------------------------------
 
 # In-Memory-Liste der erlaubten User (du bist automatisch immer drin)
