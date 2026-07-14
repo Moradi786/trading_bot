@@ -26,10 +26,12 @@ def save_alerts():
     except: pass
 
 def get_crypto_price(symbol):
-    clean_symbol = symbol.replace("#", "").upper()
+    # Entfernt alle Sonderzeichen und stellt sicher, dass USDT angehängt ist
+    clean_symbol = re.sub(r'[^A-Z0-9]', '', symbol.upper())
     if not clean_symbol.endswith("USDT"): clean_symbol += "USDT"
     try:
-        data = requests.get(f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={clean_symbol}", timeout=5).json()
+        url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={clean_symbol}"
+        data = requests.get(url, timeout=5).json()
         return float(data.get("price", 0.0))
     except: return 0.0
 
@@ -57,12 +59,15 @@ async def status_alerts(update, context):
         pct = (abs(curr - entry) / abs(target - entry) * 100) if abs(target - entry) != 0 else 0
         pct = max(0, min(100, pct))
         
-        # Farbige Balken: 🟩 für Long, 🟥 für Short
+        # Farbige Balken
         bar_char = "🟩" if alert["trade_type"] == "LONG" else "🟥"
         bar = bar_char * int(pct/10) + "⬜" * (10 - int(pct/10))
         icon = "🟢" if alert["trade_type"] == "LONG" else "🔴"
         
-        text.append(f"{idx}. **#{alert['symbol'].replace('USDT', '')}** | BY ( {alert.get('created_by', 'Admin')} )\n"
+        # Symbol bereinigen für die Anzeige
+        display_symbol = re.sub(r'[^A-Z0-9]', '', alert["symbol"].upper()).replace("USDT", "")
+        
+        text.append(f"{idx}. **#{display_symbol}** | BY ( {alert.get('created_by', 'Admin')} )\n"
                     f"{icon} {alert['trade_type']} | 🎯 T: `{target}` | ⚡ Now: `{curr}`\n"
                     f"📈 To Target: {bar} {int(pct)}%\n")
     
@@ -92,7 +97,7 @@ async def handle_photo(update, context):
         msg = await update.message.reply_text(f"✅ {symbol} {dir} Alarm gespeichert!")
         asyncio.create_task(delete_after_delay(context, chat_id, msg.message_id, 30))
 
-# --- START (RENDER STABILISIERT) ---
+# --- START ---
 async def run_bot():
     load_alerts()
     app_bot = Application.builder().token(TOKEN).build()
