@@ -128,18 +128,7 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
     alerts: list[tuple[str, str, float]] = []
     for match in DIRECTION_TARGET_PATTERN.finditer(caption):
         direction, raw_target = match.groups()
-        # Accept both 64,835.0 and 64.835,0, as well as a simple decimal comma.
-        if "," in raw_target and "." in raw_target:
-            if raw_target.rfind(".") > raw_target.rfind(","):
-                normalised_target = raw_target.replace(",", "")
-            else:
-                normalised_target = raw_target.replace(".", "").replace(",", ".")
-        else:
-            normalised_target = raw_target.replace(",", ".")
-        try:
-            target = float(normalised_target)
-        except ValueError:
-            continue
+        target = float(raw_target.replace(",", "."))
         if target > 0:
             alerts.append((symbol, direction.upper(), target))
     return alerts
