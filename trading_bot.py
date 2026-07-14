@@ -16,9 +16,16 @@ FRIEND_1_ID = 6673849133     # ID von Amiri
 FRIEND_2_ID = 5544021969     # ID von Ali
 # ---------------------------------------------------------
 
-# In-Memory-Liste der erlaubten User (Ihr drei seid jetzt immer fest drin!)
+# In-Memory-Liste der erlaubten User
 ERLAUBTE_USER = {ADMIN_ID, FRIEND_1_ID, FRIEND_2_ID}
 active_alerts = {}
+
+# Namens-Mapping für den Fall, dass jemand keinen Telegram-Vornamen gesetzt hat
+USER_NAMES = {
+    ADMIN_ID: "Admin",
+    FRIEND_1_ID: "Amiri",
+    FRIEND_2_ID: "Ali"
+}
 
 def get_crypto_price(symbol):
     symbol = symbol.upper()
@@ -106,12 +113,13 @@ async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = alert["target_price"]
         trade_type = alert["trade_type"]
         emoji = alert["emoji"]
+        creator = alert.get("created_by", "Unbekannt")
         
         current = get_crypto_price(symbol)
         current_text = f"{current} USDT" if current is not None else "Fehler beim Abrufen"
         
         text_lines.append(
-            f"{idx}. {emoji} **{trade_type}** | #{symbol}\n"
+            f"{idx}. {emoji} **{trade_type}** | #{symbol} BY ( {creator} )\n"
             f"   🎯 Ziel: `{target} USDT`\n"
             f"   ⚡ Aktuell: `{current_text}`\n"
         )
@@ -135,6 +143,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     caption = update.message.caption
+    user = update.effective_user
+
+    # Ermitteln, wer das Bild geschickt hat (bevorzugt festen Namen, sonst TG-Name)
+    if user.id in USER_NAMES:
+        creator_name = USER_NAMES[user.id]
+    else:
+        creator_name = user.first_name if user.first_name else (user.username if user.username else str(user.id))
 
     if not caption:
         await update.message.reply_text("Bitte füge dem Bild eine Unterschrift hinzu.")
@@ -207,9 +222,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "photo_id": photo_id,
             "direction": a["direction"],
             "trade_type": a["type"],
-            "emoji": a["emoji"]
+            "emoji": a["emoji"],
+            "created_by": creator_name  # Speichert Alis, Amiris oder deinen Namen
         })
-        response_text += f"{a['emoji']} **{a['type']}** bei `{a['price']} USDT`\n"
+        response_text += f"{a['emoji']} **{a['type']}** bei `{a['price']} USDT` BY ( {creator_name} )\n"
 
     await update.message.reply_text(response_text, parse_mode="Markdown")
 
@@ -224,6 +240,7 @@ async def price_checker_loop(application: Application):
                 direction = alert["direction"]
                 trade_type = alert["trade_type"]
                 emoji = alert["emoji"]
+                creator = alert.get("created_by", "Unbekannt")
 
                 current_price = get_crypto_price(symbol)
                 if current_price is None:
@@ -237,7 +254,7 @@ async def price_checker_loop(application: Application):
 
                 if triggered:
                     try:
-                        message_text = f"Trade Signal: {emoji} {trade_type}\n\n📊 Pair: #{symbol}\n\n🎯 Entry: {target_price}"
+                        message_text = f"Trade Signal: {emoji} {trade_type} BY ( {creator} )\n\n📊 Pair: #{symbol}\n\n🎯 Entry: {target_price}"
                         await application.bot.send_photo(chat_id=chat_id, photo=photo_id, caption=message_text)
                     except Exception as e:
                         print(f"Fehler beim Senden: {e}")
