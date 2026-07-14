@@ -87,13 +87,16 @@ async def handle_photo(update, context):
         msg = await update.message.reply_text(f"✅ {symbol} {dir} Alarm gespeichert!")
         asyncio.create_task(delete_after_delay(context, chat_id, msg.message_id, 30))
 
-# --- START ---
+# --- START (RENDER STABILISIERT) ---
 async def run_bot():
     load_alerts()
     app_bot = Application.builder().token(TOKEN).build()
     app_bot.add_handler(CommandHandler(["alarm", "alarms"], status_alerts))
     app_bot.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    await app_bot.run_polling()
+    await app_bot.initialize()
+    await app_bot.start()
+    await app_bot.updater.start_polling()
+    await asyncio.Event().wait()
 
 async def run_server():
     app = web.Application()
@@ -101,7 +104,7 @@ async def run_server():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
-    while True: await asyncio.sleep(3600)
+    await asyncio.Event().wait()
 
 async def main():
     await asyncio.gather(run_bot(), run_server())
