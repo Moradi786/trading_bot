@@ -62,7 +62,6 @@ async def add_user(update, context):
     except: await update.message.reply_text("❌ Fehler bei der ID.")
 
 async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Befehl sofort löschen
     try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
     except: pass
 
@@ -76,15 +75,29 @@ async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_message_after_delay(context, chat_id, msg.message_id, 5))
         return
 
-    # Kompaktes Grafisches Design
     text_lines = ["📊 **MARKET DASHBOARD**\n"]
     for idx, alert in enumerate(alerts, 1):
-        curr_price = get_crypto_price(alert["symbol"])
+        curr = get_crypto_price(alert["symbol"])
+        target = alert["target_price"]
+        entry = alert.get("entry_price", curr)
+        
+        if alert["trade_type"] == "LONG":
+            diff = target - entry
+            pct = ((curr - entry) / diff) * 100 if diff != 0 else 0
+        else:
+            diff = entry - target
+            pct = ((entry - curr) / diff) * 100 if diff != 0 else 0
+            
+        pct = max(0, min(100, pct))
+        filled = int(pct / 10)
+        bar = "▰" * filled + "▱" * (10 - filled)
+        color_icon = "🟢" if alert["trade_type"] == "LONG" else "🔴"
+        
         text_lines.append(
-            f"{idx}. **#{alert['symbol']}** ➔ {alert['trade_type']}\n"
-            f"   🎯 Target: `{alert['target_price']}` | ⚡ Now: `{curr_price}`\n"
-            f"   👤 Creator: {alert.get('created_by')}\n"
-            f"   🔗 [Bild ansehen](https://t.me/c/{str(chat_id).replace('-100','')}/{alert['message_id']})\n"
+            f"{idx}. **#{alert['symbol']}** | BY: {alert.get('created_by')}\n"
+            f"{color_icon} {alert['trade_type']} | 🎯 T: `{target}` | ⚡ Now: `{curr}`\n"
+            f"📈 To Target: {bar} {int(pct)}%\n"
+            f"🔗 [Bild ansehen](https://t.me/c/{str(chat_id).replace('-100','')}/{alert['message_id']})\n"
             f"━━━━━━━━━━━━━━━━━━"
         )
     
@@ -111,7 +124,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price = float(match.group(1).replace(",", "."))
             active_alerts[chat_id].append({
                 "symbol": symbol, "target_price": price, "trade_type": dir,
-                "photo_id": update.message.photo[-1].file_id, "message_id": update.message.message_id,
+                "message_id": update.message.message_id, "entry_price": curr,
                 "created_by": update.effective_user.first_name
             })
     save_alerts()
@@ -131,12 +144,10 @@ async def post_init(application): load_alerts()
 async def main():
     await start_web_server()
     application = Application.builder().token(TOKEN).post_init(post_init).build()
-    
     application.add_handler(CommandHandler(["alarm", "alarms"], status_alerts))
     application.add_handler(CommandHandler("list", list_users))
     application.add_handler(CommandHandler("add", add_user))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
