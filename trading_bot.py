@@ -11,21 +11,22 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # ---------------------------------------------------------
 TOKEN = "8766875036:AAEpSseVagPrhMph_Jr5iwFZusc3QxyLWW4"
+ADMIN_ID = @Mo_radi786  # <--- ERSETZE DIESE ZAHL MIT DEINER ECHTEN TELEGRAM-ID!
 # ---------------------------------------------------------
 
+# In-Memory-Liste der erlaubten User (du bist automatisch immer drin)
+ERLAUBTE_USER = {ADMIN_ID}
 active_alerts = {}
 
 def get_crypto_price(symbol):
     symbol = symbol.upper()
     try:
-        # 1. Versuch: Binance Futures API
         url_futures = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
         response = requests.get(url_futures, timeout=5)
         data = response.json()
         if "price" in data:
             return float(data["price"])
             
-        # 2. Versuch: Normaler Binance Spot-Markt
         url_spot = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
         response = requests.get(url_spot, timeout=5)
         data = response.json()
@@ -36,7 +37,68 @@ def get_crypto_price(symbol):
         print(f"Fehler beim Abrufen des Preises für {symbol}: {e}")
     return None
 
+# --- AUTHENTIFIZIERUNG ---
+def ist_erlaubt(user_id):
+    return user_id == ADMIN_ID or user_id in ERLAUBTE_USER
+
+# --- ADMIN BEFEHLE ---
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Nur der Master-Admin darf Nutzer hinzufügen.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Bitte gib eine ID an. Beispiel: `/add 123456789`", parse_mode="Markdown")
+        return
+
+    try:
+        neue_id = int(context.args[0])
+        ERLAUBTE_USER.add(neue_id)
+        await update.message.reply_text(f"✅ User-ID `{neue_id}` wurde erfolgreich hinzugefügt!", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Ungültige ID. Die ID muss eine reine Zahl sein.")
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Nur der Master-Admin darf Nutzer löschen.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Bitte gib eine ID an. Beispiel: `/remove 123456789`", parse_mode="Markdown")
+        return
+
+    try:
+        ziel_id = int(context.args[0])
+        if ziel_id == ADMIN_ID:
+            await update.message.reply_text("❌ Du kannst dich nicht selbst löschen!")
+            return
+            
+        if ziel_id in ERLAUBTE_USER:
+            ERLAUBTE_USER.remove(ziel_id)
+            await update.message.reply_text(f"🗑️ User-ID `{ziel_id}` wurde gelöscht.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ Diese ID war nicht in der Liste.")
+    except ValueError:
+        await update.message.reply_text("❌ Ungültige ID.")
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Nur der Master-Admin darf die Liste sehen.")
+        return
+
+    if not ERLAUBTE_USER:
+        await update.message.reply_text("Die Liste ist leer (außer dir als Admin).")
+        return
+
+    liste = "\n".join([f"• `{uid}`" for uid in ERLAUBTE_USER])
+    await update.message.reply_text(f"👥 **Erlaubte Nutzer-IDs:**\n\n{liste}", parse_mode="Markdown")
+
+# --- STANDARDFUNKTIONEN ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ist_erlaubt(update.effective_user.id):
+        await update.message.reply_text("Tut mir leid, dieser Bot ist privat. Du hast keine Zugriffsberechtigung.")
+        return
+
     await update.message.reply_text(
         "Hi! Ich bin dein Trading-Alarm-Bot.\n\n"
         "Schicke mir ein Bild mit einer Unterschrift wie z.B.:\n"
@@ -44,6 +106,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ist_erlaubt(update.effective_user.id):
+        await update.message.reply_text("Zugriff verweigert.")
+        return
+
     chat_id = update.effective_chat.id
     caption = update.message.caption
 
@@ -161,7 +227,7 @@ async def price_checker_loop(application: Application):
 async def post_init(application: Application):
     asyncio.create_task(price_checker_loop(application))
 
-# --- DUMMY WEB SERVER FÜR RENDER TIMEOUT-SCHUTZ ---
+# --- DUMMY WEB SERVER ---
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -170,18 +236,21 @@ async def start_web_server():
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render weist dynamisch einen Port über die Umgebungsvariable "PORT" zu (Standard: 10000)
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"Web-Server läuft auf Port {port}...")
 
 async def main():
-    # Startet den Web-Server im Hintergrund für Render
     await start_web_server()
 
     application = Application.builder().token(TOKEN).post_init(post_init).build()
+    
+    # Handlers registrieren
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add", add_user))
+    application.add_handler(CommandHandler("remove", remove_user))
+    application.add_handler(CommandHandler("list", list_users))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
     await application.initialize()
