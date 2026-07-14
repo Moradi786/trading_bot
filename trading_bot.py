@@ -6,8 +6,8 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # --- KONFIGURATION ---
 TOKEN = "8766875036:AAEpSseVagPrhMph_Jr5iwFZusc3QxyLWW4"
-ADMIN_ID = 6147760453
-ERLAUBTE_USER = {ADMIN_ID, 6673849133, 5544021969}
+ADMIN_ID = 6147760453 IBRAHIM
+ERLAUBTE_USER = {ADMIN_ID, 6673849133 AMIRI, 5544021969 ALI}
 DATABASE_URL = f"https://kvdb.io/Trade786Bot_SecureBucket_{ADMIN_ID}/active_alerts"
 active_alerts = {}
 
