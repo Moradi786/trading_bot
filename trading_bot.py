@@ -21,23 +21,19 @@ ERLAUBTE_USER = {ADMIN_ID, FRIEND_1_ID, FRIEND_2_ID}
 active_alerts = {}
 DATABASE_URL = f"https://kvdb.io/Trade786Bot_SecureBucket_{ADMIN_ID}/active_alerts"
 
-# --- CLOUD SPEICHER ---
 def load_alerts():
     global active_alerts
     try:
         response = requests.get(DATABASE_URL, timeout=8)
         if response.status_code == 200:
             active_alerts = {int(k): v for k, v in response.json().items()}
-    except:
-        active_alerts = {}
+    except: active_alerts = {}
 
 def save_alerts():
     try:
         requests.put(DATABASE_URL, data=json.dumps({str(k): v for k, v in active_alerts.items()}), headers={'Content-type': 'application/json'}, timeout=8)
-    except:
-        pass
+    except: pass
 
-# --- HILFSFUNKTIONEN ---
 def get_crypto_price(symbol):
     symbol = symbol.upper()
     try:
@@ -52,7 +48,6 @@ async def delete_message_after_delay(context, chat_id, message_id, delay):
     try: await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except: pass
 
-# --- ADMIN BEFEHLE ---
 async def list_users(update, context):
     if update.effective_user.id != ADMIN_ID: return
     liste = "\n".join([f"• `{uid}`" for uid in ERLAUBTE_USER])
@@ -66,9 +61,8 @@ async def add_user(update, context):
         await update.message.reply_text(f"✅ User `{neue_id}` hinzugefügt.")
     except: await update.message.reply_text("❌ Fehler bei der ID.")
 
-# --- ALARME HANDLER ---
 async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Sofort löschen
+    # Befehl sofort löschen
     try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
     except: pass
 
@@ -82,12 +76,19 @@ async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_message_after_delay(context, chat_id, msg.message_id, 5))
         return
 
-    text = ["📊 **Aktive Alarme:**\n"]
+    # Kompaktes Grafisches Design
+    text_lines = ["📊 **MARKET DASHBOARD**\n"]
     for idx, alert in enumerate(alerts, 1):
-        price = get_crypto_price(alert["symbol"])
-        text.append(f"{idx}. #{alert['symbol']} | {alert['trade_type']} | T: {alert['target_price']} | Curr: {price}")
+        curr_price = get_crypto_price(alert["symbol"])
+        text_lines.append(
+            f"{idx}. **#{alert['symbol']}** ➔ {alert['trade_type']}\n"
+            f"   🎯 Target: `{alert['target_price']}` | ⚡ Now: `{curr_price}`\n"
+            f"   👤 Creator: {alert.get('created_by')}\n"
+            f"   🔗 [Bild ansehen](https://t.me/c/{str(chat_id).replace('-100','')}/{alert['message_id']})\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
     
-    msg = await update.message.reply_text("\n".join(text), parse_mode="Markdown")
+    msg = await update.message.reply_text("\n".join(text_lines), parse_mode="Markdown", disable_web_page_preview=True)
     asyncio.create_task(delete_message_after_delay(context, chat_id, msg.message_id, 60))
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,11 +111,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price = float(match.group(1).replace(",", "."))
             active_alerts[chat_id].append({
                 "symbol": symbol, "target_price": price, "trade_type": dir,
-                "photo_id": update.message.photo[-1].file_id, "direction": "above" if price >= curr else "below"
+                "photo_id": update.message.photo[-1].file_id, "message_id": update.message.message_id,
+                "created_by": update.effective_user.first_name
             })
     save_alerts()
 
-# --- SERVER START ---
 async def handle_ping(request): return web.Response(text="Bot is running!")
 
 async def start_web_server():
@@ -131,7 +132,6 @@ async def main():
     await start_web_server()
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     
-    # HANDLER REGISTRIERUNG
     application.add_handler(CommandHandler(["alarm", "alarms"], status_alerts))
     application.add_handler(CommandHandler("list", list_users))
     application.add_handler(CommandHandler("add", add_user))
