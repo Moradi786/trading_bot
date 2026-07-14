@@ -11,7 +11,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # ---------------------------------------------------------
 TOKEN = "8766875036:AAEpSseVagPrhMph_Jr5iwFZusc3QxyLWW4"
-ADMIN_ID = 6147760453  # <--- ERSETZE DIESE ZAHL MIT DEINER ECHTEN TELEGRAM-ID!
+ADMIN_ID = 6147760453  # <--- HIER DEINE ID EINTRAGEN
 # ---------------------------------------------------------
 
 # In-Memory-Liste der erlaubten User (du bist automatisch immer drin)
@@ -93,6 +93,39 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     liste = "\n".join([f"• `{uid}`" for uid in ERLAUBTE_USER])
     await update.message.reply_text(f"👥 **Erlaubte Nutzer-IDs:**\n\n{liste}", parse_mode="Markdown")
 
+# --- ALARME ANZEIGEN (STATUS) ---
+async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ist_erlaubt(update.effective_user.id):
+        await update.message.reply_text("Zugriff verweigert.")
+        return
+
+    chat_id = update.effective_chat.id
+    alerts = active_alerts.get(chat_id, [])
+
+    if not alerts:
+        await update.message.reply_text("🔔 Aktuell sind **keine** aktiven Alarme für diesen Chat eingerichtet.", parse_mode="Markdown")
+        return
+
+    text_lines = ["📊 **Aktive Alarme & aktuelle Kurse:**\n"]
+    
+    for idx, alert in enumerate(alerts, 1):
+        symbol = alert["symbol"]
+        target = alert["target_price"]
+        trade_type = alert["trade_type"]
+        emoji = alert["emoji"]
+        
+        # Aktuellen Kurs live abfragen
+        current = get_crypto_price(symbol)
+        current_text = f"{current} USDT" if current is not None else "Fehler beim Abrufen"
+        
+        text_lines.append(
+            f"{idx}. {emoji} **{trade_type}** | #{symbol}\n"
+            f"   🎯 Ziel: `{target} USDT`\n"
+            f"   ⚡ Aktuell: `{current_text}`\n"
+        )
+
+    await update.message.reply_text("\n".join(text_lines), parse_mode="Markdown")
+
 # --- STANDARDFUNKTIONEN ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ist_erlaubt(update.effective_user.id):
@@ -102,7 +135,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! Ich bin dein Trading-Alarm-Bot.\n\n"
         "Schicke mir ein Bild mit einer Unterschrift wie z.B.:\n"
-        "`#SUIUSDT long Preis 0.7072` oder `#AVAXUSDT short 6.483`"
+        "`#SUIUSDT long Preis 0.7072` oder `#AVAXUSDT short 6.483`\n\n"
+        "Mit `/alarms` oder `/alarm` siehst du alle aktiven Alarme mit Live-Kursen!"
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,6 +285,8 @@ async def main():
     application.add_handler(CommandHandler("add", add_user))
     application.add_handler(CommandHandler("remove", remove_user))
     application.add_handler(CommandHandler("list", list_users))
+    application.add_handler(CommandHandler("alarms", status_alerts)) # <--- NEU
+    application.add_handler(CommandHandler("alarm", status_alerts))  # <--- NEU (Zusatz ohne "s")
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
     await application.initialize()
