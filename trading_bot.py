@@ -31,9 +31,6 @@ def get_crypto_price(symbol):
     except: return 0.0
 
 async def status_alerts(update, context):
-    try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-    except: pass
-    
     chat_id = str(update.effective_chat.id)
     alerts = active_alerts.get(chat_id, [])
     
@@ -47,23 +44,23 @@ async def status_alerts(update, context):
         target = alert["target_price"]
         entry = alert.get("entry_price", curr)
         
-        # Prozentrechnung 0-100%
-        if alert["trade_type"] == "LONG":
-            diff = target - entry
-            pct = ((curr - entry) / diff) * 100 if diff != 0 else 0
-        else:
-            diff = entry - target
-            pct = ((entry - curr) / diff) * 100 if diff != 0 else 0
-        
+        # Prozentrechnung: 0% bei Einstieg, 100% am Target
+        total_dist = abs(target - entry)
+        current_dist = abs(curr - entry)
+        pct = (current_dist / total_dist * 100) if total_dist != 0 else 0
         pct = max(0, min(100, pct))
-        bar = "▰" * int(pct/10) + "▱" * (10 - int(pct/10))
+        
+        # Grafische Balken (10 Segmente)
+        filled = int(pct / 10)
+        bar = "⬛" * filled + "⬜" * (10 - filled)
         icon = "🟢" if alert["trade_type"] == "LONG" else "🔴"
         
-        text.append(f"{idx}. **#{alert['symbol']}** | BY: {alert.get('created_by')}\n"
-                    f"{icon} {alert['trade_type']} | 🎯 T: `{target}` | ⚡ Now: `{curr}`\n"
+        text.append(f"{idx}. **#{alert['symbol']}**                      BY ( {alert.get('created_by', 'Admin')} )\n"
+                    f"{icon} {alert['trade_type']}\n"
+                    f"🎯 Target Preis: `{target}` USDT\n"
+                    f"⚡ Aktuell: `{curr}` USDT\n"
                     f"📈 To Target: {bar} {int(pct)}%\n"
-                    f"🔗 [Bild ansehen](https://t.me/c/{chat_id.replace('-100','')}/{alert['message_id']})\n"
-                    f"━━━━━━━━━━━━━━━━━━")
+                    f"🔗 [🖼️ Bild anzeigen](https://t.me/c/{chat_id.replace('-100','')}/{alert['message_id']})\n")
     
     await update.message.reply_text("\n".join(text), parse_mode="Markdown", disable_web_page_preview=True)
 
@@ -85,9 +82,9 @@ async def handle_photo(update, context):
             "created_by": update.effective_user.first_name
         })
         save_alerts()
-        await update.message.reply_text(f"✅ {symbol} {dir} gespeichert!")
+        await update.message.reply_text(f"✅ {symbol} {dir} Alarm gespeichert!")
 
-# Start-Funktionen
+# Start-Logik für Render (Bot + Webserver)
 async def run_bot():
     load_alerts()
     app_bot = Application.builder().token(TOKEN).build()
