@@ -49,6 +49,42 @@ def get_crypto_price(symbol):
 def ist_erlaubt(user_id):
     return user_id == ADMIN_ID or user_id in ERLAUBTE_USER
 
+def generate_progress_bar(current, target, start_price, trade_type):
+    """
+    Erzeugt einen farbigen Emoji-Fortschrittsbalken:
+    - Grün (🟩) für LONG
+    - Rot (🟥) für SHORT
+    - Schwarz (⬛) für den verbleibenden Weg
+    """
+    if start_price is None or start_price == target:
+        return "⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ 0%"
+    
+    total_distance = abs(target - start_price)
+    
+    if trade_type == "LONG" and current < start_price:
+        percentage = 0
+    elif trade_type == "SHORT" and current > start_price:
+        percentage = 0
+    else:
+        if total_distance > 0:
+            current_distance = abs(current - start_price) if trade_type == "LONG" else abs(start_price - current)
+            percentage = int((current_distance / total_distance) * 100)
+        else:
+            percentage = 0
+
+    percentage = min(max(percentage, 0), 100)
+    
+    # 10 Blöcke Gesamtbreite
+    filled_blocks = percentage // 10
+    empty_blocks = 10 - filled_blocks
+    
+    # Farbwahl basierend auf dem Trade-Typ
+    fill_emoji = "🟩" if trade_type == "LONG" else "🟥"
+    empty_emoji = "⬛"
+    
+    bar = (fill_emoji * filled_blocks) + (empty_emoji * empty_blocks)
+    return f"{bar} **{percentage}%**"
+
 # --- ADMIN BEFEHLE ---
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -111,19 +147,38 @@ async def status_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for idx, alert in enumerate(alerts, 1):
         symbol = alert["symbol"]
         target = alert["target_price"]
+        start_price = alert["start_price"]
         trade_type = alert["trade_type"]
         emoji = alert["emoji"]
         creator = alert.get("created_by", "Unbekannt")
+        msg_id = alert.get("message_id")
         
         current = get_crypto_price(symbol)
-        current_text = f"{current} USDT" if current is not None else "Fehler beim Abrufen"
+        
+        # Link-Generierung direkt zum Bild-Beitrag im Telegram-Chat
+        chat_username = update.effective_chat.username
+        if chat_username:
+            img_link = f"[🖼️ Bild anzeigen](https://t.me/{chat_username}/{msg_id})"
+        else:
+            cleaned_chat_id = str(chat_id).replace("-100", "")
+            img_link = f"[🖼️ Bild anzeigen](https://t.me/c/{cleaned_chat_id}/{msg_id})"
+        
+        if current is not None:
+            current_text = f"{current} USDT"
+            progress_bar = generate_progress_bar(current, target, start_price, trade_type)
+        else:
+            current_text = "Fehler"
+            progress_bar = "⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ 0%"
         
         text_lines.append(
-            f"{idx}. {emoji} **{trade_type}** | #{symbol} BY ( {creator} )\n"
-            f"   🎯 Ziel: `{target} USDT`\n"
+            f"{idx}. **#{symbol}** {' ' * (28 - len(symbol))} BY ( {creator} )\n"
+            f"   {emoji} **{trade_type}**\n"
+            f"   🎯 Target Preis: `{target} USDT`\n"
             f"   ⚡ Aktuell: `{current_text}`\n"
+            f"   📈 To Target: {progress_bar}\n"
+            f"   🔗 {img_link}\n"
         )
-    await update.message.reply_text("\n".join(text_lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(text_lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 # --- STANDARDFUNKTIONEN ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,27 +193,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ist_erlaubt(update.effective_user.id):
-        await update.message.reply_text("Zugriff verweigert.")
-        return
+        return  # Lautlos ignorieren
 
     chat_id = update.effective_chat.id
     caption = update.message.caption
     user = update.effective_user
+    message_id = update.message.message_id
 
-    # Ermitteln, wer das Bild geschickt hat (bevorzugt festen Namen, sonst TG-Name)
+    # Ermitteln, wer das Bild geschickt hat
     if user.id in USER_NAMES:
         creator_name = USER_NAMES[user.id]
     else:
         creator_name = user.first_name if user.first_name else (user.username if user.username else str(user.id))
 
     if not caption:
-        await update.message.reply_text("Bitte füge dem Bild eine Unterschrift hinzu.")
         return
 
-    # Symbol extrahieren (Erstes Wort oder Wort mit #)
+    # Symbol extrahieren
     words = caption.replace("#", " ").strip().split()
     if not words:
-        await update.message.reply_text("Konnte kein Krypto-Paar finden.")
         return
     
     symbol = words[0].upper()
@@ -167,10 +220,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     current_price = get_crypto_price(symbol)
     if current_price is None:
-        await update.message.reply_text(f"Fehler: Kurs für {symbol} nicht gefunden.")
         return
 
-    # Suche nach Long und Short Preisen mit Regex
+    # Suchen nach Preisen
     long_match = re.search(r'(?i)long[:\s]+([0-9.,]+)', caption)
     short_match = re.search(r'(?i)short[:\s]+([0-9.,]+)', caption)
 
@@ -186,48 +238,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = "above" if price >= current_price else "below"
         found_alerts.append({"type": "SHORT", "price": price, "direction": direction, "emoji": "🔴"})
 
-    # Fallback: Falls kein "long" oder "short" Text gefunden wurde, alten Parser nutzen
     if not found_alerts:
-        try:
-            cleaned_text = re.sub(r'(?i)alarm|preis|limit', ' ', caption.replace("#", " "))
-            parts = cleaned_text.strip().split()
-            target_price = None
-            for part in parts:
-                try:
-                    target_price = float(part.replace(",", "."))
-                except ValueError:
-                    continue
-            if target_price is not None:
-                direction = "above" if target_price >= current_price else "below"
-                ttype = "LONG" if direction == "above" else "SHORT"
-                emoji = "🟢" if ttype == "LONG" else "🔴"
-                found_alerts.append({"type": ttype, "price": target_price, "direction": direction, "emoji": emoji})
-        except Exception:
-            pass
-
-    if not found_alerts:
-        await update.message.reply_text("Ungültiges Format. Beispiel:\nMnt\nShort: 0.4183\nLong: 0.4263")
         return
 
     if chat_id not in active_alerts:
         active_alerts[chat_id] = []
 
     photo_id = update.message.photo[-1].file_id
-    response_text = f"✅ **Alarme für #{symbol} eingerichtet!**\n\n(Aktueller Kurs: {current_price} USDT)\n\n"
 
+    # Alarme im Hintergrund lautlos speichern
     for a in found_alerts:
         active_alerts[chat_id].append({
             "symbol": symbol,
             "target_price": a["price"],
+            "start_price": current_price,
             "photo_id": photo_id,
+            "message_id": message_id,
             "direction": a["direction"],
             "trade_type": a["type"],
             "emoji": a["emoji"],
-            "created_by": creator_name  # Speichert Alis, Amiris oder deinen Namen
+            "created_by": creator_name
         })
-        response_text += f"{a['emoji']} **{a['type']}** bei `{a['price']} USDT` BY ( {creator_name} )\n"
-
-    await update.message.reply_text(response_text, parse_mode="Markdown")
 
 async def price_checker_loop(application: Application):
     while True:
@@ -279,7 +310,7 @@ async def main():
     await start_web_server()
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     
-    # Handlers bereinigt (ohne das problematische @Trade_786_bot Suffix)
+    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add", add_user))
     application.add_handler(CommandHandler("remove", remove_user))
