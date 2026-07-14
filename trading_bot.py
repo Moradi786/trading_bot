@@ -26,7 +26,7 @@ def save_alerts():
     except: pass
 
 def get_crypto_price(symbol):
-    # Entfernt alle Sonderzeichen und stellt sicher, dass USDT angehängt ist
+    # Bereinigt das Symbol und erzwingt USDT Endung
     clean_symbol = re.sub(r'[^A-Z0-9]', '', symbol.upper())
     if not clean_symbol.endswith("USDT"): clean_symbol += "USDT"
     try:
@@ -52,7 +52,10 @@ async def status_alerts(update, context):
 
     text = ["📊 **Aktive Alarme & aktuelle Kurse:**\n"]
     for idx, alert in enumerate(alerts, 1):
+        # Preis abrufen mit kleiner Pause für API Stabilität
         curr = get_crypto_price(alert["symbol"])
+        await asyncio.sleep(0.5) 
+        
         target = alert["target_price"]
         entry = alert.get("entry_price", curr)
         
@@ -64,7 +67,6 @@ async def status_alerts(update, context):
         bar = bar_char * int(pct/10) + "⬜" * (10 - int(pct/10))
         icon = "🟢" if alert["trade_type"] == "LONG" else "🔴"
         
-        # Symbol bereinigen für die Anzeige
         display_symbol = re.sub(r'[^A-Z0-9]', '', alert["symbol"].upper()).replace("USDT", "")
         
         text.append(f"{idx}. **#{display_symbol}** | BY ( {alert.get('created_by', 'Admin')} )\n"
