@@ -279,13 +279,12 @@ async def main():
     await start_web_server()
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     
-    # Handlers mit Anpassungen für Gruppennamen-Suffixes
-    application.add_handler(CommandHandler(["start", "start@Trade_786_bot"], start))
-    application.add_handler(CommandHandler(["add", "add@Trade_786_bot"], add_user))
-    application.add_handler(CommandHandler(["remove", "remove@Trade_786_bot"], remove_user))
-    application.add_handler(CommandHandler(["list", "list@Trade_786_bot"], list_users))
-    application.add_handler(CommandHandler(["alarms", "alarms@Trade_786_bot"], status_alerts))
-    application.add_handler(CommandHandler(["alarm", "alarm@Trade_786_bot"], status_alerts))
+    # Handlers bereinigt (ohne das problematische @Trade_786_bot Suffix)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add", add_user))
+    application.add_handler(CommandHandler("remove", remove_user))
+    application.add_handler(CommandHandler("list", list_users))
+    application.add_handler(CommandHandler(["alarms", "alarm"], status_alerts))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
     await application.initialize()
