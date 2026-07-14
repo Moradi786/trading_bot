@@ -56,10 +56,13 @@ async def status_alerts(update, context):
         
         pct = (abs(curr - entry) / abs(target - entry) * 100) if abs(target - entry) != 0 else 0
         pct = max(0, min(100, pct))
-        bar = "⬛" * int(pct/10) + "⬜" * (10 - int(pct/10))
+        
+        # Farbige Balken: 🟩 für Long, 🟥 für Short
+        bar_char = "🟩" if alert["trade_type"] == "LONG" else "🟥"
+        bar = bar_char * int(pct/10) + "⬜" * (10 - int(pct/10))
         icon = "🟢" if alert["trade_type"] == "LONG" else "🔴"
         
-        text.append(f"{idx}. **#{alert['symbol']}** | BY ( {alert.get('created_by', 'Admin')} )\n"
+        text.append(f"{idx}. **#{alert['symbol'].replace('USDT', '')}** | BY ( {alert.get('created_by', 'Admin')} )\n"
                     f"{icon} {alert['trade_type']} | 🎯 T: `{target}` | ⚡ Now: `{curr}`\n"
                     f"📈 To Target: {bar} {int(pct)}%\n")
     
@@ -71,7 +74,9 @@ async def handle_photo(update, context):
     caption = update.message.caption or ""
     chat_id = str(update.effective_chat.id)
     
-    symbol = caption.split()[0].upper()
+    parts = caption.split()
+    if not parts: return
+    symbol = parts[0].upper()
     match = re.search(r'(LONG|SHORT)[:\s]+([0-9.,]+)', caption, re.IGNORECASE)
     
     if match:
