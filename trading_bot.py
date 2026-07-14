@@ -1,8 +1,8 @@
 import logging, asyncio, requests, re, os, json
 from aiohttp import web
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
+# Logging einrichten
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # --- KONFIGURATION ---
@@ -16,20 +16,17 @@ def load_alerts():
     global active_alerts
     try:
         response = requests.get(DATABASE_URL, timeout=10)
-        if response.status_code == 200:
-            active_alerts = response.json()
+        if response.status_code == 200: active_alerts = response.json()
     except: active_alerts = {}
 
 def save_alerts():
     try:
         requests.put(DATABASE_URL, data=json.dumps(active_alerts), headers={'Content-type': 'application/json'}, timeout=10)
-    except Exception as e:
-        logging.error(f"Speicherfehler: {e}")
+    except: pass
 
 def get_crypto_price(symbol):
     try:
-        url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol.upper()}"
-        data = requests.get(url, timeout=5).json()
+        data = requests.get(f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol.upper()}", timeout=5).json()
         return float(data["price"])
     except: return 0.0
 
@@ -50,7 +47,7 @@ async def status_alerts(update, context):
         target = alert["target_price"]
         entry = alert.get("entry_price", curr)
         
-        # Berechnung %
+        # Prozentrechnung 0-100%
         if alert["trade_type"] == "LONG":
             diff = target - entry
             pct = ((curr - entry) / diff) * 100 if diff != 0 else 0
@@ -88,20 +85,28 @@ async def handle_photo(update, context):
             "created_by": update.effective_user.first_name
         })
         save_alerts()
-        await update.message.reply_text(f"✅ {symbol} {dir} Alarm gespeichert!")
+        await update.message.reply_text(f"✅ {symbol} {dir} gespeichert!")
 
-async def main():
-    # Webserver für Render/Cronjob
+# Start-Funktionen
+async def run_bot():
+    load_alerts()
+    app_bot = Application.builder().token(TOKEN).build()
+    app_bot.add_handler(CommandHandler(["alarm", "alarms"], status_alerts))
+    app_bot.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    await app_bot.initialize()
+    await app_bot.start()
+    await app_bot.updater.start_polling()
+
+async def run_server():
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
-    
-    # Bot Start
-    app_bot = Application.builder().token(TOKEN).post_init(lambda a: load_alerts()).build()
-    app_bot.add_handler(CommandHandler(["alarm", "alarms"], status_alerts))
-    app_bot.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    await app_bot.run_polling()
+    while True: await asyncio.sleep(3600)
 
-if __name__ == '__main__': asyncio.run(main())
+async def main():
+    await asyncio.gather(run_bot(), run_server())
+
+if __name__ == '__main__':
+    asyncio.run(main())
