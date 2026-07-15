@@ -131,11 +131,11 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
         try:
             target = float(target_match.group(1))
             alerts.append((symbol, direction, target))
-            return alerts  # Erfolgreich ausgelesen!
+            return alerts
         except ValueError:
             pass
 
-    # 3. Fallback auf das klassische mehrzeilige Format (z.B. Zeile 2: LONG 0.3238)
+    # 3. Fallback auf das klassische mehrzeilige Format
     if len(lines) > 1:
         for line in lines[1:]:
             match = DIRECTION_TARGET_PATTERN.search(line)
@@ -314,7 +314,6 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     parsed_alerts = parse_caption(text_to_parse)
     
-    # Wenn kein passender Alarm (inkl. '#') gefunden wurde
     if not parsed_alerts:
         if message.text and message.text.lower().startswith("/alarm"):
             bot_msg = await message.reply_text(
@@ -332,28 +331,47 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     client = context.application.bot_data["db_client"]
     session = context.application.bot_data["http_session"]
-    alert_ids: list[int] = []
     creator = update.effective_user.username or update.effective_user.first_name or "Unknown"
 
-    for symbol, direction, target in parsed_alerts:
+    # SCHÖNE ERFOLGSMELDUNG (PASSEND ZUM ORIGINAL-STYLE)
+    if len(parsed_alerts) == 1:
+        symbol, direction, target = parsed_alerts[0]
         current_price = await get_price(session, symbol) or target
+        
         result = await client.execute(
             "INSERT INTO alerts (chat_id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (update.effective_chat.id, symbol, direction, target, current_price, creator, source_link, photo_file_id),
         )
-        alert_ids.append(result.last_insert_rowid)
-
-    saved = "\n".join(
-        f"• #{alert_id} {direction} → Ziel: <code>{target:g}</code>"
-        for alert_id, (_, direction, target) in zip(alert_ids, parsed_alerts)
-    )
+        alert_id = result.last_insert_rowid
+        
+        reply_text = (
+            f"✅ <b>Alarm gespeichert - #{symbol} | BY {creator}</b>\n"
+            f"• #{alert_id} {direction} → Ziel: <code>{target:g}</code>\n"
+            f"Aktueller Kurs: <code>{current_price:g}</code>"
+        )
+    else:
+        # Falls doch mehrere gleichzeitig gespeichert werden
+        saved_lines = []
+        for symbol, direction, target in parsed_alerts:
+            current_price = await get_price(session, symbol) or target
+            result = await client.execute(
+                "INSERT INTO alerts (chat_id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (update.effective_chat.id, symbol, direction, target, current_price, creator, source_link, photo_file_id),
+            )
+            alert_id = result.last_insert_rowid
+            saved_lines.append(f"• #{alert_id} {direction} → Ziel: <code>{target:g}</code>")
+            
+        reply_text = (
+            f"🔔 <b>Alarme gespeichert!</b>\n"
+            + "\n".join(saved_lines)
+        )
     
-    await message.reply_text(
-        f"🔔 <b>Alarme gespeichert!</b>\n{saved}", parse_mode=ParseMode.HTML
-    )
+    await message.reply_text(reply_text, parse_mode=ParseMode.HTML)
 
 
+# DIE SCHÖNE ALARMLISTE MIT FORTSCHRITTSBALKEN
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -382,24 +400,49 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for number, alert in enumerate(alerts, start=1):
         alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
         current = prices.get(symbol)
+        
+        dir_emoji = "🟢" if direction == "LONG" else "🔴"
+        
         if current is None:
-            current_text, progress = "unavailable", 0
+            current_text = "unavailable"
+            progress_line = ""
         else:
             current_text = f"{current:g} USDT"
-            total_diff = abs(target - entry)
-            if total_diff > 0:
-                current_diff = abs(current - entry)
-                progress = min(100, int((current_diff / total_diff) * 100))
-            else:
-                progress = 100
+            
+            # Mathematisch korrekte Trading-Fortschrittsberechnung
+            if direction == "LONG":
+                if current <= entry:
+                    progress = 0
+                elif current >= target:
+                    progress = 100
+                else:
+                    progress = int(((current - entry) / (target - entry)) * 100)
+            else:  # SHORT
+                if current >= entry:
+                    progress = 0
+                elif current <= target:
+                    progress = 100
+                else:
+                    progress = int(((entry - current) / (entry - target)) * 100)
+
+            # Fortschrittsbalken generieren
+            progress_clamped = min(100, max(0, progress))
+            filled_blocks = int(progress_clamped / 10)
+            empty_blocks = 10 - filled_blocks
+            bar = "█" * filled_blocks + "░" * empty_blocks
+            progress_line = f"\n📈 To Target: [<code>{bar}</code>] <code>{progress}%</code>"
 
         lines.append(
-            f"{number}. <b>#{symbol}</b> {direction}\n"
-            f"   Einstieg: <code>{entry:g}</code> → Ziel: <code>{target:g}</code>\n"
-            f"   Kurs: <code>{current_text}</code> | Fortschritt: <code>{progress}%</code>"
+            f"{number}. <b>#{symbol}</b> | BY {creator}\n"
+            f"{dir_emoji} {direction}\n"
+            f"🎯 Target: <code>{target:g}</code> USDT\n"
+            f"⚡ Current: <code>{current_text}</code>"
+            f"{progress_line}"
         )
+        
+        # Der schöne Original-Button-Text
         if photo_file_id:
-            keyboard.append([InlineKeyboardButton(f"🖼️ Show Image #{alert_id}", callback_data=f"show_img:{alert_id}")])
+            keyboard.append([InlineKeyboardButton(f"🔗 🖼️ View Image #{symbol}", callback_data=f"show_img:{alert_id}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     bot_msg = await user_msg.reply_text("\n\n".join(lines), reply_markup=reply_markup, parse_mode=ParseMode.HTML)
