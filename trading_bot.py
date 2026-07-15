@@ -33,7 +33,9 @@ load_dotenv()
 
 DB_PATH = Path("alerts.db")
 BINANCE_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
-SYMBOL_PATTERN = re.compile(r"^\s*#?([A-Za-z0-9/_-]+)")
+
+# Das '#' ist jetzt Pflicht (kein '?' mehr dahinter)!
+SYMBOL_PATTERN = re.compile(r"^\s*#([A-Za-z0-9/_-]+)")
 DIRECTION_TARGET_PATTERN = re.compile(r"(LONG|SHORT)\s+([\d.,]+)", re.IGNORECASE)
 
 # Admins & Erlaubte User IDs aus .env laden
@@ -117,31 +119,40 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
         
     symbol_match = SYMBOL_PATTERN.search(lines[0])
     if not symbol_match:
-        return alerts
+        return alerts  # Kein '#' am Anfang -> Abbrechen!
     symbol = symbol_match.group(1).upper()
     
-    for line in lines[1:]:
-        match = DIRECTION_TARGET_PATTERN.search(line)
+    # Falls das Signal einzeilig ist (z.B. /alarm #TRXUSDT SHORT 0.3238)
+    if len(lines) == 1:
+        match = DIRECTION_TARGET_PATTERN.search(lines[0])
         if match:
             direction = match.group(1).upper()
             try:
                 target = float(match.group(2))
                 alerts.append((symbol, direction, target))
             except ValueError:
-                continue
+                pass
+    else:
+        # Mehrzeilige Signale auswerten
+        for line in lines[1:]:
+            match = DIRECTION_TARGET_PATTERN.search(line)
+            if match:
+                direction = match.group(1).upper()
+                try:
+                    target = float(match.group(2))
+                    alerts.append((symbol, direction, target))
+                except ValueError:
+                    continue
     return alerts
 
 
 # 3. SAUBERER CHAT: AUTOMATISCHES LÖSCHEN
 async def delete_messages_later(bot, chat_id, message_ids, delay=30):
-    """Löscht eine Liste von Nachrichten-IDs nach exakt 'delay' Sekunden."""
     await asyncio.sleep(delay)
     for msg_id in message_ids:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except TelegramError:
-            # Fehler ignorieren, falls die Nachricht schon manuell gelöscht wurde 
-            # oder der Bot im Privat-Chat keine User-Nachrichten löschen darf
             pass
 
 
@@ -260,17 +271,50 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # 6. COMMANDS: ALARM-VERWALTUNG (SIGNALE)
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Wird getriggert, wenn ein User ein Signalbild mit Caption postet."""
     if not await is_authorised(update, context) or update.message is None:
         return
 
-    parsed_alerts = parse_caption(update.message.caption or "")
+    message = update.message
+    text_to_parse = ""
+    photo_file_id = None
+
+    # Fall 1: Foto mit Caption
+    if message.photo:
+        text_to_parse = message.caption or ""
+        photo_file_id = message.photo[-1].file_id
+    # Fall 2: Reply auf Foto/Text
+    elif message.reply_to_message:
+        replied = message.reply_to_message
+        if replied.photo:
+            text_to_parse = replied.caption or ""
+            photo_file_id = replied.photo[-1].file_id
+        else:
+            text_to_parse = replied.text or ""
+    # Fall 3: Reiner Text-Befehl
+    else:
+        text_to_parse = message.text or ""
+
+    # "/alarm" am Anfang abschneiden
+    if text_to_parse.lower().startswith("/alarm"):
+        text_to_parse = re.sub(r"^/alarm\s*", "", text_to_parse, flags=re.IGNORECASE).strip()
+
+    parsed_alerts = parse_caption(text_to_parse)
+    
+    # Wenn kein passender Alarm (inkl. '#') gefunden wurde, brechen wir ab.
     if not parsed_alerts:
+        # Falls der Nutzer es explizit über /alarm versucht hat, Fehlermeldung zeigen
+        if message.text and message.text.lower().startswith("/alarm"):
+            bot_msg = await message.reply_text(
+                "❌ <b>Fehler:</b> Ungültiges Format!\n\n"
+                "Der Coin-Name <b>muss</b> mit einem <code>#</code> beginnen.\n"
+                "Beispiel: <code>/alarm #TRXUSDT SHORT 0.3238</code>",
+                parse_mode=ParseMode.HTML
+            )
+            asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [message.message_id, bot_msg.message_id], 30))
         return
 
-    photo_file_id = update.message.photo[-1].file_id if update.message.photo else None
     chat = update.effective_chat
-    message_id = update.message.message_id
+    message_id = message.message_id
     source_link = message_link(chat.id, chat.username, chat.type, message_id) if chat else None
 
     client = context.application.bot_data["db_client"]
@@ -292,8 +336,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for alert_id, (_, direction, target) in zip(alert_ids, parsed_alerts)
     )
     
-    # Signale bleiben zur Übersicht im Kanal stehen, keine automatische Löschung!
-    await update.message.reply_text(
+    await message.reply_text(
         f"🔔 <b>Alarme gespeichert!</b>\n{saved}", parse_mode=ParseMode.HTML
     )
 
@@ -347,8 +390,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     bot_msg = await user_msg.reply_text("\n\n".join(lines), reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-    
-    # Liste nach 30 Sekunden im Hintergrund sauber löschen
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
 
 
@@ -452,7 +493,6 @@ async def post_init(application: Application) -> None:
     if not db_url or not db_token:
         raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN environment variables must be set.")
     
-    # Bypass für den Render WebSocket-Fehler: libsql:// wird in stabile HTTPS-Anfragen geändert
     if db_url.startswith("libsql://"):
         db_url = db_url.replace("libsql://", "https://")
 
@@ -463,7 +503,6 @@ async def post_init(application: Application) -> None:
     application.bot_data["http_session"] = aiohttp.ClientSession()
     application.bot_data["alert_task"] = asyncio.create_task(check_alerts(application))
     
-    # Webserver starten, um Renders Port-Binding Fehler zu verhindern
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
@@ -516,11 +555,12 @@ def main() -> None:
     application.add_handler(CommandHandler("list", list_user_ids))
     application.add_handler(CommandHandler("delete", delete_alert))
     application.add_handler(CommandHandler("alerts", list_alerts))
+    application.add_handler(CommandHandler("alarm", add_alert))
     
     # Callback für Bildanzeige bei Inline-Buttons
     application.add_handler(CallbackQueryHandler(show_trade_image, pattern="^show_img:"))
     
-    # Handler für Bilder mit Alarmsignalen (z.B. TradingView-Bild mit Signal im Text)
+    # Handler für Bilder mit Alarmsignalen
     application.add_handler(MessageHandler(filters.PHOTO, add_alert))
 
     LOGGER.info("Starte Polling...")
