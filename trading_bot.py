@@ -34,19 +34,19 @@ load_dotenv()
 DB_PATH = Path("alerts.db")
 BINANCE_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
 
-# Das '#' ist jetzt Pflicht (kein '?' mehr dahinter)!
+# Das '#' ist Pflicht!
 SYMBOL_PATTERN = re.compile(r"^\s*#([A-Za-z0-9/_-]+)")
 DIRECTION_TARGET_PATTERN = re.compile(r"(LONG|SHORT)\s+([\d.,]+)", re.IGNORECASE)
 
 # Admins & Erlaubte User IDs aus .env laden
 ADMIN_USER_IDS = [
     int(x.strip()) 
-    for x in os.getenv("ADMIN_USER_IDS", "6147760453 MORADI").split(",") 
+    for x in os.getenv("ADMIN_USER_IDS", "").split(",") 
     if x.strip().isdigit()
 ]
 ALLOWED_USER_IDS = [
     int(x.strip()) 
-    for x in os.getenv("ALLOWED_USER_IDS", "6673849133 AMIRI, 5544021969 ALI").split(",") 
+    for x in os.getenv("ALLOWED_USER_IDS", "").split(",") 
     if x.strip().isdigit()
 ]
 CHECK_INTERVAL_SECONDS = max(10, int(os.getenv("CHECK_INTERVAL_SECONDS", "30")))
@@ -113,27 +113,30 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
 def parse_caption(caption: str) -> list[tuple[str, str, float]]:
     alerts = []
     caption_clean = caption.replace(",", ".")  # Deutsche Kommasetzung abfangen
-    lines = [line.strip() for line in caption_clean.split("\n") if line.strip()]
-    if not lines:
-        return alerts
-        
-    symbol_match = SYMBOL_PATTERN.search(lines[0])
+    
+    # 1. Symbol suchen (Muss zwingend mit '#' beginnen)
+    symbol_match = re.search(r"#([A-Za-z0-9/_-]+)", caption_clean)
     if not symbol_match:
-        return alerts  # Kein '#' am Anfang -> Abbrechen!
+        return alerts
     symbol = symbol_match.group(1).upper()
     
-    # Falls das Signal einzeilig ist (z.B. /alarm #TRXUSDT SHORT 0.3238)
-    if len(lines) == 1:
-        match = DIRECTION_TARGET_PATTERN.search(lines[0])
-        if match:
-            direction = match.group(1).upper()
-            try:
-                target = float(match.group(2))
-                alerts.append((symbol, direction, target))
-            except ValueError:
-                pass
-    else:
-        # Mehrzeilige Signale auswerten
+    lines = [line.strip() for line in caption_clean.split("\n") if line.strip()]
+    
+    # 2. Intelligenter globaler Scan (für TradingView-Formate mit Umbrüchen/Wörtern dazwischen)
+    dir_match = re.search(r"\b(LONG|SHORT)\b", caption_clean, re.IGNORECASE)
+    target_match = re.search(r"\b(?:target|ziel|tp)\s*:?\s*([\d.]+)", caption_clean, re.IGNORECASE)
+    
+    if dir_match and target_match:
+        direction = dir_match.group(1).upper()
+        try:
+            target = float(target_match.group(1))
+            alerts.append((symbol, direction, target))
+            return alerts  # Erfolgreich ausgelesen!
+        except ValueError:
+            pass
+
+    # 3. Fallback auf das klassische mehrzeilige Format (z.B. Zeile 2: LONG 0.3238)
+    if len(lines) > 1:
         for line in lines[1:]:
             match = DIRECTION_TARGET_PATTERN.search(line)
             if match:
@@ -143,6 +146,17 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
                     alerts.append((symbol, direction, target))
                 except ValueError:
                     continue
+    # 4. Fallback auf das klassische einzeilige Format
+    elif len(lines) == 1:
+        match = DIRECTION_TARGET_PATTERN.search(lines[0])
+        if match:
+            direction = match.group(1).upper()
+            try:
+                target = float(match.group(2))
+                alerts.append((symbol, direction, target))
+            except ValueError:
+                pass
+                
     return alerts
 
 
@@ -300,9 +314,8 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     parsed_alerts = parse_caption(text_to_parse)
     
-    # Wenn kein passender Alarm (inkl. '#') gefunden wurde, brechen wir ab.
+    # Wenn kein passender Alarm (inkl. '#') gefunden wurde
     if not parsed_alerts:
-        # Falls der Nutzer es explizit über /alarm versucht hat, Fehlermeldung zeigen
         if message.text and message.text.lower().startswith("/alarm"):
             bot_msg = await message.reply_text(
                 "❌ <b>Fehler:</b> Ungültiges Format!\n\n"
