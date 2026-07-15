@@ -1,4 +1,5 @@
-pyTelegramBotAPI
-flask
+python-telegram-bot
 libsql-client
-gunicorn
+aiohttp
+python-dotenv
+
