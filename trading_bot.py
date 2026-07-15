@@ -1,8 +1,8 @@
 """Telegram crypto target-alert bot.
 
 Send a photo with a caption such as:
-    BTC LONG 70000
-    ETHUSDT SHORT 2200
+    #BTC LONG 70000
+    #ETHUSDT SHORT 2200
 
 The bot stores the target, checks Binance Futures prices, and sends a message
 to the same chat when the target is reached.
@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest  # Erforderlich für die Timeout-Einstellung
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -32,7 +33,8 @@ LOGGER = logging.getLogger(__name__)
 load_dotenv()
 
 BINANCE_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
-SYMBOL_PATTERN = re.compile(r"^\s*#?([A-Za-z0-9/_-]+)")
+# Erfordert zwingend ein '#' am Anfang
+SYMBOL_PATTERN = re.compile(r"^\s*#([A-Za-z0-9/_-]+)")
 DIRECTION_TARGET_PATTERN = re.compile(
     r"\b(LONG|SHORT)\b\s*(?:TARGET(?:\s+PRICE)?|TP|PRICE)?\s*[:=@-]?\s*([0-9][0-9.,]*)",
     re.IGNORECASE,
@@ -105,7 +107,7 @@ def message_link(chat_id: int, chat_username: str | None, chat_type: str, messag
 
 
 def parse_caption(caption: str) -> list[tuple[str, str, float]]:
-    """Read one or two targets, e.g. ``BTC LONG 70000 SHORT 62000``."""
+    """Read one or two targets, e.g. ``#BTC LONG 70000 SHORT 62000``."""
     symbol_match = SYMBOL_PATTERN.match(caption)
     if not symbol_match:
         return []
@@ -257,12 +259,19 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_authorised(update, context) or update.message is None:
         return
-    parsed_alerts = parse_caption(update.message.caption or "")
+    
+    caption = (update.message.caption or "").strip()
+    
+    # Ignoriere Bilder komplett geräuschlos, wenn sie nicht mit '#' beginnen
+    if not caption.startswith("#"):
+        return
+
+    parsed_alerts = parse_caption(caption)
     if not parsed_alerts:
         await update.message.reply_text(
             "Ich konnte den Alarm nicht lesen. Schreibe in die Bildbeschreibung z. B.:\n"
-            "<code>BTC LONG 70000</code>\noder für beide Richtungen:\n"
-            "<code>BTC LONG 70000 SHORT 62000</code>",
+            "<code>#BTC LONG 70000</code>\noder für beide Richtungen:\n"
+            "<code>#BTC LONG 70000 SHORT 62000</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -477,8 +486,17 @@ def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN before starting the bot.")
+    
+    # Erhöht das Verbindungs-Timeout auf 30 Sekunden, um langsame Render-Leitungen abzufangen
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    
     application = (
-        Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
+        Application.builder()
+        .token(token)
+        .request(request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
     )
     application.add_handler(CommandHandler(("alarms", "alarm"), list_alerts))
     application.add_handler(CommandHandler("delete", delete_alert))
