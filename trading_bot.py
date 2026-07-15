@@ -41,12 +41,12 @@ DIRECTION_TARGET_PATTERN = re.compile(r"(LONG|SHORT)\s+([\d.,]+)", re.IGNORECASE
 # Admins & Erlaubte User IDs aus .env laden
 ADMIN_USER_IDS = [
     int(x.strip()) 
-    for x in os.getenv("ADMIN_USER_IDS", "").split(",") 
+    for x in os.getenv("ADMIN_USER_IDS", "6147760453 MORADI").split(",") 
     if x.strip().isdigit()
 ]
 ALLOWED_USER_IDS = [
     int(x.strip()) 
-    for x in os.getenv("ALLOWED_USER_IDS", "").split(",") 
+    for x in os.getenv("ALLOWED_USER_IDS", "6673849133 AMIRI, 5544021969 ALI").split(",") 
     if x.strip().isdigit()
 ]
 CHECK_INTERVAL_SECONDS = max(10, int(os.getenv("CHECK_INTERVAL_SECONDS", "30")))
