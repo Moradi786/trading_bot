@@ -13,11 +13,11 @@ import html
 import logging
 import os
 import re
-import sqlite3
 from contextlib import suppress
-from pathlib import Path
 
 import aiohttp
+import libsql_client
+from aiohttp import web
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -31,7 +31,6 @@ LOGGER = logging.getLogger(__name__)
 
 load_dotenv()
 
-DB_PATH = Path("alerts.db")
 BINANCE_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
 SYMBOL_PATTERN = re.compile(r"^\s*#?([A-Za-z0-9/_-]+)")
 DIRECTION_TARGET_PATTERN = re.compile(
@@ -59,46 +58,33 @@ ADMIN_USER_IDS = {
 CHECK_INTERVAL_SECONDS = max(10, int(os.getenv("CHECK_INTERVAL_SECONDS", "30")))
 
 
-def initialise_database() -> None:
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                direction TEXT NOT NULL CHECK(direction IN ('LONG', 'SHORT')),
-                target_price REAL NOT NULL CHECK(target_price > 0),
-                entry_price REAL NOT NULL CHECK(entry_price > 0),
-                created_by TEXT NOT NULL,
-                source_link TEXT,
-                photo_file_id TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+async def initialise_database(client) -> None:
+    await client.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL CHECK(direction IN ('LONG', 'SHORT')),
+            target_price REAL NOT NULL CHECK(target_price > 0),
+            entry_price REAL NOT NULL CHECK(entry_price > 0),
+            created_by TEXT NOT NULL,
+            source_link TEXT,
+            photo_file_id TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
-        # Allows an existing database made by an earlier bot version to keep working.
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(alerts)")}
-        if "entry_price" not in columns:
-            connection.execute("ALTER TABLE alerts ADD COLUMN entry_price REAL")
-            connection.execute("UPDATE alerts SET entry_price = target_price WHERE entry_price IS NULL")
-        if "source_link" not in columns:
-            connection.execute("ALTER TABLE alerts ADD COLUMN source_link TEXT")
-        if "photo_file_id" not in columns:
-            connection.execute("ALTER TABLE alerts ADD COLUMN photo_file_id TEXT")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS authorised_users (
-                user_id INTEGER PRIMARY KEY,
-                added_by INTEGER NOT NULL,
-                display_name TEXT,
-                added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+        """
+    )
+    await client.execute(
+        """
+        CREATE TABLE IF NOT EXISTS authorised_users (
+            user_id INTEGER PRIMARY KEY,
+            added_by INTEGER NOT NULL,
+            display_name TEXT,
+            added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
-        user_columns = {row[1] for row in connection.execute("PRAGMA table_info(authorised_users)")}
-        if "display_name" not in user_columns:
-            connection.execute("ALTER TABLE authorised_users ADD COLUMN display_name TEXT")
+        """
+    )
 
 
 def normalise_symbol(value: str) -> str:
@@ -113,7 +99,6 @@ def message_link(chat_id: int, chat_username: str | None, chat_type: str, messag
     if chat_type in {"group", "supergroup", "channel"} and chat_username:
         return f"https://t.me/{chat_username}/{message_id}"
     raw_chat_id = str(chat_id)
-    # t.me/c links work for private supergroups and channels (IDs begin with -100).
     if chat_type in {"supergroup", "channel"} and raw_chat_id.startswith("-100"):
         return f"https://t.me/c/{raw_chat_id[4:]}/{message_id}"
     return None
@@ -162,7 +147,7 @@ async def reply_in_chunks(message, text: str, parse_mode: ParseMode = ParseMode.
         text = text[split_at:].lstrip()
 
 
-def is_authorised(update: Update) -> bool:
+async def is_authorised(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if user is None:
         return False
@@ -170,10 +155,9 @@ def is_authorised(update: Update) -> bool:
         return True
     if not ADMIN_USER_IDS and not ALLOWED_USER_IDS:
         return True
-    with sqlite3.connect(DB_PATH) as connection:
-        return connection.execute(
-            "SELECT 1 FROM authorised_users WHERE user_id = ?", (user.id,)
-        ).fetchone() is not None
+    client = context.application.bot_data["db_client"]
+    result = await client.execute("SELECT 1 FROM authorised_users WHERE user_id = ?", (user.id,))
+    return len(result.rows) > 0
 
 
 def is_admin(update: Update) -> bool:
@@ -210,18 +194,18 @@ async def add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Usage: <code>/addid 123456789 AMIRI</code>", parse_mode=ParseMode.HTML
         )
         return
-    with sqlite3.connect(DB_PATH) as connection:
-        for user_id, display_name in entries:
-            connection.execute(
-                """
-                INSERT INTO authorised_users (user_id, added_by, display_name) VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET added_by = excluded.added_by, display_name = excluded.display_name
-                """,
-                (user_id, update.effective_user.id, display_name),
-            )
+    client = context.application.bot_data["db_client"]
+    for u_id, display_name in entries:
+        await client.execute(
+            """
+            INSERT INTO authorised_users (user_id, added_by, display_name) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET added_by = excluded.added_by, display_name = excluded.display_name
+            """,
+            (u_id, update.effective_user.id, display_name),
+        )
     added = "\n".join(
-        f"• {html.escape(name) if name else 'No name'} — <code>{user_id}</code>"
-        for user_id, name in entries
+        f"• {html.escape(name) if name else 'No name'} — <code>{u_id}</code>"
+        for u_id, name in entries
     )
     await update.message.reply_text(
         f"✅ User{'s' if len(entries) > 1 else ''} can now add alerts:\n{added}", parse_mode=ParseMode.HTML
@@ -238,11 +222,11 @@ async def delete_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Usage: <code>/deleteid 123456789</code>", parse_mode=ParseMode.HTML)
         return
     user_id = int(context.args[0])
-    with sqlite3.connect(DB_PATH) as connection:
-        cursor = connection.execute("DELETE FROM authorised_users WHERE user_id = ?", (user_id,))
+    client = context.application.bot_data["db_client"]
+    result = await client.execute("DELETE FROM authorised_users WHERE user_id = ?", (user_id,))
     message = (
         f"🗑️ User ID <code>{user_id}</code> removed."
-        if cursor.rowcount
+        if result.rows_affected > 0
         else "User ID was not in the added list."
     )
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
@@ -254,22 +238,24 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_admin(update):
         await update.message.reply_text("Only an admin can view allowed user IDs.")
         return
-    with sqlite3.connect(DB_PATH) as connection:
-        users = connection.execute(
-            "SELECT user_id, display_name FROM authorised_users ORDER BY added_at, user_id"
-        ).fetchall()
+    client = context.application.bot_data["db_client"]
+    result = await client.execute(
+        "SELECT user_id, display_name FROM authorised_users ORDER BY added_at, user_id"
+    )
+    users = result.rows
     if not users:
         await update.message.reply_text("No extra user IDs have been added yet.")
         return
     lines = ["👥 <b>Allowed users</b>"]
-    for number, (user_id, display_name) in enumerate(users, start=1):
+    for number, row in enumerate(users, start=1):
+        u_id, display_name = row[0], row[1]
         name = html.escape(display_name) if display_name else "No name"
-        lines.append(f"{number}. <b>{name}</b> — <code>{user_id}</code>")
+        lines.append(f"{number}. <b>{name}</b> — <code>{u_id}</code>")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorised(update) or update.message is None:
+    if not await is_authorised(update, context) or update.message is None:
         return
     parsed_alerts = parse_caption(update.message.caption or "")
     if not parsed_alerts:
@@ -297,15 +283,15 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.message.message_id,
     )
     photo_file_id = update.message.photo[-1].file_id
-    with sqlite3.connect(DB_PATH) as connection:
-        alert_ids: list[int] = []
-        for _, direction, target in parsed_alerts:
-            cursor = connection.execute(
-                "INSERT INTO alerts (chat_id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (update.effective_chat.id, symbol, direction, target, current_price, creator, source_link, photo_file_id),
-            )
-            alert_ids.append(cursor.lastrowid)
+    client = context.application.bot_data["db_client"]
+    alert_ids: list[int] = []
+    for _, direction, target in parsed_alerts:
+        result = await client.execute(
+            "INSERT INTO alerts (chat_id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (update.effective_chat.id, symbol, direction, target, current_price, creator, source_link, photo_file_id),
+        )
+        alert_ids.append(result.last_insert_rowid)
 
     saved = "\n".join(
         f"• #{alert_id} {direction} → Ziel: <code>{target:g}</code>"
@@ -319,14 +305,15 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorised(update) or update.effective_chat is None or update.message is None:
+    if not await is_authorised(update, context) or update.effective_chat is None or update.message is None:
         return
-    with sqlite3.connect(DB_PATH) as connection:
-        alerts = connection.execute(
-            "SELECT id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id "
-            "FROM alerts WHERE chat_id = ? ORDER BY id",
-            (update.effective_chat.id,),
-        ).fetchall()
+    client = context.application.bot_data["db_client"]
+    result = await client.execute(
+        "SELECT id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id "
+        "FROM alerts WHERE chat_id = ? ORDER BY id",
+        (update.effective_chat.id,),
+    )
+    alerts = result.rows
     if not alerts:
         await update.message.reply_text("🔔 No active alerts.")
         return
@@ -336,7 +323,8 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     prices = dict(zip(symbols, fetched_prices))
     lines = ["📊 <b>Active Alerts &amp; Current Prices</b>"]
     image_buttons: list[list[InlineKeyboardButton]] = []
-    for number, (alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id) in enumerate(alerts, start=1):
+    for number, alert in enumerate(alerts, start=1):
+        alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
         current = prices.get(symbol)
         if current is None:
             current_text, progress = "unavailable", 0
@@ -370,15 +358,16 @@ async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await query.answer()
     alert_id = int(query.data.split(":", maxsplit=1)[1])
-    with sqlite3.connect(DB_PATH) as connection:
-        alert = connection.execute(
-            "SELECT symbol, direction, target_price, photo_file_id FROM alerts WHERE id = ? AND chat_id = ?",
-            (alert_id, query.message.chat_id),
-        ).fetchone()
+    client = context.application.bot_data["db_client"]
+    result = await client.execute(
+        "SELECT symbol, direction, target_price, photo_file_id FROM alerts WHERE id = ? AND chat_id = ?",
+        (alert_id, query.message.chat_id),
+    )
+    alert = result.rows[0] if result.rows else None
     if alert is None or not alert[3]:
         await query.message.reply_text("The original image is no longer available.")
         return
-    symbol, direction, target, photo_file_id = alert
+    symbol, direction, target, photo_file_id = alert[0], alert[1], alert[2], alert[3]
     await query.message.reply_photo(
         photo=photo_file_id,
         caption=f"#{symbol} {direction} | Target: {target:g} USDT",
@@ -386,54 +375,82 @@ async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorised(update) or update.effective_chat is None or update.message is None:
+    if not await is_authorised(update, context) or update.effective_chat is None or update.message is None:
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
         await update.message.reply_text("Verwendung: <code>/delete 12</code>", parse_mode=ParseMode.HTML)
         return
-    with sqlite3.connect(DB_PATH) as connection:
-        cursor = connection.execute(
-            "DELETE FROM alerts WHERE id = ? AND chat_id = ?", (int(context.args[0]), update.effective_chat.id)
-        )
-    await update.message.reply_text("🗑️ Alarm gelöscht." if cursor.rowcount else "Kein Alarm mit dieser Nummer gefunden.")
+    client = context.application.bot_data["db_client"]
+    result = await client.execute(
+        "DELETE FROM alerts WHERE id = ? AND chat_id = ?", (int(context.args[0]), update.effective_chat.id)
+    )
+    await update.message.reply_text("🗑️ Alarm gelöscht." if result.rows_affected > 0 else "Kein Alarm mit dieser Nummer gefunden.")
 
 
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
+    client = application.bot_data["db_client"]
     while True:
-        with sqlite3.connect(DB_PATH) as connection:
-            alerts = connection.execute(
+        try:
+            result = await client.execute(
                 "SELECT id, chat_id, symbol, direction, target_price FROM alerts ORDER BY id"
-            ).fetchall()
+            )
+            alerts = result.rows
 
-        prices: dict[str, float | None] = {}
-        for _, _, symbol, _, _ in alerts:
-            if symbol not in prices:
-                prices[symbol] = await get_price(session, symbol)
+            prices: dict[str, float | None] = {}
+            for row in alerts:
+                symbol = row[2]
+                if symbol not in prices:
+                    prices[symbol] = await get_price(session, symbol)
 
-        for alert_id, chat_id, symbol, direction, target in alerts:
-            price = prices[symbol]
-            reached = price is not None and ((direction == "LONG" and price >= target) or (direction == "SHORT" and price <= target))
-            if not reached:
-                continue
-            try:
-                await application.bot.send_message(
-                    chat_id=chat_id,
-                    text=(f"🎯 <b>Ziel erreicht!</b>\n#{symbol} {direction}\n"
-                          f"Ziel: <code>{target:g}</code> | Kurs: <code>{price:g}</code>"),
-                    parse_mode=ParseMode.HTML,
-                )
-                with sqlite3.connect(DB_PATH) as connection:
-                    connection.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
-            except Exception:
-                LOGGER.exception("Could not notify chat %s for alert %s", chat_id, alert_id)
+            for row in alerts:
+                alert_id, chat_id, symbol, direction, target = row[0], row[1], row[2], row[3], row[4]
+                price = prices[symbol]
+                reached = price is not None and ((direction == "LONG" and price >= target) or (direction == "SHORT" and price <= target))
+                if not reached:
+                    continue
+                try:
+                    await application.bot.send_message(
+                        chat_id=chat_id,
+                        text=(f"🎯 <b>Ziel erreicht!</b>\n#{symbol} {direction}\n"
+                              f"Ziel: <code>{target:g}</code> | Kurs: <code>{price:g}</code>"),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    await client.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+                except Exception:
+                    LOGGER.exception("Could not notify chat %s for alert %s", chat_id, alert_id)
+        except Exception as e:
+            LOGGER.error("Fehler im Alert-Check-Loop: %s", e)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+
 async def post_init(application: Application) -> None:
-    initialise_database()
+    db_url = os.getenv("TURSO_DATABASE_URL")
+    db_token = os.getenv("TURSO_AUTH_TOKEN")
+    if not db_url or not db_token:
+        raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN environment variables must be set.")
+    
+    db_client = libsql_client.create_client(url=db_url, auth_token=db_token)
+    application.bot_data["db_client"] = db_client
+    
+    await initialise_database(db_client)
     application.bot_data["http_session"] = aiohttp.ClientSession()
     application.bot_data["alert_task"] = asyncio.create_task(check_alerts(application))
+    
+    # Start web server to prevent Render from idling or failing to bind to port
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    application.bot_data["web_runner"] = runner
+    LOGGER.info("Web server started on port %s", port)
 
 
 async def post_shutdown(application: Application) -> None:
@@ -442,9 +459,18 @@ async def post_shutdown(application: Application) -> None:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+            
     session = application.bot_data.get("http_session")
     if session:
         await session.close()
+        
+    db_client = application.bot_data.get("db_client")
+    if db_client:
+        await db_client.close()
+        
+    runner = application.bot_data.get("web_runner")
+    if runner:
+        await runner.cleanup()
 
 
 def main() -> None:
