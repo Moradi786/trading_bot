@@ -96,17 +96,63 @@ def message_link(chat_id: int, chat_username: str | None, chat_type: str, messag
     return None
 
 
+# MULTI-API FALLBACK FÜR DIE PREISABFRAGE
 async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None:
+    norm_symbol = normalise_symbol(symbol)
+    if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
+        norm_symbol += "USDT"
+
+    # --- VERSUCH 1: Binance Futures (Standard) ---
     try:
-        norm_symbol = normalise_symbol(symbol)
-        if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
-            norm_symbol += "USDT"
-        async with session.get(BINANCE_PRICE_URL, params={"symbol": norm_symbol}) as response:
+        async with session.get(
+            BINANCE_PRICE_URL,
+            params={"symbol": norm_symbol},
+            timeout=aiohttp.ClientTimeout(total=3)
+        ) as response:
             if response.status == 200:
                 data = await response.json()
                 return float(data["price"])
     except Exception:
-        LOGGER.exception("Fehler beim Abrufen des Preises für %s", symbol)
+        LOGGER.warning("Binance API für %s fehlgeschlagen (Geoblocking?). Probiere Bybit...", norm_symbol)
+
+    # --- VERSUCH 2: Bybit V5 API (Kein US-Geoblocking) ---
+    try:
+        bybit_url = "https://api.bybit.com/v5/market/tickers"
+        params = {"category": "linear", "symbol": norm_symbol}
+        async with session.get(
+            bybit_url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=3)
+        ) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get("retCode") == 0 and data["result"]["list"]:
+                    return float(data["result"]["list"][0]["lastPrice"])
+    except Exception:
+        LOGGER.warning("Bybit API für %s fehlgeschlagen. Probiere KuCoin...", norm_symbol)
+
+    # --- VERSUCH 3: KuCoin API (Backup) ---
+    try:
+        kucoin_symbol = norm_symbol
+        if kucoin_symbol.endswith("USDT"):
+            kucoin_symbol = kucoin_symbol.replace("USDT", "-USDT")
+        elif kucoin_symbol.endswith("BUSD"):
+            kucoin_symbol = kucoin_symbol.replace("BUSD", "-BUSD")
+        
+        kucoin_url = "https://api.kucoin.com/api/v1/market/orderbook/level1"
+        async with session.get(
+            kucoin_url,
+            params={"symbol": kucoin_symbol},
+            timeout=aiohttp.ClientTimeout(total=3)
+        ) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get("code") == "200000" and data.get("data"):
+                    return float(data["data"]["price"])
+    except Exception:
+        LOGGER.warning("KuCoin API für %s fehlgeschlagen.", kucoin_symbol)
+
+    LOGGER.error("Fehler: Keine API konnte den aktuellen Preis für %s abrufen.", norm_symbol)
     return None
 
 
