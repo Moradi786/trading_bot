@@ -113,7 +113,7 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
                 data = await response.json()
                 return float(data["price"])
     except Exception:
-        LOGGER.warning("Binance API für %s fehlgeschlagen (Geoblocking?). Probiere Bybit...", norm_symbol)
+        LOGGER.warning("Binance API für %s fehlgeschlagen. Probiere Bybit...", norm_symbol)
 
     # --- VERSUCH 2: Bybit V5 API (Kein US-Geoblocking) ---
     try:
@@ -156,30 +156,49 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
     return None
 
 
+# Intelligenter Zahlen-Parser für europäische und amerikanische Schreibweisen
+def parse_price(price_str: str) -> float | None:
+    price_str = price_str.strip()
+    
+    # Wenn sowohl Punkt als auch Komma vorkommen (z.B. 1.887,60 oder 1,887.60)
+    if "," in price_str and "." in price_str:
+        if price_str.find(".") < price_str.find(","):
+            # Deutsches Format: 1.887,60 -> Punkt löschen, Komma zum Punkt machen
+            price_str = price_str.replace(".", "").replace(",", ".")
+        else:
+            # US Format: 1,887.60 -> Komma löschen
+            price_str = price_str.replace(",", "")
+    # Wenn nur ein Komma vorkommt (z.B. 0,3238)
+    elif "," in price_str:
+        price_str = price_str.replace(",", ".")
+        
+    try:
+        return float(price_str)
+    except ValueError:
+        return None
+
+
 def parse_caption(caption: str) -> list[tuple[str, str, float]]:
     alerts = []
-    caption_clean = caption.replace(",", ".")  # Deutsche Kommasetzung abfangen
     
     # 1. Symbol suchen (Muss zwingend mit '#' beginnen)
-    symbol_match = re.search(r"#([A-Za-z0-9/_-]+)", caption_clean)
+    symbol_match = re.search(r"#([A-Za-z0-9/_-]+)", caption)
     if not symbol_match:
         return alerts
     symbol = symbol_match.group(1).upper()
     
-    lines = [line.strip() for line in caption_clean.split("\n") if line.strip()]
+    lines = [line.strip() for line in caption.split("\n") if line.strip()]
     
     # 2. Intelligenter globaler Scan (für TradingView-Formate mit Umbrüchen/Wörtern dazwischen)
-    dir_match = re.search(r"\b(LONG|SHORT)\b", caption_clean, re.IGNORECASE)
-    target_match = re.search(r"\b(?:target|ziel|tp)\s*:?\s*([\d.]+)", caption_clean, re.IGNORECASE)
+    dir_match = re.search(r"\b(LONG|SHORT)\b", caption, re.IGNORECASE)
+    target_match = re.search(r"\b(?:target|ziel|tp)\s*:?\s*([\d.,]+)", caption, re.IGNORECASE)
     
     if dir_match and target_match:
         direction = dir_match.group(1).upper()
-        try:
-            target = float(target_match.group(1))
+        target = parse_price(target_match.group(1))
+        if target is not None:
             alerts.append((symbol, direction, target))
             return alerts
-        except ValueError:
-            pass
 
     # 3. Fallback auf das klassische mehrzeilige Format
     if len(lines) > 1:
@@ -187,21 +206,17 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
             match = DIRECTION_TARGET_PATTERN.search(line)
             if match:
                 direction = match.group(1).upper()
-                try:
-                    target = float(match.group(2))
+                target = parse_price(match.group(2))
+                if target is not None:
                     alerts.append((symbol, direction, target))
-                except ValueError:
-                    continue
     # 4. Fallback auf das klassische einzeilige Format
     elif len(lines) == 1:
         match = DIRECTION_TARGET_PATTERN.search(lines[0])
         if match:
             direction = match.group(1).upper()
-            try:
-                target = float(match.group(2))
+            target = parse_price(match.group(2))
+            if target is not None:
                 alerts.append((symbol, direction, target))
-            except ValueError:
-                pass
                 
     return alerts
 
