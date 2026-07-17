@@ -64,10 +64,15 @@ async def initialise_database(client) -> None:
             created_by TEXT NOT NULL,
             source_link TEXT,
             photo_file_id TEXT,
+            near_alert_sent INTEGER DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    # Safe migration: Adds the near_alert_sent column if the database already exists
+    with suppress(Exception):
+        await client.execute("ALTER TABLE alerts ADD COLUMN near_alert_sent INTEGER DEFAULT 0")
+
     await client.execute(
         """
         CREATE TABLE IF NOT EXISTS authorised_users (
@@ -417,9 +422,6 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     
     bot_msg = await message.reply_text(reply_text, parse_mode=ParseMode.HTML)
-    
-    # UPDATED: Automatically clears ONLY the bot's response message after 60 seconds (1 minute). 
-    # Your signal/photo message stays inside the chat!
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [bot_msg.message_id], 60))
 
 
@@ -543,14 +545,14 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
 
 
-# 5. BACKGROUND ENGINE: TICKER WATCHER
+# 5. BACKGROUND ENGINE: TICKER WATCHER (WITH NEAR TARGET ALERTS)
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
     client = application.bot_data["db_client"]
     while True:
         try:
             result = await client.execute(
-                "SELECT id, chat_id, symbol, direction, target_price, photo_file_id FROM alerts ORDER BY id"
+                "SELECT id, chat_id, symbol, direction, target_price, photo_file_id, near_alert_sent FROM alerts ORDER BY id"
             )
             alerts = result.rows
 
@@ -561,40 +563,62 @@ async def check_alerts(application: Application) -> None:
                     prices[symbol] = await get_price(session, symbol)
 
             for row in alerts:
-                alert_id, chat_id, symbol, direction, target, photo_file_id = row[0], row[1], row[2], row[3], row[4], row[5]
+                alert_id, chat_id, symbol, direction, target, photo_file_id, near_alert_sent = row[0], row[1], row[2], row[3], row[4], row[5], row[6]
                 price = prices[symbol]
                 
-                reached = price is not None and (
+                if price is None:
+                    continue
+
+                # 1. Check if ultimate target is reached
+                reached = (
                     (direction == "LONG" and price >= target) or 
                     (direction == "SHORT" and price <= target)
                 )
-                if not reached:
-                    continue
-                    
-                dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-                success_text = (
-                    f"🎯 <b>Target Reached!</b>\n"
-                    f"#{symbol} {dir_emoji}\n"
-                    f"Target: <code>{target:g}</code> | Price Hit: <code>{price:g}</code>"
-                )
                 
-                try:
-                    if photo_file_id:
-                        await application.bot.send_photo(
-                            chat_id=chat_id,
-                            photo=photo_file_id,
-                            caption=success_text,
-                            parse_mode=ParseMode.HTML
-                        )
-                    else:
+                if reached:
+                    dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+                    success_text = (
+                        f"🎯 <b>Target Reached!</b>\n"
+                        f"#{symbol} {dir_emoji}\n"
+                        f"Target: <code>{target:g}</code> | Price Hit: <code>{price:g}</code>"
+                    )
+                    try:
+                        if photo_file_id:
+                            await application.bot.send_photo(
+                                chat_id=chat_id, photo=photo_file_id, caption=success_text, parse_mode=ParseMode.HTML
+                            )
+                        else:
+                            await application.bot.send_message(
+                                chat_id=chat_id, text=success_text, parse_mode=ParseMode.HTML
+                            )
+                        await client.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+                    except Exception:
+                        LOGGER.exception("Failed to dispatch alert notification to chat %s for ID %s", chat_id, alert_id)
+                    continue
+
+                # 2. Check if price is NEAR target (within 1% threshold) and hasn't warned yet
+                is_near = False
+                if direction == "LONG" and (target * 0.99) <= price < target:
+                    is_near = True
+                elif direction == "SHORT" and (target * 1.01) >= price > target:
+                    is_near = True
+
+                if is_near and not near_alert_sent:
+                    dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+                    warning_text = (
+                        f"⚠️ <b>Fast am Ziel! (Nähe zum Target)</b>\n"
+                        f"#{symbol} {dir_emoji}\n"
+                        f"🎯 Target: <code>{target:g}</code> | Aktueller Kurs: <code>{price:g}</code> (Weniger als 1% entfernt!)"
+                    )
+                    try:
                         await application.bot.send_message(
-                            chat_id=chat_id,
-                            text=success_text,
-                            parse_mode=ParseMode.HTML,
+                            chat_id=chat_id, text=warning_text, parse_mode=ParseMode.HTML
                         )
-                    await client.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
-                except Exception:
-                    LOGGER.exception("Failed to dispatch alert notification to chat %s for ID %s", chat_id, alert_id)
+                        # Flag it as sent in database so it alerts exactly once
+                        await client.execute("UPDATE alerts SET near_alert_sent = 1 WHERE id = ?", (alert_id,))
+                    except Exception:
+                        LOGGER.exception("Failed to send near-target warning context for ID %s", alert_id)
+
         except Exception as e:
             LOGGER.error("Error inside target loop execution: %s", e)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
