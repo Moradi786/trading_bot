@@ -38,7 +38,7 @@ BINANCE_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
 SYMBOL_PATTERN = re.compile(r"^\s*#([A-Za-z0-9/_-]+)")
 DIRECTION_TARGET_PATTERN = re.compile(r"(LONG|SHORT)\s+([\d.,]+)", re.IGNORECASE)
 
-# Automatically extracts pure numbers and ignores text tags (e.g., MORADI, AMIRI, ALI)
+# Automatically extracts pure numbers and ignores text tags
 ADMIN_USER_IDS = [
     int(num) 
     for num in re.findall(r"\d+", os.getenv("ADMIN_USER_IDS", "6147760453 MORADI"))
@@ -100,7 +100,7 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
     if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
         norm_symbol += "USDT"
 
-    # TRY 1: Binance Futures (Standard)
+    # TRY 1: Binance Futures
     try:
         async with session.get(
             BINANCE_PRICE_URL,
@@ -371,7 +371,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Example: <code>/alarm #TRXUSDT SHORT 0.3238</code>",
                 parse_mode=ParseMode.HTML
             )
-            asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [message.message_id, bot_msg.message_id], 30))
+            asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [bot_msg.message_id], 30))
         return
 
     chat = update.effective_chat
@@ -395,9 +395,9 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         
         dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
         reply_text = (
-            f"✅ <b>Alert Saved - #{symbol} | BY {creator}</b>\n"
-            f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>\n"
-            f"Current Price: <code>{current_price:g}</code>"
+            f"✅ <b>Alarm gespeichert - #{symbol} | BY {creator}</b>\n"
+            f"• #{alert_id} {dir_emoji} → Ziel: <code>{target:g}</code>\n"
+            f"Aktueller Kurs: <code>{current_price:g}</code>"
         )
     else:
         saved_lines = []
@@ -410,13 +410,17 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             alert_id = result.last_insert_rowid
             dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-            saved_lines.append(f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>")
+            saved_lines.append(f"• #{alert_id} {dir_emoji} → Ziel: <code>{target:g}</code>")
             
         reply_text = (
-            f"🔔 <b>Multiple Alerts Saved!</b>\n" + "\n".join(saved_lines)
+            f"🔔 <b>Mehrere Alarme gespeichert!</b>\n" + "\n".join(saved_lines)
         )
     
-    await message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    bot_msg = await message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    
+    # UPDATED: Automatically clears ONLY the bot's response message after 60 seconds (1 minute). 
+    # Your signal/photo message stays inside the chat!
+    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [bot_msg.message_id], 60))
 
 
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -545,7 +549,6 @@ async def check_alerts(application: Application) -> None:
     client = application.bot_data["db_client"]
     while True:
         try:
-            # Added photo_file_id into database query selection
             result = await client.execute(
                 "SELECT id, chat_id, symbol, direction, target_price, photo_file_id FROM alerts ORDER BY id"
             )
@@ -576,7 +579,6 @@ async def check_alerts(application: Application) -> None:
                 )
                 
                 try:
-                    # FIX: Sends original image if attached to the hit alert
                     if photo_file_id:
                         await application.bot.send_photo(
                             chat_id=chat_id,
