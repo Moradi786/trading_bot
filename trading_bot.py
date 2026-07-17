@@ -22,7 +22,7 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-# Logging initialisieren
+# Initialize Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -34,25 +34,23 @@ load_dotenv()
 DB_PATH = Path("alerts.db")
 BINANCE_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
 
-# Das '#' ist Pflicht!
+# Regex Patterns
 SYMBOL_PATTERN = re.compile(r"^\s*#([A-Za-z0-9/_-]+)")
 DIRECTION_TARGET_PATTERN = re.compile(r"(LONG|SHORT)\s+([\d.,]+)", re.IGNORECASE)
 
-# Admins & Erlaubte User IDs aus .env laden
+# Automatically extracts pure numbers and ignores text tags (e.g., MORADI, AMIRI, ALI)
 ADMIN_USER_IDS = [
-    int(x.strip()) 
-    for x in os.getenv("ADMIN_USER_IDS", "6147760453 MORADI").split(",") 
-    if x.strip().isdigit()
+    int(num) 
+    for num in re.findall(r"\d+", os.getenv("ADMIN_USER_IDS", "6147760453 MORADI"))
 ]
 ALLOWED_USER_IDS = [
-    int(x.strip()) 
-    for x in os.getenv("ALLOWED_USER_IDS", "6673849133 AMIRI , 5544021969 ALI").split(",") 
-    if x.strip().isdigit()
+    int(num) 
+    for num in re.findall(r"\d+", os.getenv("ALLOWED_USER_IDS", "6673849133 AMIRI , 5544021969 ALI"))
 ]
 CHECK_INTERVAL_SECONDS = max(10, int(os.getenv("CHECK_INTERVAL_SECONDS", "30")))
 
 
-# 1. DATENBANK-SETUP (Turso)
+# 1. DATABASE SETUP
 async def initialise_database(client) -> None:
     await client.execute(
         """
@@ -82,7 +80,7 @@ async def initialise_database(client) -> None:
     )
 
 
-# 2. HILFSFUNKTIONEN
+# 2. HELPER FUNCTIONS
 def normalise_symbol(value: str) -> str:
     return value.upper().strip().replace("/", "").replace("-", "").replace("_", "")
 
@@ -96,13 +94,13 @@ def message_link(chat_id: int, chat_username: str | None, chat_type: str, messag
     return None
 
 
-# MULTI-API FALLBACK FÜR DIE PREISABFRAGE
+# MULTI-API FALLBACK FOR PRICE FETCHING
 async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None:
     norm_symbol = normalise_symbol(symbol)
     if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
         norm_symbol += "USDT"
 
-    # --- VERSUCH 1: Binance Futures (Standard) ---
+    # TRY 1: Binance Futures (Standard)
     try:
         async with session.get(
             BINANCE_PRICE_URL,
@@ -113,9 +111,9 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
                 data = await response.json()
                 return float(data["price"])
     except Exception:
-        LOGGER.warning("Binance API für %s fehlgeschlagen. Probiere Bybit...", norm_symbol)
+        LOGGER.warning("Binance API for %s failed. Trying Bybit...", norm_symbol)
 
-    # --- VERSUCH 2: Bybit V5 API (Kein US-Geoblocking) ---
+    # TRY 2: Bybit V5 API
     try:
         bybit_url = "https://api.bybit.com/v5/market/tickers"
         params = {"category": "linear", "symbol": norm_symbol}
@@ -129,9 +127,9 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
                 if data.get("retCode") == 0 and data["result"]["list"]:
                     return float(data["result"]["list"][0]["lastPrice"])
     except Exception:
-        LOGGER.warning("Bybit API für %s fehlgeschlagen. Probiere KuCoin...", norm_symbol)
+        LOGGER.warning("Bybit API for %s failed. Trying KuCoin...", norm_symbol)
 
-    # --- VERSUCH 3: KuCoin API (Backup) ---
+    # TRY 3: KuCoin API
     try:
         kucoin_symbol = norm_symbol
         if kucoin_symbol.endswith("USDT"):
@@ -150,25 +148,21 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
                 if data.get("code") == "200000" and data.get("data"):
                     return float(data["data"]["price"])
     except Exception:
-        LOGGER.warning("KuCoin API für %s fehlgeschlagen.", kucoin_symbol)
+        LOGGER.warning("KuCoin API for %s failed.", kucoin_symbol)
 
-    LOGGER.error("Fehler: Keine API konnte den aktuellen Preis für %s abrufen.", norm_symbol)
+    LOGGER.error("Error: All price APIs failed for %s.", norm_symbol)
     return None
 
 
-# Intelligenter Zahlen-Parser für europäische und amerikanische Schreibweisen
+# Parses European and American number formats safely
 def parse_price(price_str: str) -> float | None:
     price_str = price_str.strip()
     
-    # Wenn sowohl Punkt als auch Komma vorkommen (z.B. 1.887,60 oder 1,887.60)
     if "," in price_str and "." in price_str:
         if price_str.find(".") < price_str.find(","):
-            # Deutsches Format: 1.887,60 -> Punkt löschen, Komma zum Punkt machen
             price_str = price_str.replace(".", "").replace(",", ".")
         else:
-            # US Format: 1,887.60 -> Komma löschen
             price_str = price_str.replace(",", "")
-    # Wenn nur ein Komma vorkommt (z.B. 0,3238)
     elif "," in price_str:
         price_str = price_str.replace(",", ".")
         
@@ -178,20 +172,27 @@ def parse_price(price_str: str) -> float | None:
         return None
 
 
+# Flexible Signal Parser
 def parse_caption(caption: str) -> list[tuple[str, str, float]]:
     alerts = []
     
-    # 1. Symbol suchen (Muss zwingend mit '#' beginnen)
     symbol_match = re.search(r"#([A-Za-z0-9/_-]+)", caption)
     if not symbol_match:
         return alerts
     symbol = symbol_match.group(1).upper()
     
-    lines = [line.strip() for line in caption.split("\n") if line.strip()]
-    
-    # 2. Intelligenter globaler Scan (für TradingView-Formate mit Umbrüchen/Wörtern dazwischen)
+    # Inline Scan (e.g., #ethusdt short 1.887,60)
+    inline_match = re.search(r"\b(LONG|SHORT)\b\s+([\d.,]+)", caption, re.IGNORECASE)
+    if inline_match:
+        direction = inline_match.group(1).upper()
+        target = parse_price(inline_match.group(2))
+        if target is not None:
+            alerts.append((symbol, direction, target))
+            return alerts
+            
+    # Keyword Scan (e.g., Target: 220.6)
     dir_match = re.search(r"\b(LONG|SHORT)\b", caption, re.IGNORECASE)
-    target_match = re.search(r"\b(?:target|ziel|tp)\s*:?\s*([\d.,]+)", caption, re.IGNORECASE)
+    target_match = re.search(r"\b(?:target|ziel|tp|entry|price)\s*:?\s*([\d.,]+)", caption, re.IGNORECASE)
     
     if dir_match and target_match:
         direction = dir_match.group(1).upper()
@@ -200,38 +201,29 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
             alerts.append((symbol, direction, target))
             return alerts
 
-    # 3. Fallback auf das klassische mehrzeilige Format
-    if len(lines) > 1:
-        for line in lines[1:]:
-            match = DIRECTION_TARGET_PATTERN.search(line)
-            if match:
-                direction = match.group(1).upper()
-                target = parse_price(match.group(2))
-                if target is not None:
-                    alerts.append((symbol, direction, target))
-    # 4. Fallback auf das klassische einzeilige Format
-    elif len(lines) == 1:
-        match = DIRECTION_TARGET_PATTERN.search(lines[0])
+    # Line by Line Fallback
+    lines = [line.strip() for line in caption.split("\n") if line.strip()]
+    for line in lines:
+        match = DIRECTION_TARGET_PATTERN.search(line)
         if match:
             direction = match.group(1).upper()
             target = parse_price(match.group(2))
             if target is not None:
                 alerts.append((symbol, direction, target))
+                return alerts
                 
     return alerts
 
 
-# 3. SAUBERER CHAT: AUTOMATISCHES LÖSCHEN
+# AUTOMATIC MESSAGE CLEANUP
 async def delete_messages_later(bot, chat_id, message_ids, delay=30):
     await asyncio.sleep(delay)
     for msg_id in message_ids:
-        try:
+        with suppress(TelegramError):
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except TelegramError:
-            pass
 
 
-# 4. RECHTEPRÜFUNG
+# AUTHORISATION CHECKS
 async def is_authorised(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if user is None:
@@ -250,7 +242,7 @@ def is_admin(update: Update) -> bool:
     return user is not None and user.id in ADMIN_USER_IDS
 
 
-# 5. COMMANDS: USER-VERWALTUNG (ADMINS)
+# 3. COMMANDS: USER MANAGEMENT (ADMIN ONLY)
 async def add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not is_admin(update):
@@ -287,7 +279,7 @@ async def add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         for u_id, name in entries
     )
     bot_msg = await user_msg.reply_text(
-        f"✅ User{'s' if len(entries) > 1 else ''} can now add alerts:\n{added}", parse_mode=ParseMode.HTML
+        f"✅ User{'s' if len(entries) > 1 else ''} authorized successfully:\n{added}", parse_mode=ParseMode.HTML
     )
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
 
@@ -311,7 +303,7 @@ async def delete_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message = (
         f"🗑️ User ID <code>{user_id}</code> removed."
         if result.rows_affected > 0
-        else "User ID was not in the added list."
+        else "User ID was not found in the authorized list."
     )
     bot_msg = await user_msg.reply_text(message, parse_mode=ParseMode.HTML)
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
@@ -330,11 +322,11 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     users = result.rows
     if not users:
-        bot_msg = await user_msg.reply_text("No extra user IDs have been added yet.")
+        bot_msg = await user_msg.reply_text("No extra user IDs authorized yet.")
         asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
         return
 
-    lines = ["👥 <b>Allowed users</b>"]
+    lines = ["👥 <b>Allowed Users List</b>"]
     for number, row in enumerate(users, start=1):
         u_id, display_name = row[0], row[1]
         name = html.escape(display_name) if display_name else "No name"
@@ -344,7 +336,7 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
 
 
-# 6. COMMANDS: ALARM-VERWALTUNG (SIGNALE)
+# 4. COMMANDS: ALERT MANAGEMENT
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_authorised(update, context) or update.message is None:
         return
@@ -353,11 +345,9 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text_to_parse = ""
     photo_file_id = None
 
-    # Fall 1: Foto mit Caption
     if message.photo:
         text_to_parse = message.caption or ""
         photo_file_id = message.photo[-1].file_id
-    # Fall 2: Reply auf Foto/Text
     elif message.reply_to_message:
         replied = message.reply_to_message
         if replied.photo:
@@ -365,11 +355,9 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             photo_file_id = replied.photo[-1].file_id
         else:
             text_to_parse = replied.text or ""
-    # Fall 3: Reiner Text-Befehl
     else:
         text_to_parse = message.text or ""
 
-    # "/alarm" am Anfang abschneiden
     if text_to_parse.lower().startswith("/alarm"):
         text_to_parse = re.sub(r"^/alarm\s*", "", text_to_parse, flags=re.IGNORECASE).strip()
 
@@ -378,9 +366,9 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not parsed_alerts:
         if message.text and message.text.lower().startswith("/alarm"):
             bot_msg = await message.reply_text(
-                "❌ <b>Fehler:</b> Ungültiges Format!\n\n"
-                "Der Coin-Name <b>muss</b> mit einem <code>#</code> beginnen.\n"
-                "Beispiel: <code>/alarm #TRXUSDT SHORT 0.3238</code>",
+                "❌ <b>Error:</b> Invalid Format!\n\n"
+                "The ticker/coin <b>must</b> start with a <code>#</code>.\n"
+                "Example: <code>/alarm #TRXUSDT SHORT 0.3238</code>",
                 parse_mode=ParseMode.HTML
             )
             asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [message.message_id, bot_msg.message_id], 30))
@@ -394,7 +382,6 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = context.application.bot_data["http_session"]
     creator = update.effective_user.username or update.effective_user.first_name or "Unknown"
 
-    # SCHÖNE ERFOLGSMELDUNG (PASSEND ZUM ORIGINAL-STYLE)
     if len(parsed_alerts) == 1:
         symbol, direction, target = parsed_alerts[0]
         current_price = await get_price(session, symbol) or target
@@ -406,13 +393,13 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         alert_id = result.last_insert_rowid
         
+        dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
         reply_text = (
-            f"✅ <b>Alarm gespeichert - #{symbol} | BY {creator}</b>\n"
-            f"• #{alert_id} {direction} → Ziel: <code>{target:g}</code>\n"
-            f"Aktueller Kurs: <code>{current_price:g}</code>"
+            f"✅ <b>Alert Saved - #{symbol} | BY {creator}</b>\n"
+            f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>\n"
+            f"Current Price: <code>{current_price:g}</code>"
         )
     else:
-        # Falls doch mehrere gleichzeitig gespeichert werden
         saved_lines = []
         for symbol, direction, target in parsed_alerts:
             current_price = await get_price(session, symbol) or target
@@ -422,17 +409,16 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 (update.effective_chat.id, symbol, direction, target, current_price, creator, source_link, photo_file_id),
             )
             alert_id = result.last_insert_rowid
-            saved_lines.append(f"• #{alert_id} {direction} → Ziel: <code>{target:g}</code>")
+            dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+            saved_lines.append(f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>")
             
         reply_text = (
-            f"🔔 <b>Alarme gespeichert!</b>\n"
-            + "\n".join(saved_lines)
+            f"🔔 <b>Multiple Alerts Saved!</b>\n" + "\n".join(saved_lines)
         )
     
     await message.reply_text(reply_text, parse_mode=ParseMode.HTML)
 
 
-# DIE SCHÖNE ALARMLISTE MIT FORTSCHRITTSBALKEN
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -455,14 +441,14 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     fetched_prices = await asyncio.gather(*(get_price(session, s) for s in symbols))
     prices = dict(zip(symbols, fetched_prices))
 
-    lines = ["📊 <b>Active Alerts &amp; Current Prices</b>"]
+    lines = ["📊 <b>Active Alerts &amp; Market Prices</b>"]
     keyboard = []
 
     for number, alert in enumerate(alerts, start=1):
         alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
         current = prices.get(symbol)
         
-        dir_emoji = "🟢" if direction == "LONG" else "🔴"
+        dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
         
         if current is None:
             current_text = "unavailable"
@@ -470,7 +456,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             current_text = f"{current:g} USDT"
             
-            # Mathematisch korrekte Trading-Fortschrittsberechnung
             if direction == "LONG":
                 if current <= entry:
                     progress = 0
@@ -486,7 +471,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 else:
                     progress = int(((entry - current) / (entry - target)) * 100)
 
-            # Fortschrittsbalken generieren
             progress_clamped = min(100, max(0, progress))
             filled_blocks = int(progress_clamped / 10)
             empty_blocks = 10 - filled_blocks
@@ -495,15 +479,14 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         lines.append(
             f"{number}. <b>#{symbol}</b> | BY {creator}\n"
-            f"{dir_emoji} {direction}\n"
+            f"{dir_emoji}\n"
             f"🎯 Target: <code>{target:g}</code> USDT\n"
             f"⚡ Current: <code>{current_text}</code>"
             f"{progress_line}"
         )
         
-        # Der schöne Original-Button-Text
         if photo_file_id:
-            keyboard.append([InlineKeyboardButton(f"🔗 🖼️ View Image #{symbol}", callback_data=f"show_img:{alert_id}")])
+            keyboard.append([InlineKeyboardButton(f"🔗 🖼️ View Chart #{symbol}", callback_data=f"show_img:{alert_id}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     bot_msg = await user_msg.reply_text("\n\n".join(lines), reply_markup=reply_markup, parse_mode=ParseMode.HTML)
@@ -524,13 +507,14 @@ async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     alert = result.rows[0] if result.rows else None
     if alert is None or not alert[3]:
-        await query.message.reply_text("The original image is no longer available.")
+        await query.message.reply_text("The original chart image is no longer available.")
         return
 
     symbol, direction, target, photo_file_id = alert[0], alert[1], alert[2], alert[3]
+    dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
     await query.message.reply_photo(
         photo=photo_file_id,
-        caption=f"#{symbol} {direction} | Target: {target:g} USDT",
+        caption=f"#{symbol} {dir_emoji} | Target: {target:g} USDT",
     )
 
 
@@ -540,7 +524,7 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if len(context.args) != 1 or not context.args[0].isdigit():
-        bot_msg = await user_msg.reply_text("Verwendung: <code>/delete 12</code>", parse_mode=ParseMode.HTML)
+        bot_msg = await user_msg.reply_text("Usage: <code>/delete 12</code>", parse_mode=ParseMode.HTML)
         asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
         return
 
@@ -550,19 +534,20 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     
     bot_msg = await user_msg.reply_text(
-        "🗑️ Alarm gelöscht." if result.rows_affected > 0 else "Kein Alarm mit dieser Nummer gefunden."
+        "🗑️ Alert deleted successfully." if result.rows_affected > 0 else "No active alert found with that ID."
     )
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
 
 
-# 7. HINTERGRUND-TASK: ALARME PRÜFEN
+# 5. BACKGROUND ENGINE: TICKER WATCHER
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
     client = application.bot_data["db_client"]
     while True:
         try:
+            # Added photo_file_id into database query selection
             result = await client.execute(
-                "SELECT id, chat_id, symbol, direction, target_price FROM alerts ORDER BY id"
+                "SELECT id, chat_id, symbol, direction, target_price, photo_file_id FROM alerts ORDER BY id"
             )
             alerts = result.rows
 
@@ -573,42 +558,57 @@ async def check_alerts(application: Application) -> None:
                     prices[symbol] = await get_price(session, symbol)
 
             for row in alerts:
-                alert_id, chat_id, symbol, direction, target = row[0], row[1], row[2], row[3], row[4]
+                alert_id, chat_id, symbol, direction, target, photo_file_id = row[0], row[1], row[2], row[3], row[4], row[5]
                 price = prices[symbol]
+                
                 reached = price is not None and (
                     (direction == "LONG" and price >= target) or 
                     (direction == "SHORT" and price <= target)
                 )
                 if not reached:
                     continue
+                    
+                dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+                success_text = (
+                    f"🎯 <b>Target Reached!</b>\n"
+                    f"#{symbol} {dir_emoji}\n"
+                    f"Target: <code>{target:g}</code> | Price Hit: <code>{price:g}</code>"
+                )
+                
                 try:
-                    await application.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"🎯 <b>Ziel erreicht!</b>\n#{symbol} {direction}\n"
-                            f"Ziel: <code>{target:g}</code> | Kurs: <code>{price:g}</code>"
-                        ),
-                        parse_mode=ParseMode.HTML,
-                    )
+                    # FIX: Sends original image if attached to the hit alert
+                    if photo_file_id:
+                        await application.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=photo_file_id,
+                            caption=success_text,
+                            parse_mode=ParseMode.HTML
+                        )
+                    else:
+                        await application.bot.send_message(
+                            chat_id=chat_id,
+                            text=success_text,
+                            parse_mode=ParseMode.HTML,
+                        )
                     await client.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
                 except Exception:
-                    LOGGER.exception("Could not notify chat %s for alert %s", chat_id, alert_id)
+                    LOGGER.exception("Failed to dispatch alert notification to chat %s for ID %s", chat_id, alert_id)
         except Exception as e:
-            LOGGER.error("Fehler im Alert-Check-Loop: %s", e)
+            LOGGER.error("Error inside target loop execution: %s", e)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# 8. MINI-WEBSERVER FÜR PORT-BINDING
+# 6. MINI WEB SERVER (PORT BINDING REQUIREMENT)
 async def handle_ping(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot ecosystem is running live!")
 
 
-# 9. TELEGRAM INITIALISIERUNG & SHUTDOWN
+# 7. TELEGRAM LIFECYCLE HANDLERS
 async def post_init(application: Application) -> None:
     db_url = os.getenv("TURSO_DATABASE_URL")
     db_token = os.getenv("TURSO_AUTH_TOKEN")
     if not db_url or not db_token:
-        raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN environment variables must be set.")
+        raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN environment variables must be configured properly.")
     
     if db_url.startswith("libsql://"):
         db_url = db_url.replace("libsql://", "https://")
@@ -628,7 +628,7 @@ async def post_init(application: Application) -> None:
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     application.bot_data["web_runner"] = runner
-    LOGGER.info("Web server started on port %s", port)
+    LOGGER.info("Internal status engine bound on port %s", port)
 
 
 async def post_shutdown(application: Application) -> None:
@@ -651,11 +651,11 @@ async def post_shutdown(application: Application) -> None:
         await runner.cleanup()
 
 
-# 10. ENTRYPOINT
+# 8. BOT RUNTIME MANAGER
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        LOGGER.error("Kein TELEGRAM_BOT_TOKEN in der .env gefunden!")
+        LOGGER.error("Missing TELEGRAM_BOT_TOKEN inside configuration profile (.env)")
         return
 
     application = (
@@ -666,7 +666,7 @@ def main() -> None:
         .build()
     )
 
-    # Befehle registrieren
+    # Command Pipelines
     application.add_handler(CommandHandler("addid", add_user_id))
     application.add_handler(CommandHandler("deleteid", delete_user_id))
     application.add_handler(CommandHandler("list", list_user_ids))
@@ -674,13 +674,12 @@ def main() -> None:
     application.add_handler(CommandHandler("alerts", list_alerts))
     application.add_handler(CommandHandler("alarm", add_alert))
     
-    # Callback für Bildanzeige bei Inline-Buttons
+    # Context-Interactive Actions
     application.add_handler(CallbackQueryHandler(show_trade_image, pattern="^show_img:"))
-    
-    # Handler für Bilder mit Alarmsignalen
     application.add_handler(MessageHandler(filters.PHOTO, add_alert))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_alert))
 
-    LOGGER.info("Starte Polling...")
+    LOGGER.info("Starting Polling loop context...")
     application.run_polling()
 
 
