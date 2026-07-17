@@ -73,6 +73,23 @@ async def initialise_database(client) -> None:
     with suppress(Exception):
         await client.execute("ALTER TABLE alerts ADD COLUMN near_alert_sent INTEGER DEFAULT 0")
 
+    # TABLE: For keeping track of triggered/completed alerts
+    await client.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alert_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            target_price REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            triggered_price REAL NOT NULL,
+            created_by TEXT NOT NULL,
+            triggered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
     await client.execute(
         """
         CREATE TABLE IF NOT EXISTS authorised_users (
@@ -499,6 +516,40 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
 
 
+# UPDATED FEATURE: Command to view history of triggered alerts (Shows up to 30 elements, deleted after 1 minute)
+async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_msg = update.message
+    if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
+        return
+
+    client = context.application.bot_data["db_client"]
+    # Optimization 1: Fetch the last 30 successfully triggered alerts instead of 15
+    result = await client.execute(
+        "SELECT symbol, direction, target_price, triggered_price, created_by, triggered_at "
+        "FROM alert_history WHERE chat_id = ? ORDER BY triggered_at DESC LIMIT 30",
+        (update.effective_chat.id,),
+    )
+    history = result.rows
+    if not history:
+        bot_msg = await user_msg.reply_text("📜 Bisher wurden keine Alarme ausgelöst.")
+        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60))
+        return
+
+    lines = ["📜 <b>Historie der erreichten Ziele (Letzte 30)</b>"]
+    for number, row in enumerate(history, start=1):
+        symbol, direction, target, triggered, creator, timestamp = row
+        dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+        lines.append(
+            f"{number}. <b>#{symbol}</b> {dir_emoji}\n"
+            f"🎯 Ziel: <code>{target:g}</code> | Erreicht bei: <code>{triggered:g}</code>\n"
+            f"👤 Von: {creator} | 🕒 {timestamp}"
+        )
+
+    bot_msg = await user_msg.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
+    # Optimization 2: Delay set to 60 seconds (1 minute) for automatic cleanup
+    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60))
+
+
 async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None or query.data is None or not query.data.startswith("show_img:"):
@@ -545,14 +596,14 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
 
 
-# 5. BACKGROUND ENGINE: TICKER WATCHER (WITH NEAR TARGET ALERTS)
+# 5. BACKGROUND ENGINE: TICKER WATCHER (WITH AUTO-TRIMMING TO MAX 30 ITEMS)
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
     client = application.bot_data["db_client"]
     while True:
         try:
             result = await client.execute(
-                "SELECT id, chat_id, symbol, direction, target_price, photo_file_id, near_alert_sent FROM alerts ORDER BY id"
+                "SELECT id, chat_id, symbol, direction, target_price, entry_price, created_by, photo_file_id, near_alert_sent FROM alerts ORDER BY id"
             )
             alerts = result.rows
 
@@ -563,7 +614,7 @@ async def check_alerts(application: Application) -> None:
                     prices[symbol] = await get_price(session, symbol)
 
             for row in alerts:
-                alert_id, chat_id, symbol, direction, target, photo_file_id, near_alert_sent = row[0], row[1], row[2], row[3], row[4], row[5], row[6]
+                alert_id, chat_id, symbol, direction, target, entry_price, created_by, photo_file_id, near_alert_sent = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
                 price = prices[symbol]
                 
                 if price is None:
@@ -591,6 +642,24 @@ async def check_alerts(application: Application) -> None:
                             await application.bot.send_message(
                                 chat_id=chat_id, text=success_text, parse_mode=ParseMode.HTML
                             )
+                        
+                        # Insert the alert data into history
+                        await client.execute(
+                            "INSERT INTO alert_history (chat_id, symbol, direction, target_price, entry_price, triggered_price, created_by) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (chat_id, symbol, direction, target, entry_price, price, created_by)
+                        )
+                        
+                        # Optimization 3: Keep history strictly capped at 30 entries per chat.
+                        # It automatically deletes the oldest records that are outside the top 30 newest items.
+                        await client.execute(
+                            "DELETE FROM alert_history WHERE chat_id = ? AND id NOT IN ("
+                            "SELECT id FROM alert_history WHERE chat_id = ? ORDER BY triggered_at DESC, id DESC LIMIT 30"
+                            ")",
+                            (chat_id, chat_id)
+                        )
+                        
+                        # Remove from active list
                         await client.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
                     except Exception:
                         LOGGER.exception("Failed to dispatch alert notification to chat %s for ID %s", chat_id, alert_id)
@@ -698,6 +767,7 @@ def main() -> None:
     application.add_handler(CommandHandler("list", list_user_ids))
     application.add_handler(CommandHandler("delete", delete_alert))
     application.add_handler(CommandHandler("alerts", list_alerts))
+    application.add_handler(CommandHandler("history", list_history))  
     application.add_handler(CommandHandler("alarm", add_alert))
     
     # Context-Interactive Actions
