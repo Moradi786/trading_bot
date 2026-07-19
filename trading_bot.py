@@ -190,8 +190,9 @@ def fill_market_metrics(metrics: dict, price: float, raw_vol: float, close_price
         else:
             rsi_trend = "stable"
             
+        # "via exchange" text successfully removed here
         metrics["ai_analysis"] = (
-            f"🤖 <b>AI Market Analysis ({interval} via {source_name}):</b>\n"
+            f"🤖 <b>AI Market Analysis ({interval}):</b>\n"
             f"• 📊 Volume: {vol_text}\n"
             f"• 🕒 RSI Status: {rsi_zone} | {rsi_trend}"
         )
@@ -264,7 +265,7 @@ async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval:
             # 3. BITGET V2 FUTURES DATA PROFILE
             elif provider == "bitget":
                 symbol_f = f"{coin}USDT"
-                url = "https://api.bitget.com/api/v2/mix/market/ticker"
+                url = "https://api.bitget.com/api/v2/mix/mix-market/ticker"
                 async with session.get(url, params={"productType": "USDT-FUTURES", "symbol": symbol_f}, timeout=aiohttp.ClientTimeout(total=2)) as response:
                     if response.status == 200:
                         res_data = await response.json()
@@ -311,7 +312,7 @@ async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval:
                                         return market_metrics
         except Exception as err:
             LOGGER.warning(f"Provider {provider.upper()} failed or timed out for token {coin}: {err}")
-            continue # Cleanly proceeds to execution of next provider in line
+            continue
             
     return market_metrics
 
@@ -330,7 +331,6 @@ def message_link(chat_id: int, chat_username: str | None, chat_type: str, messag
 
 
 async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None:
-    # Leverages our highly redundant multi-exchange routing framework seamlessly
     res = await get_market_data(session, symbol)
     return res["price"]
 
@@ -517,7 +517,7 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
-# 4. COMMANDS: ALERT MANAGEMENT WITH DYNAMIC HIERARCHICAL FAILOVER APIS
+# 4. COMMANDS: ALERT MANAGEMENT
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_authorised(update, context) or update.message is None:
         return
@@ -605,7 +605,6 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     track_background_cleanup(context.bot, update.effective_chat.id, [bot_msg.message_id], 60)
 
 
-# RELIABLE ROUTED ALERT PIPELINE
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -629,7 +628,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         session = context.application.bot_data["http_session"]
         symbols = {alert[1] for alert in alerts}
         
-        # Staggered gathering to alleviate strict simultaneous connection limits
         market_data = {}
         for s in symbols:
             market_data[s] = await get_market_data(session, s)
@@ -713,7 +711,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         track_background_cleanup(context.bot, update.effective_chat.id, messages_to_delete, 30)
 
 
-# CRASH-PROOF LIST_HISTORY FUNCTION
 async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -832,7 +829,7 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
-# 5. BACKGROUND ENGINE: TICKER WATCHER WITH AI TRIGGER SCANS
+# 5. BACKGROUND ENGINE: TICKER WATCHER
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
     client = application.bot_data["db_client"]
