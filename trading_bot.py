@@ -32,7 +32,6 @@ LOGGER = logging.getLogger(__name__)
 load_dotenv()
 
 DB_PATH = Path("alerts.db")
-BINANCE_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
 
 # Global set to keep strong references to running background tasks
 RUNNING_TASKS = set()
@@ -111,7 +110,7 @@ async def initialise_database(client) -> None:
     )
 
 
-# 2. HELPER FUNCTIONS FOR RSI, VOLUME & AI ANALYSIS ENGINE
+# 2. HELPER FUNCTIONS FOR RSI, VOLUME & MULTI-EXCHANGE ENGINE
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return None
@@ -139,100 +138,181 @@ def calculate_rsi(prices, period=14):
     return rsi
 
 
+def fill_market_metrics(metrics: dict, price: float, raw_vol: float, close_prices: list, quote_volumes: list, source_name: str, interval: str):
+    """Parses and calculates standard metrics from any successful exchange stream."""
+    metrics["price"] = price
+    metrics["source"] = source_name
+    
+    if raw_vol >= 1_000_000:
+        metrics["volume"] = f"{raw_vol / 1_000_000:.1f}M"
+    elif raw_vol >= 1_000:
+        metrics["volume"] = f"{raw_vol / 1_000:.1f}K"
+    else:
+        metrics["volume"] = f"{raw_vol:.0f}"
+        
+    current_rsi = calculate_rsi(close_prices)
+    prev_rsi = calculate_rsi(close_prices[:-1])
+    
+    current_vol = quote_volumes[-1]
+    avg_vol = sum(quote_volumes[-11:-1]) / 10 if len(quote_volumes) >= 11 else sum(quote_volumes[:-1]) / max(1, len(quote_volumes)-1)
+    
+    if current_vol > avg_vol * 1.5:
+        vol_text = "Massive Spike! 📈 (High buying interest/breakout)"
+    elif current_vol > avg_vol * 1.1:
+        vol_text = "Increasing ↗️ (Market getting active)"
+    elif current_vol < avg_vol * 0.7:
+        vol_text = "Heavy Drop! 📉 (Interest fading completely)"
+    elif current_vol < avg_vol * 0.9:
+        vol_text = "Decreasing ↘️ (Less activity)"
+    else:
+        vol_text = "Stable ➡️ (Consolidating)"
+        
+    if current_rsi is not None:
+        metrics["rsi"] = f"{current_rsi:.1f}"
+        if current_rsi >= 70:
+            rsi_zone = "Overbought 🔴 (Caution, Short risk / Correction looming)"
+        elif current_rsi <= 30:
+            rsi_zone = "Oversold 🟢 (Good Long opportunity / Bottom forming)"
+        else:
+            rsi_zone = "Neutral 🟡"
+            
+        if prev_rsi is not None:
+            if current_rsi > prev_rsi + 1.5:
+                rsi_trend = "strongly rising momentum"
+            elif current_rsi < prev_rsi - 1.5:
+                rsi_trend = "strongly falling momentum"
+            elif current_rsi > prev_rsi:
+                rsi_trend = "slightly rising"
+            elif current_rsi < prev_rsi:
+                rsi_trend = "slightly falling"
+            else:
+                rsi_trend = "sideways"
+        else:
+            rsi_trend = "stable"
+            
+        metrics["ai_analysis"] = (
+            f"🤖 <b>AI Market Analysis ({interval} via {source_name}):</b>\n"
+            f"• 📊 Volume: {vol_text}\n"
+            f"• 🕒 RSI Status: {rsi_zone} | {rsi_trend}"
+        )
+
+
 async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval: str = "1h") -> dict:
-    norm_symbol = normalise_symbol(symbol)
-    if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
-        norm_symbol += "USDT"
+    base_symbol = normalise_symbol(symbol)
+    if base_symbol.endswith("USDT") or base_symbol.endswith("BUSD"):
+        coin = base_symbol[:-4]
+    else:
+        coin = base_symbol
         
     market_metrics = {
         "price": None, 
         "volume": "N/A", 
         "rsi": "N/A",
-        "ai_analysis": "🤖 <i>AI Analysis: Waiting for market data...</i>"
+        "ai_analysis": "🤖 <i>AI Analysis: Waiting for market data...</i>",
+        "source": "N/A"
     }
     
-    # Fetch 24h Ticker data (Price and Volume)
-    try:
-        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        async with session.get(url, params={"symbol": norm_symbol}, timeout=aiohttp.ClientTimeout(total=3)) as response:
-            if response.status == 200:
-                res_data = await response.json()
-                market_metrics["price"] = float(res_data["lastPrice"])
-                raw_vol = float(res_data["quoteVolume"]) # Volume in USDT
-                if raw_vol >= 1_000_000:
-                    market_metrics["volume"] = f"{raw_vol / 1_000_000:.1f}M"
-                elif raw_vol >= 1_000:
-                    market_metrics["volume"] = f"{raw_vol / 1_000:.1f}K"
-                else:
-                    market_metrics["volume"] = f"{raw_vol:.0f}"
-    except Exception:
-        market_metrics["price"] = await get_price(session, symbol)
+    # Priority order for Fallback Routing Engine
+    providers = ["binance", "bybit", "bitget", "mexc"]
+    
+    for provider in providers:
+        try:
+            # 1. BINANCE FUTURES DATA PROFILE
+            if provider == "binance":
+                symbol_f = f"{coin}USDT"
+                url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+                async with session.get(url, params={"symbol": symbol_f}, timeout=aiohttp.ClientTimeout(total=2)) as response:
+                    if response.status == 200:
+                        res_data = await response.json()
+                        price = float(res_data["lastPrice"])
+                        raw_vol = float(res_data["quoteVolume"])
+                        
+                        url_k = "https://fapi.binance.com/fapi/v1/klines"
+                        async with session.get(url_k, params={"symbol": symbol_f, "interval": interval, "limit": 50}, timeout=aiohttp.ClientTimeout(total=2)) as k_resp:
+                            if k_resp.status == 200:
+                                klines = await k_resp.json()
+                                close_prices = [float(k[4]) for k in klines]
+                                quote_volumes = [float(k[7]) for k in klines]
+                                fill_market_metrics(market_metrics, price, raw_vol, close_prices, quote_volumes, "Binance", interval)
+                                return market_metrics
 
-    # Fetch Klines for standard RSI(14) calculation and Volume Trend Engine
-    try:
-        url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {"symbol": norm_symbol, "interval": interval, "limit": 50}
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=3)) as response:
-            if response.status == 200:
-                klines = await response.json()
-                
-                # Extract details
-                close_prices = [float(k[4]) for k in klines]
-                quote_volumes = [float(k[7]) for k in klines] # USDT Volume per candle
-                
-                # Calculate RSI Trends
-                current_rsi = calculate_rsi(close_prices)
-                prev_rsi = calculate_rsi(close_prices[:-1])
-                
-                # Calculate Volume Trends (Current hour vs average of last 10 hours)
-                current_vol = quote_volumes[-1]
-                avg_vol = sum(quote_volumes[-11:-1]) / 10 if len(quote_volumes) >= 11 else sum(quote_volumes[:-1]) / (len(quote_volumes)-1)
-                
-                # 1. Evaluate Volume Condition
-                if current_vol > avg_vol * 1.5:
-                    vol_text = "Massive Spike! 📈 (High buying interest/breakout)"
-                elif current_vol > avg_vol * 1.1:
-                    vol_text = "Increasing ↗️ (Market getting active)"
-                elif current_vol < avg_vol * 0.7:
-                    vol_text = "Heavy Drop! 📉 (Interest fading completely)"
-                elif current_vol < avg_vol * 0.9:
-                    vol_text = "Decreasing ↘️ (Less activity)"
-                else:
-                    vol_text = "Stable ➡️ (Consolidating)"
-                    
-                # 2. Evaluate RSI Condition & Direction
-                if current_rsi is not None:
-                    market_metrics["rsi"] = f"{current_rsi:.1f}"
-                    
-                    if current_rsi >= 70:
-                        rsi_zone = "Overbought 🔴 (Caution, Short risk / Correction looming)"
-                    elif current_rsi <= 30:
-                        rsi_zone = "Oversold 🟢 (Good Long opportunity / Bottom forming)"
-                    else:
-                        rsi_zone = "Neutral 🟡"
-                        
-                    if prev_rsi is not None:
-                        if current_rsi > prev_rsi + 1.5:
-                            rsi_trend = "strongly rising momentum"
-                        elif current_rsi < prev_rsi - 1.5:
-                            rsi_trend = "strongly falling momentum"
-                        elif current_rsi > prev_rsi:
-                            rsi_trend = "slightly rising"
-                        elif current_rsi < prev_rsi:
-                            rsi_trend = "slightly falling"
-                        else:
-                            rsi_trend = "sideways"
-                    else:
-                        rsi_trend = "stable"
-                        
-                    market_metrics["ai_analysis"] = (
-                        f"🤖 <b>AI Market Analysis ({interval}):</b>\n"
-                        f"• 📊 Volume: {vol_text}\n"
-                        f"• 🕒 RSI Status: {rsi_zone} | {rsi_trend}"
-                    )
-    except Exception as e:
-        LOGGER.error(f"Error compiling AI analysis indicators: {e}")
-        
+            # 2. BYBIT V5 MARKET DATA PROFILE
+            elif provider == "bybit":
+                symbol_f = f"{coin}USDT"
+                url = "https://api.bybit.com/v5/market/tickers"
+                async with session.get(url, params={"category": "linear", "symbol": symbol_f}, timeout=aiohttp.ClientTimeout(total=2)) as response:
+                    if response.status == 200:
+                        res_data = await response.json()
+                        if res_data.get("retCode") == 0 and res_data["result"]["list"]:
+                            ticker = res_data["result"]["list"][0]
+                            price = float(ticker["lastPrice"])
+                            raw_vol = float(ticker["turnover24h"])
+                            
+                            bybit_interval = "60" if interval == "1h" else "15"
+                            url_k = "https://api.bybit.com/v5/market/kline"
+                            k_params = {"category": "linear", "symbol": symbol_f, "interval": bybit_interval, "limit": 50}
+                            async with session.get(url_k, params=k_params, timeout=aiohttp.ClientTimeout(total=2)) as k_resp:
+                                if k_resp.status == 200:
+                                    k_data = await k_resp.json()
+                                    if k_data.get("retCode") == 0 and k_data["result"]["list"]:
+                                        klines = list(reversed(k_data["result"]["list"]))
+                                        close_prices = [float(k[4]) for k in klines]
+                                        quote_volumes = [float(k[6]) for k in klines]
+                                        fill_market_metrics(market_metrics, price, raw_vol, close_prices, quote_volumes, "Bybit", interval)
+                                        return market_metrics
+
+            # 3. BITGET V2 FUTURES DATA PROFILE
+            elif provider == "bitget":
+                symbol_f = f"{coin}USDT"
+                url = "https://api.bitget.com/api/v2/mix/market/ticker"
+                async with session.get(url, params={"productType": "USDT-FUTURES", "symbol": symbol_f}, timeout=aiohttp.ClientTimeout(total=2)) as response:
+                    if response.status == 200:
+                        res_data = await response.json()
+                        if res_data.get("code") == "00000" and res_data.get("data"):
+                            ticker = res_data["data"][0]
+                            price = float(ticker["lastPr"])
+                            raw_vol = float(ticker["usdtVolume"])
+                            
+                            bitget_interval = "1h" if interval == "1h" else "15m"
+                            url_k = "https://api.bitget.com/api/v2/mix/market/history-candles"
+                            k_params = {"productType": "USDT-FUTURES", "symbol": symbol_f, "granularity": bitget_interval, "limit": 50}
+                            async with session.get(url_k, params=k_params, timeout=aiohttp.ClientTimeout(total=2)) as k_resp:
+                                if k_resp.status == 200:
+                                    k_data = await k_resp.json()
+                                    if k_data.get("code") == "00000" and k_data.get("data"):
+                                        klines = list(reversed(k_data["data"]))
+                                        close_prices = [float(k[4]) for k in klines]
+                                        quote_volumes = [float(k[6]) for k in klines]
+                                        fill_market_metrics(market_metrics, price, raw_vol, close_prices, quote_volumes, "Bitget", interval)
+                                        return market_metrics
+
+            # 4. MEXC GLOBAL FUTURES DATA PROFILE
+            elif provider == "mexc":
+                symbol_f = f"{coin}_USDT"
+                url = f"https://contract.mexc.com/api/v1/contract/ticker"
+                async with session.get(url, params={"symbol": symbol_f}, timeout=aiohttp.ClientTimeout(total=2)) as response:
+                    if response.status == 200:
+                        res_data = await response.json()
+                        if res_data.get("success") and res_data.get("data"):
+                            ticker = res_data["data"]
+                            price = float(ticker["lastPrice"])
+                            raw_vol = float(ticker.get("amount24h", 0)) or (float(ticker.get("volume24h", 0)) * price)
+                            
+                            mexc_interval = "Min60" if interval == "1h" else "Min15"
+                            url_k = f"https://contract.mexc.com/api/v1/contract/kline/{symbol_f}"
+                            async with session.get(url_k, params={"interval": mexc_interval, "limit": 50}, timeout=aiohttp.ClientTimeout(total=2)) as k_resp:
+                                if k_resp.status == 200:
+                                    k_data = await k_resp.json()
+                                    if k_data.get("success") and k_data.get("data"):
+                                        klines = k_data["data"]
+                                        close_prices = [float(k["close"]) for k in klines]
+                                        quote_volumes = [float(k["amount"]) for k in klines]
+                                        fill_market_metrics(market_metrics, price, raw_vol, close_prices, quote_volumes, "MEXC", interval)
+                                        return market_metrics
+        except Exception as err:
+            LOGGER.warning(f"Provider {provider.upper()} failed or timed out for token {coin}: {err}")
+            continue # Cleanly proceeds to execution of next provider in line
+            
     return market_metrics
 
 
@@ -250,22 +330,9 @@ def message_link(chat_id: int, chat_username: str | None, chat_type: str, messag
 
 
 async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None:
-    norm_symbol = normalise_symbol(symbol)
-    if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
-        norm_symbol += "USDT"
-
-    try:
-        async with session.get(
-            BINANCE_PRICE_URL,
-            params={"symbol": norm_symbol},
-            timeout=aiohttp.ClientTimeout(total=3)
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                return float(data["price"])
-    except Exception:
-        pass
-    return None
+    # Leverages our highly redundant multi-exchange routing framework seamlessly
+    res = await get_market_data(session, symbol)
+    return res["price"]
 
 
 def parse_price(price_str: str) -> float | None:
@@ -450,7 +517,7 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
-# 4. COMMANDS: ALERT MANAGEMENT WITH DYNAMIC AI INTELLIGENCE
+# 4. COMMANDS: ALERT MANAGEMENT WITH DYNAMIC HIERARCHICAL FAILOVER APIS
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_authorised(update, context) or update.message is None:
         return
@@ -482,7 +549,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             bot_msg = await message.reply_text(
                 "❌ <b>Error:</b> Invalid Format!\n\n"
                 "The ticker/coin <b>must</b> start with a <code>#</code>.\n"
-                "Example: <code>/alarm #TRXUSDT SHORT 0.3238</code>",
+                "Example: <code>/alarm #TRX SHORT 0.3238</code>",
                 parse_mode=ParseMode.HTML
             )
             track_background_cleanup(context.bot, update.effective_chat.id, [bot_msg.message_id], 30)
@@ -538,7 +605,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     track_background_cleanup(context.bot, update.effective_chat.id, [bot_msg.message_id], 60)
 
 
-# CRASH-PROOF LIST_ALERTS WITH INTEGRATED LIVE AI ENGINE VERDICTS
+# RELIABLE ROUTED ALERT PIPELINE
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -562,14 +629,11 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         session = context.application.bot_data["http_session"]
         symbols = {alert[1] for alert in alerts}
         
-        market_responses = await asyncio.gather(*(get_market_data(session, s) for s in symbols), return_exceptions=True)
-        
+        # Staggered gathering to alleviate strict simultaneous connection limits
         market_data = {}
-        for s, res in zip(symbols, market_responses):
-            if isinstance(res, Exception) or res is None:
-                market_data[s] = {"price": None, "volume": "N/A", "rsi": "N/A", "ai_analysis": ""}
-            else:
-                market_data[s] = res
+        for s in symbols:
+            market_data[s] = await get_market_data(session, s)
+            await asyncio.sleep(0.05) 
 
         header_msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -784,6 +848,7 @@ async def check_alerts(application: Application) -> None:
                 symbol = row[2]
                 if symbol not in prices:
                     prices[symbol] = await get_price(session, symbol)
+                    await asyncio.sleep(0.05)
 
             for row in alerts:
                 alert_id, chat_id, symbol, direction, target, entry_price, created_by, photo_file_id, near_1_sent, near_05_sent, source_link = (
@@ -801,8 +866,6 @@ async def check_alerts(application: Application) -> None:
                 
                 if reached:
                     dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-                    
-                    # Live contextual market scan right as the trigger fires
                     m_data = await get_market_data(session, symbol)
                     
                     success_text = (
@@ -827,22 +890,13 @@ async def check_alerts(application: Application) -> None:
                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (chat_id, symbol, direction, target, entry_price, price, created_by, photo_file_id, source_link)
                         )
-                        
-                        await client.execute(
-                            "DELETE FROM alert_history WHERE chat_id = ? AND id NOT IN ("
-                            "SELECT id FROM alert_history WHERE chat_id = ? ORDER BY triggered_at DESC, id DESC LIMIT 30"
-                            ")",
-                            (chat_id, chat_id)
-                        )
-                        
                         await client.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
                     except Exception:
                         LOGGER.exception("Failed to dispatch alert notification to chat %s for ID %s", chat_id, alert_id)
                     continue
 
-                is_near_1 = False
                 is_near_05 = False
-
+                is_near_1 = False
                 if direction == "LONG":
                     if (target * 0.995) <= price < target:
                         is_near_05 = True
