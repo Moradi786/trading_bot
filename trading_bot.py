@@ -111,7 +111,7 @@ async def initialise_database(client) -> None:
     )
 
 
-# 2. HELPER FUNCTIONS FOR RSI & VOLUME CALCULATION
+# 2. HELPER FUNCTIONS FOR RSI, VOLUME & AI ANALYSIS ENGINE
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return None
@@ -144,7 +144,12 @@ async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval:
     if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
         norm_symbol += "USDT"
         
-    market_metrics = {"price": None, "volume": "N/A", "rsi": "N/A"}
+    market_metrics = {
+        "price": None, 
+        "volume": "N/A", 
+        "rsi": "N/A",
+        "ai_analysis": "🤖 <i>AI Analysis: Waiting for market data...</i>"
+    }
     
     # Fetch 24h Ticker data (Price and Volume)
     try:
@@ -163,19 +168,70 @@ async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval:
     except Exception:
         market_metrics["price"] = await get_price(session, symbol)
 
-    # Fetch Klines for standard RSI(14) calculation
+    # Fetch Klines for standard RSI(14) calculation and Volume Trend Engine
     try:
         url = "https://fapi.binance.com/fapi/v1/klines"
         params = {"symbol": norm_symbol, "interval": interval, "limit": 50}
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=3)) as response:
             if response.status == 200:
                 klines = await response.json()
+                
+                # Extract details
                 close_prices = [float(k[4]) for k in klines]
-                rsi_val = calculate_rsi(close_prices)
-                if rsi_val is not None:
-                    market_metrics["rsi"] = f"{rsi_val:.1f}"
-    except Exception:
-        pass
+                quote_volumes = [float(k[7]) for k in klines] # USDT Volume per candle
+                
+                # Calculate RSI Trends
+                current_rsi = calculate_rsi(close_prices)
+                prev_rsi = calculate_rsi(close_prices[:-1])
+                
+                # Calculate Volume Trends (Current hour vs average of last 10 hours)
+                current_vol = quote_volumes[-1]
+                avg_vol = sum(quote_volumes[-11:-1]) / 10 if len(quote_volumes) >= 11 else sum(quote_volumes[:-1]) / (len(quote_volumes)-1)
+                
+                # 1. Evaluate Volume Condition
+                if current_vol > avg_vol * 1.5:
+                    vol_text = "Massive Spike! 📈 (High buying interest/breakout)"
+                elif current_vol > avg_vol * 1.1:
+                    vol_text = "Increasing ↗️ (Market getting active)"
+                elif current_vol < avg_vol * 0.7:
+                    vol_text = "Heavy Drop! 📉 (Interest fading completely)"
+                elif current_vol < avg_vol * 0.9:
+                    vol_text = "Decreasing ↘️ (Less activity)"
+                else:
+                    vol_text = "Stable ➡️ (Consolidating)"
+                    
+                # 2. Evaluate RSI Condition & Direction
+                if current_rsi is not None:
+                    market_metrics["rsi"] = f"{current_rsi:.1f}"
+                    
+                    if current_rsi >= 70:
+                        rsi_zone = "Overbought 🔴 (Caution, Short risk / Correction looming)"
+                    elif current_rsi <= 30:
+                        rsi_zone = "Oversold 🟢 (Good Long opportunity / Bottom forming)"
+                    else:
+                        rsi_zone = "Neutral 🟡"
+                        
+                    if prev_rsi is not None:
+                        if current_rsi > prev_rsi + 1.5:
+                            rsi_trend = "strongly rising momentum"
+                        elif current_rsi < prev_rsi - 1.5:
+                            rsi_trend = "strongly falling momentum"
+                        elif current_rsi > prev_rsi:
+                            rsi_trend = "slightly rising"
+                        elif current_rsi < prev_rsi:
+                            rsi_trend = "slightly falling"
+                        else:
+                            rsi_trend = "sideways"
+                    else:
+                        rsi_trend = "stable"
+                        
+                    market_metrics["ai_analysis"] = (
+                        f"🤖 <b>AI Market Analysis ({interval}):</b>\n"
+                        f"• 📊 Volume: {vol_text}\n"
+                        f"• 🕒 RSI Status: {rsi_zone} | {rsi_trend}"
+                    )
+    except Exception as e:
+        LOGGER.error(f"Error compiling AI analysis indicators: {e}")
         
     return market_metrics
 
@@ -209,22 +265,6 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
                 return float(data["price"])
     except Exception:
         pass
-
-    try:
-        bybit_url = "https://api.bybit.com/v5/market/tickers"
-        params = {"category": "linear", "symbol": norm_symbol}
-        async with session.get(
-            bybit_url,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=3)
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                if data.get("retCode") == 0 and data["result"]["list"]:
-                    return float(data["result"]["list"][0]["lastPrice"])
-    except Exception:
-        pass
-
     return None
 
 
@@ -410,7 +450,7 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
-# 4. COMMANDS: ALERT MANAGEMENT
+# 4. COMMANDS: ALERT MANAGEMENT WITH DYNAMIC AI INTELLIGENCE
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_authorised(update, context) or update.message is None:
         return
@@ -473,7 +513,8 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"✅ <b>Alert Saved - #{symbol} | BY {creator}</b>\n"
             f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>\n"
             f"Current Price: <code>{current_price:g}</code>\n"
-            f"📊 Vol (24h): <code>{market['volume']}</code> | 🕒 RSI (1h): <code>{market['rsi']}</code>"
+            f"📊 Vol (24h): <code>{market['volume']}</code> | 🕒 RSI: <code>{market['rsi']}</code>\n\n"
+            f"{market['ai_analysis']}"
         )
     else:
         saved_lines = []
@@ -497,7 +538,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     track_background_cleanup(context.bot, update.effective_chat.id, [bot_msg.message_id], 60)
 
 
-# CRASH-PROOF LIST_ALERTS SHOWING LIVE RSI AND 24H VOLUME DATA
+# CRASH-PROOF LIST_ALERTS WITH INTEGRATED LIVE AI ENGINE VERDICTS
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -521,13 +562,12 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         session = context.application.bot_data["http_session"]
         symbols = {alert[1] for alert in alerts}
         
-        # Parallel gathering of high-frequency price, rsi and volume indicators
         market_responses = await asyncio.gather(*(get_market_data(session, s) for s in symbols), return_exceptions=True)
         
         market_data = {}
         for s, res in zip(symbols, market_responses):
             if isinstance(res, Exception) or res is None:
-                market_data[s] = {"price": None, "volume": "N/A", "rsi": "N/A"}
+                market_data[s] = {"price": None, "volume": "N/A", "rsi": "N/A", "ai_analysis": ""}
             else:
                 market_data[s] = res
 
@@ -541,7 +581,7 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         for number, alert in enumerate(alerts, start=1):
             try:
                 alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
-                metrics = market_data.get(symbol, {"price": None, "volume": "N/A", "rsi": "N/A"})
+                metrics = market_data.get(symbol, {"price": None, "volume": "N/A", "rsi": "N/A", "ai_analysis": ""})
                 current = metrics["price"]
                 
                 dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
@@ -580,9 +620,9 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 alert_text = (
                     f"{number}. <b>#{symbol}</b> | BY {creator}\n"
                     f"{dir_emoji}\n"
-                    f"🎯 Target: <code>{target:g}</code> USDT\n"
-                    f"⚡ Current: <code>{current_text}</code>\n"
-                    f"📊 Vol (24h): <code>{metrics['volume']}</code> | 🕒 RSI (1h): <code>{metrics['rsi']}</code>"
+                    f"🎯 Target: <code>{target:g}</code> USDT | ⚡ Current: <code>{current_text}</code>\n"
+                    f"📊 Vol: <code>{metrics['volume']}</code> | 🕒 RSI: <code>{metrics['rsi']}</code>\n"
+                    f"{metrics['ai_analysis']}"
                     f"{progress_line}"
                 )
                 
@@ -609,7 +649,7 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         track_background_cleanup(context.bot, update.effective_chat.id, messages_to_delete, 30)
 
 
-# CRASH-PROOF LIST_HISTORY FUNCTION WITH AUTO-DELETE AND CHART BUTTONS
+# CRASH-PROOF LIST_HISTORY FUNCTION
 async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -728,7 +768,7 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
-# 5. BACKGROUND ENGINE: TICKER WATCHER
+# 5. BACKGROUND ENGINE: TICKER WATCHER WITH AI TRIGGER SCANS
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
     client = application.bot_data["db_client"]
@@ -769,7 +809,8 @@ async def check_alerts(application: Application) -> None:
                         f"🎯 <b>Target Reached!</b>\n"
                         f"#{symbol} {dir_emoji}\n"
                         f"Target: <code>{target:g}</code> | Price Hit: <code>{price:g}</code>\n"
-                        f"📊 Vol (24h): <code>{m_data['volume']}</code> | 🕒 RSI (1h): <code>{m_data['rsi']}</code>"
+                        f"📊 Vol: <code>{m_data['volume']}</code> | 🕒 RSI: <code>{m_data['rsi']}</code>\n\n"
+                        f"{m_data['ai_analysis']}"
                     )
                     try:
                         if photo_file_id:
@@ -818,7 +859,7 @@ async def check_alerts(application: Application) -> None:
                     warning_text = (
                         f"⚠️ <b>Extremely Close to Target! (0.5% Remaining)</b>\n"
                         f"#{symbol} {dir_emoji}\n"
-                        f"🎯 Target: <code>{target:g}</code> | Current Price: <code>{price:g}</code> (Less than 0.5% away!)"
+                        f"🎯 Target: <code>{target:g}</code> | Current Price: <code>{price:g}</code>"
                     )
                     try:
                         await application.bot.send_message(
@@ -833,7 +874,7 @@ async def check_alerts(application: Application) -> None:
                     warning_text = (
                         f"⚠️ <b>Closing In On Target! (1% Remaining)</b>\n"
                         f"#{symbol} {dir_emoji}\n"
-                        f"🎯 Target: <code>{target:g}</code> | Current Price: <code>{price:g}</code> (Less than 1% away!)"
+                        f"🎯 Target: <code>{target:g}</code> | Current Price: <code>{price:g}</code>"
                     )
                     try:
                         await application.bot.send_message(
