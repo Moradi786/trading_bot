@@ -111,7 +111,75 @@ async def initialise_database(client) -> None:
     )
 
 
-# 2. HELPER FUNCTIONS
+# 2. HELPER FUNCTIONS FOR RSI & VOLUME CALCULATION
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return None
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    seed = deltas[:period]
+    up = sum([d for d in seed if d > 0]) / period
+    down = sum([-d for d in seed if d < 0]) / period
+    
+    if down == 0:
+        rs = float('inf')
+    else:
+        rs = up / down
+    rsi = 100 - (100 / (1 + rs))
+    
+    for d in deltas[period:]:
+        gain = d if d > 0 else 0
+        loss = -d if d < 0 else 0
+        up = (up * (period - 1) + gain) / period
+        down = (down * (period - 1) + loss) / period
+        if down == 0:
+            rs = float('inf')
+        else:
+            rs = up / down
+        rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval: str = "1h") -> dict:
+    norm_symbol = normalise_symbol(symbol)
+    if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
+        norm_symbol += "USDT"
+        
+    market_metrics = {"price": None, "volume": "N/A", "rsi": "N/A"}
+    
+    # Fetch 24h Ticker data (Price and Volume)
+    try:
+        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        async with session.get(url, params={"symbol": norm_symbol}, timeout=aiohttp.ClientTimeout(total=3)) as response:
+            if response.status == 200:
+                res_data = await response.json()
+                market_metrics["price"] = float(res_data["lastPrice"])
+                raw_vol = float(res_data["quoteVolume"]) # Volume in USDT
+                if raw_vol >= 1_000_000:
+                    market_metrics["volume"] = f"{raw_vol / 1_000_000:.1f}M"
+                elif raw_vol >= 1_000:
+                    market_metrics["volume"] = f"{raw_vol / 1_000:.1f}K"
+                else:
+                    market_metrics["volume"] = f"{raw_vol:.0f}"
+    except Exception:
+        market_metrics["price"] = await get_price(session, symbol)
+
+    # Fetch Klines for standard RSI(14) calculation
+    try:
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        params = {"symbol": norm_symbol, "interval": interval, "limit": 50}
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=3)) as response:
+            if response.status == 200:
+                klines = await response.json()
+                close_prices = [float(k[4]) for k in klines]
+                rsi_val = calculate_rsi(close_prices)
+                if rsi_val is not None:
+                    market_metrics["rsi"] = f"{rsi_val:.1f}"
+    except Exception:
+        pass
+        
+    return market_metrics
+
+
 def normalise_symbol(value: str) -> str:
     return value.upper().strip().replace("/", "").replace("-", "").replace("_", "")
 
@@ -157,27 +225,6 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
     except Exception:
         pass
 
-    try:
-        kucoin_symbol = norm_symbol
-        if kucoin_symbol.endswith("USDT"):
-            kucoin_symbol = kucoin_symbol.replace("USDT", "-USDT")
-        elif kucoin_symbol.endswith("BUSD"):
-            kucoin_symbol = kucoin_symbol.replace("BUSD", "-BUSD")
-        
-        kucoin_url = "https://api.kucoin.com/api/v1/market/orderbook/level1"
-        async with session.get(
-            kucoin_url,
-            params={"symbol": kucoin_symbol},
-            timeout=aiohttp.ClientTimeout(total=3)
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                if data.get("code") == "200000" and data.get("data"):
-                    return float(data["data"]["price"])
-    except Exception:
-        pass
-
-    LOGGER.error("Error: All price APIs failed for %s.", norm_symbol)
     return None
 
 
@@ -411,7 +458,8 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if len(parsed_alerts) == 1:
         symbol, direction, target = parsed_alerts[0]
-        current_price = await get_price(session, symbol) or target
+        market = await get_market_data(session, symbol)
+        current_price = market["price"] or target
         
         result = await client.execute(
             "INSERT INTO alerts (chat_id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id) "
@@ -424,12 +472,14 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_text = (
             f"✅ <b>Alert Saved - #{symbol} | BY {creator}</b>\n"
             f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>\n"
-            f"Current Price: <code>{current_price:g}</code>"
+            f"Current Price: <code>{current_price:g}</code>\n"
+            f"📊 Vol (24h): <code>{market['volume']}</code> | 🕒 RSI (1h): <code>{market['rsi']}</code>"
         )
     else:
         saved_lines = []
         for symbol, direction, target in parsed_alerts:
-            current_price = await get_price(session, symbol) or target
+            market = await get_market_data(session, symbol)
+            current_price = market["price"] or target
             result = await client.execute(
                 "INSERT INTO alerts (chat_id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -437,7 +487,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             alert_id = result.last_insert_rowid
             dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-            saved_lines.append(f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>")
+            saved_lines.append(f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code> (RSI: {market['rsi']})")
             
         reply_text = (
             f"🔔 <b>Multiple Alerts Saved!</b>\n" + "\n".join(saved_lines)
@@ -447,7 +497,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     track_background_cleanup(context.bot, update.effective_chat.id, [bot_msg.message_id], 60)
 
 
-# CRASH-PROOF AND CRITICAL-SAFETY PROTECTED LIST_ALERTS FUNCTION
+# CRASH-PROOF LIST_ALERTS SHOWING LIVE RSI AND 24H VOLUME DATA
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -470,11 +520,16 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         session = context.application.bot_data["http_session"]
         symbols = {alert[1] for alert in alerts}
-        fetched_prices = await asyncio.gather(*(get_price(session, s) for s in symbols), return_exceptions=True)
         
-        prices = {}
-        for s, p in zip(symbols, fetched_prices):
-            prices[s] = None if isinstance(p, Exception) or p is None else p
+        # Parallel gathering of high-frequency price, rsi and volume indicators
+        market_responses = await asyncio.gather(*(get_market_data(session, s) for s in symbols), return_exceptions=True)
+        
+        market_data = {}
+        for s, res in zip(symbols, market_responses):
+            if isinstance(res, Exception) or res is None:
+                market_data[s] = {"price": None, "volume": "N/A", "rsi": "N/A"}
+            else:
+                market_data[s] = res
 
         header_msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -486,7 +541,8 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         for number, alert in enumerate(alerts, start=1):
             try:
                 alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
-                current = prices.get(symbol)
+                metrics = market_data.get(symbol, {"price": None, "volume": "N/A", "rsi": "N/A"})
+                current = metrics["price"]
                 
                 dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
                 
@@ -525,7 +581,8 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     f"{number}. <b>#{symbol}</b> | BY {creator}\n"
                     f"{dir_emoji}\n"
                     f"🎯 Target: <code>{target:g}</code> USDT\n"
-                    f"⚡ Current: <code>{current_text}</code>"
+                    f"⚡ Current: <code>{current_text}</code>\n"
+                    f"📊 Vol (24h): <code>{metrics['volume']}</code> | 🕒 RSI (1h): <code>{metrics['rsi']}</code>"
                     f"{progress_line}"
                 )
                 
@@ -552,7 +609,7 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         track_background_cleanup(context.bot, update.effective_chat.id, messages_to_delete, 30)
 
 
-# NEW CRASH-PROOF LIST_HISTORY FUNCTION WITH AUTO-DELETE AND CHART BUTTONS
+# CRASH-PROOF LIST_HISTORY FUNCTION WITH AUTO-DELETE AND CHART BUTTONS
 async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -611,7 +668,6 @@ async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as general_error:
         LOGGER.error(f"General processing error inside list_history pipeline: {general_error}")
     finally:
-        # Erase everything after exactly 30 seconds
         track_background_cleanup(context.bot, update.effective_chat.id, messages_to_delete, 30)
 
 
@@ -705,10 +761,15 @@ async def check_alerts(application: Application) -> None:
                 
                 if reached:
                     dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+                    
+                    # Live contextual market scan right as the trigger fires
+                    m_data = await get_market_data(session, symbol)
+                    
                     success_text = (
                         f"🎯 <b>Target Reached!</b>\n"
                         f"#{symbol} {dir_emoji}\n"
-                        f"Target: <code>{target:g}</code> | Price Hit: <code>{price:g}</code>"
+                        f"Target: <code>{target:g}</code> | Price Hit: <code>{price:g}</code>\n"
+                        f"📊 Vol (24h): <code>{m_data['volume']}</code> | 🕒 RSI (1h): <code>{m_data['rsi']}</code>"
                     )
                     try:
                         if photo_file_id:
