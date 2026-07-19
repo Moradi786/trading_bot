@@ -64,14 +64,17 @@ async def initialise_database(client) -> None:
             created_by TEXT NOT NULL,
             source_link TEXT,
             photo_file_id TEXT,
-            near_alert_sent INTEGER DEFAULT 0,
+            near_1_sent INTEGER DEFAULT 0,
+            near_05_sent INTEGER DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
-    # Safe migration: Adds the near_alert_sent column if the database already exists
+    # Safe migration: Adds the new dual tracking columns if migrating from old instances
     with suppress(Exception):
-        await client.execute("ALTER TABLE alerts ADD COLUMN near_alert_sent INTEGER DEFAULT 0")
+        await client.execute("ALTER TABLE alerts ADD COLUMN near_1_sent INTEGER DEFAULT 0")
+    with suppress(Exception):
+        await client.execute("ALTER TABLE alerts ADD COLUMN near_05_sent INTEGER DEFAULT 0")
 
     # TABLE: For keeping track of triggered/completed alerts
     await client.execute(
@@ -417,9 +420,9 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         
         dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
         reply_text = (
-            f"✅ <b>Alarm gespeichert - #{symbol} | BY {creator}</b>\n"
-            f"• #{alert_id} {dir_emoji} → Ziel: <code>{target:g}</code>\n"
-            f"Aktueller Kurs: <code>{current_price:g}</code>"
+            f"✅ <b>Alert Saved - #{symbol} | BY {creator}</b>\n"
+            f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>\n"
+            f"Current Price: <code>{current_price:g}</code>"
         )
     else:
         saved_lines = []
@@ -432,16 +435,17 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             alert_id = result.last_insert_rowid
             dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-            saved_lines.append(f"• #{alert_id} {dir_emoji} → Ziel: <code>{target:g}</code>")
+            saved_lines.append(f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>")
             
         reply_text = (
-            f"🔔 <b>Mehrere Alarme gespeichert!</b>\n" + "\n".join(saved_lines)
+            f"🔔 <b>Multiple Alerts Saved!</b>\n" + "\n".join(saved_lines)
         )
     
     bot_msg = await message.reply_text(reply_text, parse_mode=ParseMode.HTML)
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [bot_msg.message_id], 60))
 
 
+# Displays active list with integrated local chart buttons
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -464,8 +468,14 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     fetched_prices = await asyncio.gather(*(get_price(session, s) for s in symbols))
     prices = dict(zip(symbols, fetched_prices))
 
-    lines = ["📊 <b>Active Alerts &amp; Market Prices</b>"]
-    keyboard = []
+    messages_to_delete = [user_msg.message_id]
+
+    header_msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📊 <b>Active Alerts &amp; Market Prices</b>",
+        parse_mode=ParseMode.HTML
+    )
+    messages_to_delete.append(header_msg.message_id)
 
     for number, alert in enumerate(alerts, start=1):
         alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
@@ -500,7 +510,7 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             bar = "█" * filled_blocks + "░" * empty_blocks
             progress_line = f"\n📈 To Target: [<code>{bar}</code>] <code>{progress}%</code>"
 
-        lines.append(
+        alert_text = (
             f"{number}. <b>#{symbol}</b> | BY {creator}\n"
             f"{dir_emoji}\n"
             f"🎯 Target: <code>{target:g}</code> USDT\n"
@@ -508,22 +518,30 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"{progress_line}"
         )
         
+        keyboard = []
         if photo_file_id:
             keyboard.append([InlineKeyboardButton(f"🔗 🖼️ View Chart #{symbol}", callback_data=f"show_img:{alert_id}")])
 
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-    bot_msg = await user_msg.reply_text("\n\n".join(lines), reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        
+        alert_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=alert_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+        messages_to_delete.append(alert_msg.message_id)
+
+    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, messages_to_delete, 30))
 
 
-# UPDATED FEATURE: Command to view history of triggered alerts (Shows up to 30 elements, deleted after 1 minute)
+# Command to view history of triggered alerts (Shows up to 30 elements, deleted after 1 minute)
 async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
         return
 
     client = context.application.bot_data["db_client"]
-    # Optimization 1: Fetch the last 30 successfully triggered alerts instead of 15
     result = await client.execute(
         "SELECT symbol, direction, target_price, triggered_price, created_by, triggered_at "
         "FROM alert_history WHERE chat_id = ? ORDER BY triggered_at DESC LIMIT 30",
@@ -531,22 +549,21 @@ async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     history = result.rows
     if not history:
-        bot_msg = await user_msg.reply_text("📜 Bisher wurden keine Alarme ausgelöst.")
+        bot_msg = await user_msg.reply_text("📜 No alerts have been triggered yet.")
         asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60))
         return
 
-    lines = ["📜 <b>Historie der erreichten Ziele (Letzte 30)</b>"]
+    lines = ["📜 <b>History of Triggered Targets (Last 30)</b>"]
     for number, row in enumerate(history, start=1):
         symbol, direction, target, triggered, creator, timestamp = row
         dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
         lines.append(
             f"{number}. <b>#{symbol}</b> {dir_emoji}\n"
-            f"🎯 Ziel: <code>{target:g}</code> | Erreicht bei: <code>{triggered:g}</code>\n"
-            f"👤 Von: {creator} | 🕒 {timestamp}"
+            f"🎯 Target: <code>{target:g}</code> | Hit at: <code>{triggered:g}</code>\n"
+            f"👤 By: {creator} | 🕒 {timestamp}"
         )
 
     bot_msg = await user_msg.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
-    # Optimization 2: Delay set to 60 seconds (1 minute) for automatic cleanup
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60))
 
 
@@ -596,14 +613,14 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
 
 
-# 5. BACKGROUND ENGINE: TICKER WATCHER (WITH AUTO-TRIMMING TO MAX 30 ITEMS)
+# 5. BACKGROUND ENGINE: TICKER WATCHER (WITH DUAL NEAR-TARGET TRACKING)
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
     client = application.bot_data["db_client"]
     while True:
         try:
             result = await client.execute(
-                "SELECT id, chat_id, symbol, direction, target_price, entry_price, created_by, photo_file_id, near_alert_sent FROM alerts ORDER BY id"
+                "SELECT id, chat_id, symbol, direction, target_price, entry_price, created_by, photo_file_id, near_1_sent, near_05_sent FROM alerts ORDER BY id"
             )
             alerts = result.rows
 
@@ -614,13 +631,15 @@ async def check_alerts(application: Application) -> None:
                     prices[symbol] = await get_price(session, symbol)
 
             for row in alerts:
-                alert_id, chat_id, symbol, direction, target, entry_price, created_by, photo_file_id, near_alert_sent = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
+                alert_id, chat_id, symbol, direction, target, entry_price, created_by, photo_file_id, near_1_sent, near_05_sent = (
+                    row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9]
+                )
                 price = prices[symbol]
                 
                 if price is None:
                     continue
 
-                # 1. Check if ultimate target is reached
+                # 1. Ultimate Target Verification Loop
                 reached = (
                     (direction == "LONG" and price >= target) or 
                     (direction == "SHORT" and price <= target)
@@ -643,15 +662,12 @@ async def check_alerts(application: Application) -> None:
                                 chat_id=chat_id, text=success_text, parse_mode=ParseMode.HTML
                             )
                         
-                        # Insert the alert data into history
                         await client.execute(
                             "INSERT INTO alert_history (chat_id, symbol, direction, target_price, entry_price, triggered_price, created_by) "
                             "VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (chat_id, symbol, direction, target, entry_price, price, created_by)
                         )
                         
-                        # Optimization 3: Keep history strictly capped at 30 entries per chat.
-                        # It automatically deletes the oldest records that are outside the top 30 newest items.
                         await client.execute(
                             "DELETE FROM alert_history WHERE chat_id = ? AND id NOT IN ("
                             "SELECT id FROM alert_history WHERE chat_id = ? ORDER BY triggered_at DESC, id DESC LIMIT 30"
@@ -659,34 +675,58 @@ async def check_alerts(application: Application) -> None:
                             (chat_id, chat_id)
                         )
                         
-                        # Remove from active list
                         await client.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
                     except Exception:
                         LOGGER.exception("Failed to dispatch alert notification to chat %s for ID %s", chat_id, alert_id)
                     continue
 
-                # 2. Check if price is NEAR target (within 1% threshold) and hasn't warned yet
-                is_near = False
-                if direction == "LONG" and (target * 0.99) <= price < target:
-                    is_near = True
-                elif direction == "SHORT" and (target * 1.01) >= price > target:
-                    is_near = True
+                # 2. Dual Proximity Assessment (1% and 0.5% thresholds)
+                is_near_1 = False
+                is_near_05 = False
 
-                if is_near and not near_alert_sent:
+                if direction == "LONG":
+                    if (target * 0.995) <= price < target:
+                        is_near_05 = True
+                    elif (target * 0.99) <= price < target:
+                        is_near_1 = True
+                else:  # SHORT
+                    if (target * 1.005) >= price > target:
+                        is_near_05 = True
+                    elif (target * 1.01) >= price > target:
+                        is_near_1 = True
+
+                # Execution Block for 0.5% Warning
+                if is_near_05 and not near_05_sent:
                     dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
                     warning_text = (
-                        f"⚠️ <b>Fast am Ziel! (Nähe zum Target)</b>\n"
+                        f"⚠️ <b>Extremely Close to Target! (0.5% Remaining)</b>\n"
                         f"#{symbol} {dir_emoji}\n"
-                        f"🎯 Target: <code>{target:g}</code> | Aktueller Kurs: <code>{price:g}</code> (Weniger als 1% entfernt!)"
+                        f"🎯 Target: <code>{target:g}</code> | Current Price: <code>{price:g}</code> (Less than 0.5% away!)"
                     )
                     try:
                         await application.bot.send_message(
                             chat_id=chat_id, text=warning_text, parse_mode=ParseMode.HTML
                         )
-                        # Flag it as sent in database so it alerts exactly once
-                        await client.execute("UPDATE alerts SET near_alert_sent = 1 WHERE id = ?", (alert_id,))
+                        # Block both to ensure the 1% reminder won't retroactively trigger if the market skips directly to 0.5%
+                        await client.execute("UPDATE alerts SET near_1_sent = 1, near_05_sent = 1 WHERE id = ?", (alert_id,))
                     except Exception:
-                        LOGGER.exception("Failed to send near-target warning context for ID %s", alert_id)
+                        LOGGER.exception("Failed to dispatch 0.5%% proximity engine alert for ID %s", alert_id)
+
+                # Execution Block for 1% Warning
+                elif is_near_1 and not near_1_sent:
+                    dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+                    warning_text = (
+                        f"⚠️ <b>Closing In On Target! (1% Remaining)</b>\n"
+                        f"#{symbol} {dir_emoji}\n"
+                        f"🎯 Target: <code>{target:g}</code> | Current Price: <code>{price:g}</code> (Less than 1% away!)"
+                    )
+                    try:
+                        await application.bot.send_message(
+                            chat_id=chat_id, text=warning_text, parse_mode=ParseMode.HTML
+                        )
+                        await client.execute("UPDATE alerts SET near_1_sent = 1 WHERE id = ?", (alert_id,))
+                    except Exception:
+                        LOGGER.exception("Failed to dispatch 1%% proximity engine alert for ID %s", alert_id)
 
         except Exception as e:
             LOGGER.error("Error inside target loop execution: %s", e)
