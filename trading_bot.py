@@ -88,10 +88,16 @@ async def initialise_database(client) -> None:
             entry_price REAL NOT NULL,
             triggered_price REAL NOT NULL,
             created_by TEXT NOT NULL,
+            photo_file_id TEXT,
+            source_link TEXT,
             triggered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    with suppress(Exception):
+        await client.execute("ALTER TABLE alert_history ADD COLUMN photo_file_id TEXT")
+    with suppress(Exception):
+        await client.execute("ALTER TABLE alert_history ADD COLUMN source_link TEXT")
 
     await client.execute(
         """
@@ -447,7 +453,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
         return
 
-    # Track all successfully sent message IDs so they get deleted no matter what
     messages_to_delete = [user_msg.message_id]
 
     try:
@@ -478,7 +483,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         messages_to_delete.append(header_msg.message_id)
 
-        # Loop through each alert inside an individual try-catch wrapper
         for number, alert in enumerate(alerts, start=1):
             try:
                 alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
@@ -492,7 +496,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 else:
                     current_text = f"{current:g} USDT"
                     
-                    # Prevent Division By Zero Crashes
                     denom = (target - entry) if direction == "LONG" else (entry - target)
                     if denom == 0:
                         progress = 100
@@ -546,54 +549,95 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as general_error:
         LOGGER.error(f"General processing error inside list_alerts pipeline: {general_error}")
     finally:
-        # THE ULTIMATE PROTECTION: This block runs NO MATTER WHAT.
-        # Even if the bot crashes mid-execution, all successfully sent messages will be wiped after 30s.
         track_background_cleanup(context.bot, update.effective_chat.id, messages_to_delete, 30)
 
 
+# NEW CRASH-PROOF LIST_HISTORY FUNCTION WITH AUTO-DELETE AND CHART BUTTONS
 async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
         return
 
-    client = context.application.bot_data["db_client"]
-    result = await client.execute(
-        "SELECT symbol, direction, target_price, triggered_price, created_by, triggered_at "
-        "FROM alert_history WHERE chat_id = ? ORDER BY triggered_at DESC LIMIT 30",
-        (update.effective_chat.id,),
-    )
-    history = result.rows
-    if not history:
-        bot_msg = await user_msg.reply_text("📜 No alerts have been triggered yet.")
-        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60)
-        return
+    messages_to_delete = [user_msg.message_id]
 
-    lines = ["📜 <b>History of Triggered Targets (Last 30)</b>"]
-    for number, row in enumerate(history, start=1):
-        symbol, direction, target, triggered, creator, timestamp = row
-        dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-        lines.append(
-            f"{number}. <b>#{symbol}</b> {dir_emoji}\n"
-            f"🎯 Target: <code>{target:g}</code> | Hit at: <code>{triggered:g}</code>\n"
-            f"👤 By: {creator} | 🕒 {timestamp}"
+    try:
+        client = context.application.bot_data["db_client"]
+        result = await client.execute(
+            "SELECT id, symbol, direction, target_price, triggered_price, created_by, triggered_at, photo_file_id "
+            "FROM alert_history WHERE chat_id = ? ORDER BY triggered_at DESC LIMIT 30",
+            (update.effective_chat.id,),
         )
+        history = result.rows
+        if not history:
+            bot_msg = await user_msg.reply_text("📜 No alerts have been triggered yet.")
+            messages_to_delete.append(bot_msg.message_id)
+            return
 
-    bot_msg = await user_msg.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
-    track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60)
+        header_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="📜 <b>History of Triggered Targets (Last 30)</b>",
+            parse_mode=ParseMode.HTML
+        )
+        messages_to_delete.append(header_msg.message_id)
+
+        for number, row in enumerate(history, start=1):
+            try:
+                hist_id, symbol, direction, target, triggered, creator, timestamp, photo_file_id = row
+                dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+                
+                history_text = (
+                    f"{number}. <b>#{symbol}</b> {dir_emoji}\n"
+                    f"🎯 Target: <code>{target:g}</code> | Hit at: <code>{triggered:g}</code>\n"
+                    f"👤 By: {creator} | 🕒 {timestamp}"
+                )
+                
+                keyboard = []
+                if photo_file_id:
+                    keyboard.append([InlineKeyboardButton(f"🔗 🖼️ View Chart #{symbol}", callback_data=f"show_hist_img:{hist_id}")])
+                
+                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+                
+                msg = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=history_text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML
+                )
+                messages_to_delete.append(msg.message_id)
+            except Exception as e:
+                LOGGER.error(f"Error compiling history item row {number}: {e}")
+                continue
+
+    except Exception as general_error:
+        LOGGER.error(f"General processing error inside list_history pipeline: {general_error}")
+    finally:
+        # Erase everything after exactly 30 seconds
+        track_background_cleanup(context.bot, update.effective_chat.id, messages_to_delete, 30)
 
 
 async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query is None or query.data is None or not query.data.startswith("show_img:"):
+    if query is None or query.data is None:
         return
     await query.answer()
-    alert_id = int(query.data.split(":", maxsplit=1)[1])
     
     client = context.application.bot_data["db_client"]
-    result = await client.execute(
-        "SELECT symbol, direction, target_price, photo_file_id FROM alerts WHERE id = ? AND chat_id = ?",
-        (alert_id, query.message.chat_id),
-    )
+    
+    if query.data.startswith("show_img:"):
+        alert_id = int(query.data.split(":", maxsplit=1)[1])
+        result = await client.execute(
+            "SELECT symbol, direction, target_price, photo_file_id FROM alerts WHERE id = ? AND chat_id = ?",
+            (alert_id, query.message.chat_id),
+        )
+    elif query.data.startswith("show_hist_img:"):
+        hist_id = int(query.data.split(":", maxsplit=1)[1])
+        result = await client.execute(
+            "SELECT symbol, direction, target_price, photo_file_id FROM alert_history WHERE id = ? AND chat_id = ?",
+            (hist_id, query.message.chat_id),
+        )
+    else:
+        return
+
     alert = result.rows[0] if result.rows else None
     if alert is None or not alert[3]:
         await query.message.reply_text("The original chart image is no longer available.")
@@ -635,7 +679,7 @@ async def check_alerts(application: Application) -> None:
     while True:
         try:
             result = await client.execute(
-                "SELECT id, chat_id, symbol, direction, target_price, entry_price, created_by, photo_file_id, near_1_sent, near_05_sent FROM alerts ORDER BY id"
+                "SELECT id, chat_id, symbol, direction, target_price, entry_price, created_by, photo_file_id, near_1_sent, near_05_sent, source_link FROM alerts ORDER BY id"
             )
             alerts = result.rows
 
@@ -646,8 +690,8 @@ async def check_alerts(application: Application) -> None:
                     prices[symbol] = await get_price(session, symbol)
 
             for row in alerts:
-                alert_id, chat_id, symbol, direction, target, entry_price, created_by, photo_file_id, near_1_sent, near_05_sent = (
-                    row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9]
+                alert_id, chat_id, symbol, direction, target, entry_price, created_by, photo_file_id, near_1_sent, near_05_sent, source_link = (
+                    row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10]
                 )
                 price = prices[symbol]
                 
@@ -677,9 +721,9 @@ async def check_alerts(application: Application) -> None:
                             )
                         
                         await client.execute(
-                            "INSERT INTO alert_history (chat_id, symbol, direction, target_price, entry_price, triggered_price, created_by) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (chat_id, symbol, direction, target, entry_price, price, created_by)
+                            "INSERT INTO alert_history (chat_id, symbol, direction, target_price, entry_price, triggered_price, created_by, photo_file_id, source_link) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (chat_id, symbol, direction, target, entry_price, price, created_by, photo_file_id, source_link)
                         )
                         
                         await client.execute(
@@ -819,7 +863,7 @@ def main() -> None:
     application.add_handler(CommandHandler("history", list_history))  
     application.add_handler(CommandHandler("alarm", add_alert))
     
-    application.add_handler(CallbackQueryHandler(show_trade_image, pattern="^show_img:"))
+    application.add_handler(CallbackQueryHandler(show_trade_image, pattern="^(show_img:|show_hist_img:)"))
     application.add_handler(MessageHandler(filters.PHOTO, add_alert))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_alert))
 
