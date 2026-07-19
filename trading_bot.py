@@ -34,11 +34,13 @@ load_dotenv()
 DB_PATH = Path("alerts.db")
 BINANCE_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
 
+# Global set to keep strong references to running background tasks
+RUNNING_TASKS = set()
+
 # Regex Patterns
 SYMBOL_PATTERN = re.compile(r"^\s*#([A-Za-z0-9/_-]+)")
 DIRECTION_TARGET_PATTERN = re.compile(r"(LONG|SHORT)\s+([\d.,]+)", re.IGNORECASE)
 
-# Automatically extracts pure numbers and ignores text tags
 ADMIN_USER_IDS = [
     int(num) 
     for num in re.findall(r"\d+", os.getenv("ADMIN_USER_IDS", "6147760453 MORADI"))
@@ -70,13 +72,11 @@ async def initialise_database(client) -> None:
         )
         """
     )
-    # Safe migration: Adds the new dual tracking columns if migrating from old instances
     with suppress(Exception):
         await client.execute("ALTER TABLE alerts ADD COLUMN near_1_sent INTEGER DEFAULT 0")
     with suppress(Exception):
         await client.execute("ALTER TABLE alerts ADD COLUMN near_05_sent INTEGER DEFAULT 0")
 
-    # TABLE: For keeping track of triggered/completed alerts
     await client.execute(
         """
         CREATE TABLE IF NOT EXISTS alert_history (
@@ -119,13 +119,11 @@ def message_link(chat_id: int, chat_username: str | None, chat_type: str, messag
     return None
 
 
-# MULTI-API FALLBACK FOR PRICE FETCHING
 async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None:
     norm_symbol = normalise_symbol(symbol)
     if not norm_symbol.endswith("USDT") and not norm_symbol.endswith("BUSD"):
         norm_symbol += "USDT"
 
-    # TRY 1: Binance Futures
     try:
         async with session.get(
             BINANCE_PRICE_URL,
@@ -136,9 +134,8 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
                 data = await response.json()
                 return float(data["price"])
     except Exception:
-        LOGGER.warning("Binance API for %s failed. Trying Bybit...", norm_symbol)
+        pass
 
-    # TRY 2: Bybit V5 API
     try:
         bybit_url = "https://api.bybit.com/v5/market/tickers"
         params = {"category": "linear", "symbol": norm_symbol}
@@ -152,9 +149,8 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
                 if data.get("retCode") == 0 and data["result"]["list"]:
                     return float(data["result"]["list"][0]["lastPrice"])
     except Exception:
-        LOGGER.warning("Bybit API for %s failed. Trying KuCoin...", norm_symbol)
+        pass
 
-    # TRY 3: KuCoin API
     try:
         kucoin_symbol = norm_symbol
         if kucoin_symbol.endswith("USDT"):
@@ -173,16 +169,14 @@ async def get_price(session: aiohttp.ClientSession, symbol: str) -> float | None
                 if data.get("code") == "200000" and data.get("data"):
                     return float(data["data"]["price"])
     except Exception:
-        LOGGER.warning("KuCoin API for %s failed.", kucoin_symbol)
+        pass
 
     LOGGER.error("Error: All price APIs failed for %s.", norm_symbol)
     return None
 
 
-# Parses European and American number formats safely
 def parse_price(price_str: str) -> float | None:
     price_str = price_str.strip()
-    
     if "," in price_str and "." in price_str:
         if price_str.find(".") < price_str.find(","):
             price_str = price_str.replace(".", "").replace(",", ".")
@@ -190,23 +184,19 @@ def parse_price(price_str: str) -> float | None:
             price_str = price_str.replace(",", "")
     elif "," in price_str:
         price_str = price_str.replace(",", ".")
-        
     try:
         return float(price_str)
     except ValueError:
         return None
 
 
-# Flexible Signal Parser
 def parse_caption(caption: str) -> list[tuple[str, str, float]]:
     alerts = []
-    
     symbol_match = re.search(r"#([A-Za-z0-9/_-]+)", caption)
     if not symbol_match:
         return alerts
     symbol = symbol_match.group(1).upper()
     
-    # Inline Scan (e.g., #ethusdt short 1.887,60)
     inline_match = re.search(r"\b(LONG|SHORT)\b\s+([\d.,]+)", caption, re.IGNORECASE)
     if inline_match:
         direction = inline_match.group(1).upper()
@@ -215,7 +205,6 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
             alerts.append((symbol, direction, target))
             return alerts
             
-    # Keyword Scan (e.g., Target: 220.6)
     dir_match = re.search(r"\b(LONG|SHORT)\b", caption, re.IGNORECASE)
     target_match = re.search(r"\b(?:target|ziel|tp|entry|price)\s*:?\s*([\d.,]+)", caption, re.IGNORECASE)
     
@@ -226,7 +215,6 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
             alerts.append((symbol, direction, target))
             return alerts
 
-    # Line by Line Fallback
     lines = [line.strip() for line in caption.split("\n") if line.strip()]
     for line in lines:
         match = DIRECTION_TARGET_PATTERN.search(line)
@@ -244,8 +232,16 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
 async def delete_messages_later(bot, chat_id, message_ids, delay=30):
     await asyncio.sleep(delay)
     for msg_id in message_ids:
-        with suppress(TelegramError):
+        try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except TelegramError as e:
+            LOGGER.warning(f"Could not delete message {msg_id} in chat {chat_id}: {e}")
+
+
+def track_background_cleanup(bot, chat_id, message_ids, delay=30):
+    task = asyncio.create_task(delete_messages_later(bot, chat_id, message_ids, delay))
+    RUNNING_TASKS.add(task)
+    task.add_done_callback(RUNNING_TASKS.discard)
 
 
 # AUTHORISATION CHECKS
@@ -272,12 +268,12 @@ async def add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_msg = update.message
     if not is_admin(update):
         bot_msg = await user_msg.reply_text("Only an admin can add allowed user IDs.")
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     if len(context.args) < 2:
         bot_msg = await user_msg.reply_text("Usage: <code>/addid 123456789 AMIRI</code>", parse_mode=ParseMode.HTML)
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     try:
@@ -286,7 +282,7 @@ async def add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         entries = [(u_id, display_name)]
     except ValueError:
         bot_msg = await user_msg.reply_text("Invalid User ID.")
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     client = context.application.bot_data["db_client"]
@@ -306,19 +302,19 @@ async def add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     bot_msg = await user_msg.reply_text(
         f"✅ User{'s' if len(entries) > 1 else ''} authorized successfully:\n{added}", parse_mode=ParseMode.HTML
     )
-    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+    track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
 async def delete_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not is_admin(update):
         bot_msg = await user_msg.reply_text("Only an admin can delete allowed user IDs.")
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     if not context.args or not context.args[0].isdigit():
         bot_msg = await user_msg.reply_text("Usage: <code>/deleteid 123456789</code>", parse_mode=ParseMode.HTML)
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     user_id = int(context.args[0])
@@ -331,14 +327,14 @@ async def delete_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else "User ID was not found in the authorized list."
     )
     bot_msg = await user_msg.reply_text(message, parse_mode=ParseMode.HTML)
-    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+    track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
 async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not is_admin(update):
         bot_msg = await user_msg.reply_text("Only an admin can view allowed user IDs.")
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     client = context.application.bot_data["db_client"]
@@ -348,7 +344,7 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     users = result.rows
     if not users:
         bot_msg = await user_msg.reply_text("No extra user IDs authorized yet.")
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     lines = ["👥 <b>Allowed Users List</b>"]
@@ -358,7 +354,7 @@ async def list_user_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines.append(f"{number}. <b>{name}</b> — <code>{u_id}</code>")
 
     bot_msg = await user_msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+    track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
 # 4. COMMANDS: ALERT MANAGEMENT
@@ -396,7 +392,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Example: <code>/alarm #TRXUSDT SHORT 0.3238</code>",
                 parse_mode=ParseMode.HTML
             )
-            asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [bot_msg.message_id], 30))
+            track_background_cleanup(context.bot, update.effective_chat.id, [bot_msg.message_id], 30)
         return
 
     chat = update.effective_chat
@@ -442,100 +438,119 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     
     bot_msg = await message.reply_text(reply_text, parse_mode=ParseMode.HTML)
-    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [bot_msg.message_id], 60))
+    track_background_cleanup(context.bot, update.effective_chat.id, [bot_msg.message_id], 60)
 
 
-# Displays active list with integrated local chart buttons
+# CRASH-PROOF AND CRITICAL-SAFETY PROTECTED LIST_ALERTS FUNCTION
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
         return
 
-    client = context.application.bot_data["db_client"]
-    result = await client.execute(
-        "SELECT id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id "
-        "FROM alerts WHERE chat_id = ? ORDER BY id",
-        (update.effective_chat.id,),
-    )
-    alerts = result.rows
-    if not alerts:
-        bot_msg = await user_msg.reply_text("🔔 No active alerts.")
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
-        return
-
-    session = context.application.bot_data["http_session"]
-    symbols = {alert[1] for alert in alerts}
-    fetched_prices = await asyncio.gather(*(get_price(session, s) for s in symbols))
-    prices = dict(zip(symbols, fetched_prices))
-
+    # Track all successfully sent message IDs so they get deleted no matter what
     messages_to_delete = [user_msg.message_id]
 
-    header_msg = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="📊 <b>Active Alerts &amp; Market Prices</b>",
-        parse_mode=ParseMode.HTML
-    )
-    messages_to_delete.append(header_msg.message_id)
-
-    for number, alert in enumerate(alerts, start=1):
-        alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
-        current = prices.get(symbol)
-        
-        dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-        
-        if current is None:
-            current_text = "unavailable"
-            progress_line = ""
-        else:
-            current_text = f"{current:g} USDT"
-            
-            if direction == "LONG":
-                if current <= entry:
-                    progress = 0
-                elif current >= target:
-                    progress = 100
-                else:
-                    progress = int(((current - entry) / (target - entry)) * 100)
-            else:  # SHORT
-                if current >= entry:
-                    progress = 0
-                elif current <= target:
-                    progress = 100
-                else:
-                    progress = int(((entry - current) / (entry - target)) * 100)
-
-            progress_clamped = min(100, max(0, progress))
-            filled_blocks = int(progress_clamped / 10)
-            empty_blocks = 10 - filled_blocks
-            bar = "█" * filled_blocks + "░" * empty_blocks
-            progress_line = f"\n📈 To Target: [<code>{bar}</code>] <code>{progress}%</code>"
-
-        alert_text = (
-            f"{number}. <b>#{symbol}</b> | BY {creator}\n"
-            f"{dir_emoji}\n"
-            f"🎯 Target: <code>{target:g}</code> USDT\n"
-            f"⚡ Current: <code>{current_text}</code>"
-            f"{progress_line}"
+    try:
+        client = context.application.bot_data["db_client"]
+        result = await client.execute(
+            "SELECT id, symbol, direction, target_price, entry_price, created_by, source_link, photo_file_id "
+            "FROM alerts WHERE chat_id = ? ORDER BY id",
+            (update.effective_chat.id,),
         )
-        
-        keyboard = []
-        if photo_file_id:
-            keyboard.append([InlineKeyboardButton(f"🔗 🖼️ View Chart #{symbol}", callback_data=f"show_img:{alert_id}")])
+        alerts = result.rows
+        if not alerts:
+            bot_msg = await user_msg.reply_text("🔔 No active alerts.")
+            messages_to_delete.append(bot_msg.message_id)
+            return
 
-        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        session = context.application.bot_data["http_session"]
+        symbols = {alert[1] for alert in alerts}
+        fetched_prices = await asyncio.gather(*(get_price(session, s) for s in symbols), return_exceptions=True)
         
-        alert_msg = await context.bot.send_message(
+        prices = {}
+        for s, p in zip(symbols, fetched_prices):
+            prices[s] = None if isinstance(p, Exception) or p is None else p
+
+        header_msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=alert_text,
-            reply_markup=reply_markup,
+            text="📊 <b>Active Alerts &amp; Market Prices</b>",
             parse_mode=ParseMode.HTML
         )
-        messages_to_delete.append(alert_msg.message_id)
+        messages_to_delete.append(header_msg.message_id)
 
-    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, messages_to_delete, 30))
+        # Loop through each alert inside an individual try-catch wrapper
+        for number, alert in enumerate(alerts, start=1):
+            try:
+                alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
+                current = prices.get(symbol)
+                
+                dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+                
+                if current is None:
+                    current_text = "unavailable"
+                    progress_line = ""
+                else:
+                    current_text = f"{current:g} USDT"
+                    
+                    # Prevent Division By Zero Crashes
+                    denom = (target - entry) if direction == "LONG" else (entry - target)
+                    if denom == 0:
+                        progress = 100
+                    else:
+                        if direction == "LONG":
+                            if current <= entry:
+                                progress = 0
+                            elif current >= target:
+                                progress = 100
+                            else:
+                                progress = int(((current - entry) / denom) * 100)
+                        else:  # SHORT
+                            if current >= entry:
+                                progress = 0
+                            elif current <= target:
+                                progress = 100
+                            else:
+                                progress = int(((entry - current) / denom) * 100)
+
+                    progress_clamped = min(100, max(0, progress))
+                    filled_blocks = int(progress_clamped / 10)
+                    empty_blocks = 10 - filled_blocks
+                    bar = "█" * filled_blocks + "░" * empty_blocks
+                    progress_line = f"\n📈 To Target: [<code>{bar}</code>] <code>{progress_clamped}%</code>"
+
+                alert_text = (
+                    f"{number}. <b>#{symbol}</b> | BY {creator}\n"
+                    f"{dir_emoji}\n"
+                    f"🎯 Target: <code>{target:g}</code> USDT\n"
+                    f"⚡ Current: <code>{current_text}</code>"
+                    f"{progress_line}"
+                )
+                
+                keyboard = []
+                if photo_file_id:
+                    keyboard.append([InlineKeyboardButton(f"🔗 🖼️ View Chart #{symbol}", callback_data=f"show_img:{alert_id}")])
+
+                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+                
+                alert_msg = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=alert_text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML
+                )
+                messages_to_delete.append(alert_msg.message_id)
+            except Exception as e:
+                LOGGER.error(f"Error compiling list item row {number} (#{symbol}): {e}")
+                continue
+
+    except Exception as general_error:
+        LOGGER.error(f"General processing error inside list_alerts pipeline: {general_error}")
+    finally:
+        # THE ULTIMATE PROTECTION: This block runs NO MATTER WHAT.
+        # Even if the bot crashes mid-execution, all successfully sent messages will be wiped after 30s.
+        track_background_cleanup(context.bot, update.effective_chat.id, messages_to_delete, 30)
 
 
-# Command to view history of triggered alerts (Shows up to 30 elements, deleted after 1 minute)
 async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
@@ -550,7 +565,7 @@ async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     history = result.rows
     if not history:
         bot_msg = await user_msg.reply_text("📜 No alerts have been triggered yet.")
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60)
         return
 
     lines = ["📜 <b>History of Triggered Targets (Last 30)</b>"]
@@ -564,7 +579,7 @@ async def list_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
     bot_msg = await user_msg.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
-    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60))
+    track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 60)
 
 
 async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -599,7 +614,7 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if len(context.args) != 1 or not context.args[0].isdigit():
         bot_msg = await user_msg.reply_text("Usage: <code>/delete 12</code>", parse_mode=ParseMode.HTML)
-        asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+        track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     client = context.application.bot_data["db_client"]
@@ -610,10 +625,10 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     bot_msg = await user_msg.reply_text(
         "🗑️ Alert deleted successfully." if result.rows_affected > 0 else "No active alert found with that ID."
     )
-    asyncio.create_task(delete_messages_later(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30))
+    track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
-# 5. BACKGROUND ENGINE: TICKER WATCHER (WITH DUAL NEAR-TARGET TRACKING)
+# 5. BACKGROUND ENGINE: TICKER WATCHER
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
     client = application.bot_data["db_client"]
@@ -639,7 +654,6 @@ async def check_alerts(application: Application) -> None:
                 if price is None:
                     continue
 
-                # 1. Ultimate Target Verification Loop
                 reached = (
                     (direction == "LONG" and price >= target) or 
                     (direction == "SHORT" and price <= target)
@@ -680,7 +694,6 @@ async def check_alerts(application: Application) -> None:
                         LOGGER.exception("Failed to dispatch alert notification to chat %s for ID %s", chat_id, alert_id)
                     continue
 
-                # 2. Dual Proximity Assessment (1% and 0.5% thresholds)
                 is_near_1 = False
                 is_near_05 = False
 
@@ -695,7 +708,6 @@ async def check_alerts(application: Application) -> None:
                     elif (target * 1.01) >= price > target:
                         is_near_1 = True
 
-                # Execution Block for 0.5% Warning
                 if is_near_05 and not near_05_sent:
                     dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
                     warning_text = (
@@ -707,12 +719,10 @@ async def check_alerts(application: Application) -> None:
                         await application.bot.send_message(
                             chat_id=chat_id, text=warning_text, parse_mode=ParseMode.HTML
                         )
-                        # Block both to ensure the 1% reminder won't retroactively trigger if the market skips directly to 0.5%
                         await client.execute("UPDATE alerts SET near_1_sent = 1, near_05_sent = 1 WHERE id = ?", (alert_id,))
                     except Exception:
                         LOGGER.exception("Failed to dispatch 0.5%% proximity engine alert for ID %s", alert_id)
 
-                # Execution Block for 1% Warning
                 elif is_near_1 and not near_1_sent:
                     dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
                     warning_text = (
@@ -733,7 +743,7 @@ async def check_alerts(application: Application) -> None:
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# 6. MINI WEB SERVER (PORT BINDING REQUIREMENT)
+# 6. MINI WEB SERVER
 async def handle_ping(request):
     return web.Response(text="Bot ecosystem is running live!")
 
@@ -743,7 +753,7 @@ async def post_init(application: Application) -> None:
     db_url = os.getenv("TURSO_DATABASE_URL")
     db_token = os.getenv("TURSO_AUTH_TOKEN")
     if not db_url or not db_token:
-        raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN environment variables must be configured properly.")
+        raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN variables must be configured properly.")
     
     if db_url.startswith("libsql://"):
         db_url = db_url.replace("libsql://", "https://")
@@ -801,7 +811,6 @@ def main() -> None:
         .build()
     )
 
-    # Command Pipelines
     application.add_handler(CommandHandler("addid", add_user_id))
     application.add_handler(CommandHandler("deleteid", delete_user_id))
     application.add_handler(CommandHandler("list", list_user_ids))
@@ -810,7 +819,6 @@ def main() -> None:
     application.add_handler(CommandHandler("history", list_history))  
     application.add_handler(CommandHandler("alarm", add_alert))
     
-    # Context-Interactive Actions
     application.add_handler(CallbackQueryHandler(show_trade_image, pattern="^show_img:"))
     application.add_handler(MessageHandler(filters.PHOTO, add_alert))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_alert))
