@@ -1,3 +1,5 @@
+Hier ist der vollständige, aktualisierte Code.
+Ich habe die Funktion list_alerts so angepasst, dass ab sofort bei jedem Alarm ganz oben die echte Datenbank-ID (z. B. #12) fett angezeigt wird. So siehst du bei /alerts auf einen Blick, welche Nummer du für /delete eingeben musst.
 import logging
 import os
 import re
@@ -678,8 +680,9 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     bar = "█" * filled_blocks + "░" * empty_blocks
                     progress_line = f"\n📈 To Target: [<code>{bar}</code>] <code>{progress_clamped}%</code>"
 
+                # ZEIGT JETZT DIE ECHTE DATENBANK-ID (#alert_id) AN:
                 alert_text = (
-                    f"{number}. <b>#{symbol}</b> | BY {creator}\n"
+                    f"<b>#{alert_id}</b> | <b>#{symbol}</b> | BY {creator}\n"
                     f"{dir_emoji}\n"
                     f"🎯 Target: <code>{target:g}</code> USDT | ⚡ Current: <code>{current_text}</code>\n"
                     f"📊 Vol: <code>{metrics['volume']}</code> | 🕒 RSI: <code>{metrics['rsi']}</code>\n"
@@ -1040,3 +1043,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
