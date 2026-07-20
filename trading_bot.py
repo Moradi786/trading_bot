@@ -1,5 +1,3 @@
-Hier ist der vollständige, aktualisierte Code.
-Ich habe die Funktion list_alerts so angepasst, dass ab sofort bei jedem Alarm ganz oben die echte Datenbank-ID (z. B. #12) fett angezeigt wird. So siehst du bei /alerts auf einen Blick, welche Nummer du für /delete eingeben musst.
 import logging
 import os
 import re
@@ -192,11 +190,11 @@ def fill_market_metrics(metrics: dict, price: float, raw_vol: float, close_price
         else:
             rsi_trend = "stable"
             
-    metrics["ai_analysis"] = (
-        f"🤖 <b>AI Market Analysis ({interval}):</b>\n"
-        f"• 📊 Volume: {vol_text}\n"
-        f"• 🕒 RSI Status: {rsi_zone} | {rsi_trend}"
-    )
+        metrics["ai_analysis"] = (
+            f"🤖 <b>AI Market Analysis ({interval} via {source_name}):</b>\n"
+            f"• 📊 Volume: {vol_text}\n"
+            f"• 🕒 RSI Status: {rsi_zone} | {rsi_trend}"
+        )
 
 
 async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval: str = "1h") -> dict:
@@ -214,12 +212,10 @@ async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval:
         "source": "N/A"
     }
     
-    # Priority order for Fallback Routing Engine
     providers = ["binance", "bybit", "bitget", "mexc"]
     
     for provider in providers:
         try:
-            # 1. BINANCE FUTURES DATA PROFILE
             if provider == "binance":
                 symbol_f = f"{coin}USDT"
                 url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -238,7 +234,6 @@ async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval:
                                 fill_market_metrics(market_metrics, price, raw_vol, close_prices, quote_volumes, "Binance", interval)
                                 return market_metrics
 
-            # 2. BYBIT V5 MARKET DATA PROFILE
             elif provider == "bybit":
                 symbol_f = f"{coin}USDT"
                 url = "https://api.bybit.com/v5/market/tickers"
@@ -263,10 +258,9 @@ async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval:
                                         fill_market_metrics(market_metrics, price, raw_vol, close_prices, quote_volumes, "Bybit", interval)
                                         return market_metrics
 
-            # 3. BITGET V2 FUTURES DATA PROFILE
             elif provider == "bitget":
                 symbol_f = f"{coin}USDT"
-                url = "https://api.bitget.com/api/v2/mix/mix-market/ticker"
+                url = "https://api.bitget.com/api/v2/mix/market/ticker"
                 async with session.get(url, params={"productType": "USDT-FUTURES", "symbol": symbol_f}, timeout=aiohttp.ClientTimeout(total=2)) as response:
                     if response.status == 200:
                         res_data = await response.json()
@@ -288,7 +282,6 @@ async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval:
                                         fill_market_metrics(market_metrics, price, raw_vol, close_prices, quote_volumes, "Bitget", interval)
                                         return market_metrics
 
-            # 4. MEXC GLOBAL FUTURES DATA PROFILE
             elif provider == "mexc":
                 symbol_f = f"{coin}_USDT"
                 url = f"https://contract.mexc.com/api/v1/contract/ticker"
@@ -579,7 +572,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
         reply_text = (
             f"✅ <b>Alert Saved - #{symbol} | BY {creator}</b>\n"
-            f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code>\n"
+            f"• <b>#{alert_id}</b> {dir_emoji} → Target: <code>{target:g}</code>\n"
             f"Current Price: <code>{current_price:g}</code>\n"
             f"📊 Vol (24h): <code>{market['volume']}</code> | 🕒 RSI: <code>{market['rsi']}</code>\n\n"
             f"{market['ai_analysis']}"
@@ -596,7 +589,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             alert_id = result.last_insert_rowid
             dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-            saved_lines.append(f"• #{alert_id} {dir_emoji} → Target: <code>{target:g}</code> (RSI: {market['rsi']})")
+            saved_lines.append(f"• <b>#{alert_id}</b> {dir_emoji} → Target: <code>{target:g}</code> (RSI: {market['rsi']})")
             
         reply_text = (
             f"🔔 <b>Multiple Alerts Saved!</b>\n" + "\n".join(saved_lines)
@@ -641,7 +634,7 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         messages_to_delete.append(header_msg.message_id)
 
-        for number, alert in enumerate(alerts, start=1):
+        for alert in alerts:
             try:
                 alert_id, symbol, direction, target, entry, creator, source_link, photo_file_id = alert
                 metrics = market_data.get(symbol, {"price": None, "volume": "N/A", "rsi": "N/A", "ai_analysis": ""})
@@ -680,7 +673,7 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     bar = "█" * filled_blocks + "░" * empty_blocks
                     progress_line = f"\n📈 To Target: [<code>{bar}</code>] <code>{progress_clamped}%</code>"
 
-                # ZEIGT JETZT DIE ECHTE DATENBANK-ID (#alert_id) AN:
+                # ZEIGT JETZT DIE ECHTE DATENBANK-ID AN (z. B. #18)
                 alert_text = (
                     f"<b>#{alert_id}</b> | <b>#{symbol}</b> | BY {creator}\n"
                     f"{dir_emoji}\n"
@@ -704,7 +697,7 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
                 messages_to_delete.append(alert_msg.message_id)
             except Exception as e:
-                LOGGER.error(f"Error compiling list item row {number} (#{symbol}): {e}")
+                LOGGER.error(f"Error compiling alert row ID #{alert_id} (#{symbol}): {e}")
                 continue
 
     except Exception as general_error:
@@ -810,43 +803,44 @@ async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-# MULTI-ID DELETION ENGINE
+# ERWEITERTE DELETE-FUNKTION FÜR DATENBANK-IDs
 async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
         return
 
-    # Combines all arguments and extracts all numeric characters
-    args_combined = " ".join(context.args)
-    alert_ids = [int(x) for x in re.findall(r"\d+", args_combined)]
+    # Extrahiert alle Nummern aus dem Befehl (z. B. "/delete 18" oder "/delete 18, 19")
+    ids_to_delete = [int(n) for n in re.findall(r"\d+", " ".join(context.args))] if context.args else []
 
-    if not alert_ids:
+    if not ids_to_delete:
         bot_msg = await user_msg.reply_text(
-            "Format: <code>/delete 1,2,3,4</code> or <code>/delete 1 2 3</code>", 
+            "Usage: <code>/delete 18</code> or <code>/delete 18, 19</code>",
             parse_mode=ParseMode.HTML
         )
         track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     client = context.application.bot_data["db_client"]
-    
-    # Builds a secure SQL IN clause dynamically mapping placeholders
-    placeholders = ",".join(["?"] * len(alert_ids))
-    query = f"DELETE FROM alerts WHERE id IN ({placeholders}) AND chat_id = ?"
-    params = alert_ids + [update.effective_chat.id]
-    
-    result = await client.execute(query, tuple(params))
-    
-    if result.rows_affected > 0:
-        msg = f"🗑️ {result.rows_affected} alert(s) deleted successfully."
-    else:
-        msg = "No active alerts found with the provided ID(s)."
+    deleted_count = 0
 
-    bot_msg = await user_msg.reply_text(msg)
+    for alert_id in ids_to_delete:
+        result = await client.execute(
+            "DELETE FROM alerts WHERE id = ? AND chat_id = ?", 
+            (alert_id, update.effective_chat.id)
+        )
+        if result.rows_affected > 0:
+            deleted_count += 1
+    
+    if deleted_count > 0:
+        msg = f"🗑️ {deleted_count} alert(s) deleted successfully."
+    else:
+        msg = "No active alert(s) found with the provided ID(s)."
+
+    bot_msg = await user_msg.reply_text(msg, parse_mode=ParseMode.HTML)
     track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
-# 5. BACKGROUND ENGINE: TICKER WATCHER
+# 5. BACKGROUND ENGINE: TICKER WATCHER WITH AI TRIGGER SCANS
 async def check_alerts(application: Application) -> None:
     session: aiohttp.ClientSession = application.bot_data["http_session"]
     client = application.bot_data["db_client"]
@@ -1043,4 +1037,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
