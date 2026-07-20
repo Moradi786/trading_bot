@@ -190,12 +190,11 @@ def fill_market_metrics(metrics: dict, price: float, raw_vol: float, close_price
         else:
             rsi_trend = "stable"
             
-        # "via exchange" text successfully removed here
-        metrics["ai_analysis"] = (
-            f"🤖 <b>AI Market Analysis ({interval}):</b>\n"
-            f"• 📊 Volume: {vol_text}\n"
-            f"• 🕒 RSI Status: {rsi_zone} | {rsi_trend}"
-        )
+    metrics["ai_analysis"] = (
+        f"🤖 <b>AI Market Analysis ({interval}):</b>\n"
+        f"• 📊 Volume: {vol_text}\n"
+        f"• 🕒 RSI Status: {rsi_zone} | {rsi_trend}"
+    )
 
 
 async def get_market_data(session: aiohttp.ClientSession, symbol: str, interval: str = "1h") -> dict:
@@ -808,24 +807,39 @@ async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+# MULTI-ID DELETION ENGINE
 async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
         return
 
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        bot_msg = await user_msg.reply_text("Usage: <code>/delete 12</code>", parse_mode=ParseMode.HTML)
+    # Combines all arguments and extracts all numeric characters
+    args_combined = " ".join(context.args)
+    alert_ids = [int(x) for x in re.findall(r"\d+", args_combined)]
+
+    if not alert_ids:
+        bot_msg = await user_msg.reply_text(
+            "Format: <code>/delete 1,2,3,4</code> or <code>/delete 1 2 3</code>", 
+            parse_mode=ParseMode.HTML
+        )
         track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
         return
 
     client = context.application.bot_data["db_client"]
-    result = await client.execute(
-        "DELETE FROM alerts WHERE id = ? AND chat_id = ?", (int(context.args[0]), update.effective_chat.id)
-    )
     
-    bot_msg = await user_msg.reply_text(
-        "🗑️ Alert deleted successfully." if result.rows_affected > 0 else "No active alert found with that ID."
-    )
+    # Builds a secure SQL IN clause dynamically mapping placeholders
+    placeholders = ",".join(["?"] * len(alert_ids))
+    query = f"DELETE FROM alerts WHERE id IN ({placeholders}) AND chat_id = ?"
+    params = alert_ids + [update.effective_chat.id]
+    
+    result = await client.execute(query, tuple(params))
+    
+    if result.rows_affected > 0:
+        msg = f"🗑️ {result.rows_affected} alert(s) deleted successfully."
+    else:
+        msg = "No active alerts found with the provided ID(s)."
+
+    bot_msg = await user_msg.reply_text(msg)
     track_background_cleanup(context.bot, update.effective_chat.id, [user_msg.message_id, bot_msg.message_id], 30)
 
 
