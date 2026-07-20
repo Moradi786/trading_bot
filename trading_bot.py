@@ -38,7 +38,6 @@ RUNNING_TASKS = set()
 
 # Regex Patterns
 SYMBOL_PATTERN = re.compile(r"^\s*#([A-Za-z0-9/_-]+)")
-DIRECTION_TARGET_PATTERN = re.compile(r"(LONG|SHORT)\s+([\d.,]+)", re.IGNORECASE)
 
 ADMIN_USER_IDS = [
     int(num) 
@@ -344,6 +343,7 @@ def parse_price(price_str: str) -> float | None:
         return None
 
 
+# AKTUALISIERTE PARSE-FUNKTION: ERFASST MULTIPLE (LONG & SHORT) ELEMENTE FÜR EINEN COIN
 def parse_caption(caption: str) -> list[tuple[str, str, float]]:
     alerts = []
     symbol_match = re.search(r"#([A-Za-z0-9/_-]+)", caption)
@@ -351,34 +351,22 @@ def parse_caption(caption: str) -> list[tuple[str, str, float]]:
         return alerts
     symbol = symbol_match.group(1).upper()
     
-    inline_match = re.search(r"\b(LONG|SHORT)\b\s+([\d.,]+)", caption, re.IGNORECASE)
-    if inline_match:
-        direction = inline_match.group(1).upper()
-        target = parse_price(inline_match.group(2))
+    # Findet alle Vorkommnisse von LONG/SHORT inkl. Preis (z. B. "Long 0.004742", "Short 0.004630")
+    matches = re.findall(r"\b(LONG|SHORT)\b\s*:?\s*([\d.,]+)", caption, re.IGNORECASE)
+    for dir_str, price_str in matches:
+        target = parse_price(price_str)
         if target is not None:
-            alerts.append((symbol, direction, target))
-            return alerts
+            alerts.append((symbol, dir_str.upper(), target))
             
-    dir_match = re.search(r"\b(LONG|SHORT)\b", caption, re.IGNORECASE)
-    target_match = re.search(r"\b(?:target|ziel|tp|entry|price)\s*:?\s*([\d.,]+)", caption, re.IGNORECASE)
-    
-    if dir_match and target_match:
-        direction = dir_match.group(1).upper()
-        target = parse_price(target_match.group(1))
-        if target is not None:
-            alerts.append((symbol, direction, target))
-            return alerts
-
-    lines = [line.strip() for line in caption.split("\n") if line.strip()]
-    for line in lines:
-        match = DIRECTION_TARGET_PATTERN.search(line)
-        if match:
-            direction = match.group(1).upper()
-            target = parse_price(match.group(2))
+    if not alerts:
+        dir_match = re.search(r"\b(LONG|SHORT)\b", caption, re.IGNORECASE)
+        target_match = re.search(r"\b(?:target|ziel|tp|entry|price)\s*:?\s*([\d.,]+)", caption, re.IGNORECASE)
+        if dir_match and target_match:
+            direction = dir_match.group(1).upper()
+            target = parse_price(target_match.group(1))
             if target is not None:
                 alerts.append((symbol, direction, target))
-                return alerts
-                
+
     return alerts
 
 
@@ -673,7 +661,6 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     bar = "█" * filled_blocks + "░" * empty_blocks
                     progress_line = f"\n📈 To Target: [<code>{bar}</code>] <code>{progress_clamped}%</code>"
 
-                # ZEIGT JETZT DIE ECHTE DATENBANK-ID AN (z. B. #18)
                 alert_text = (
                     f"<b>#{alert_id}</b> | <b>#{symbol}</b> | BY {creator}\n"
                     f"{dir_emoji}\n"
@@ -803,13 +790,11 @@ async def show_trade_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-# ERWEITERTE DELETE-FUNKTION FÜR DATENBANK-IDs
 async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_msg = update.message
     if not await is_authorised(update, context) or update.effective_chat is None or user_msg is None:
         return
 
-    # Extrahiert alle Nummern aus dem Befehl (z. B. "/delete 18" oder "/delete 18, 19")
     ids_to_delete = [int(n) for n in re.findall(r"\d+", " ".join(context.args))] if context.args else []
 
     if not ids_to_delete:
