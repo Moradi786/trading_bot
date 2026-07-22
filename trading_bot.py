@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+import random
 import aiohttp
 from aiohttp import web
 from telegram import Bot
@@ -21,7 +22,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT = int(os.getenv("PORT", 8080))
 
-# اعتبارسنجی متغیرهای محیطی
 if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
     LOGGER.error("❌ TELEGRAM_BOT_TOKEN تنظیم نشده!")
     raise SystemExit(1)
@@ -30,7 +30,6 @@ if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
     LOGGER.error("❌ TELEGRAM_CHAT_ID تنظیم نشده!")
     raise SystemExit(1)
 
-# تبدیل chat_id به int اگر عددی باشد
 try:
     TELEGRAM_CHAT_ID = int(TELEGRAM_CHAT_ID)
 except ValueError:
@@ -38,14 +37,221 @@ except ValueError:
 
 TIMEFRAMES = ["15m", "1h", "4h"]
 MAX_SL_PERCENT = 2.0
-
-# ذخیره آلرت‌ها با timestamp برای جلوگیری از پر شدن حافظه
-sent_alerts = {}  # {alert_id: timestamp}
-ALERT_TTL = 86400  # ۲۴ ساعت
+sent_alerts = {}
+ALERT_TTL = 86400
 
 
 # ---------------------------------------------------------
-# ۲. دریافت لیست کل ارزهای USDT فیوچرز
+# ۲. تعریف ۱۰ صرافی با endpoint کندل
+# ---------------------------------------------------------
+EXCHANGES = [
+    {
+        "name": "Binance",
+        "weight": 10,
+        "url": "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100",
+        "interval_map": {"15m": "15m", "1h": "1h", "4h": "4h"},
+        "parser": lambda data: data if isinstance(data, list) else None,
+    },
+    {
+        "name": "Bybit",
+        "weight": 8,
+        "url": "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit=100",
+        "interval_map": {"15m": "15", "1h": "60", "4h": "240"},
+        "parser": lambda data: _parse_bybit(data),
+    },
+    {
+        "name": "OKX",
+        "weight": 8,
+        "url": "https://www.okx.com/api/v5/market/history-candles?instId={symbol}-SWAP&bar={interval}&limit=100",
+        "interval_map": {"15m": "15m", "1h": "1H", "4h": "4H"},
+        "parser": lambda data: _parse_okx(data),
+    },
+    {
+        "name": "KuCoin",
+        "weight": 6,
+        "url": "https://api.kucoin.com/api/v1/market/candles?type={interval}&symbol={symbol}&limit=100",
+        "interval_map": {"15m": "15min", "1h": "1hour", "4h": "4hour"},
+        "parser": lambda data: _parse_kucoin(data),
+    },
+    {
+        "name": "Gate.io",
+        "weight": 6,
+        "url": "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract={symbol}&interval={interval}&limit=100",
+        "interval_map": {"15m": "15m", "1h": "1h", "4h": "4h"},
+        "parser": lambda data: _parse_gateio(data),
+    },
+    {
+        "name": "MEXC",
+        "weight": 5,
+        "url": "https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval={interval}&limit=100",
+        "interval_map": {"15m": "Min15", "1h": "Min60", "4h": "Hour4"},
+        "parser": lambda data: _parse_mexc(data),
+    },
+    {
+        "name": "Bitget",
+        "weight": 5,
+        "url": "https://api.bitget.com/api/v2/mix/market/candles?symbol={symbol}&granularity={interval}&limit=100&productType=USDT-FUTURES",
+        "interval_map": {"15m": "15m", "1h": "1H", "4h": "4H"},
+        "parser": lambda data: _parse_bitget(data),
+    },
+    {
+        "name": "HTX",
+        "weight": 4,
+        "url": "https://api.hbdm.com/linear-swap-ex/market/history/kline?contract_code={symbol}&period={interval}&size=100",
+        "interval_map": {"15m": "15min", "1h": "60min", "4h": "4hour"},
+        "parser": lambda data: _parse_htx(data),
+    },
+    {
+        "name": "Kraken",
+        "weight": 3,
+        "url": "https://futures.kraken.com/api/charts/v1/trade/{symbol}/{interval}?limit=100",
+        "interval_map": {"15m": "1", "1h": "60", "4h": "240"},
+        "parser": lambda data: _parse_kraken(data),
+    },
+    {
+        "name": "Coinbase",
+        "weight": 3,
+        "url": "https://api.exchange.coinbase.com/products/{symbol}/candles?granularity={interval}&limit=100",
+        "interval_map": {"15m": "900", "1h": "3600", "4h": "14400"},
+        "parser": lambda data: _parse_coinbase(data),
+    },
+]
+
+
+# ---------------------------------------------------------
+# ۳. پارسرهای هر صرافی (تبدیل به فرمت استاندارد [time, open, high, low, close, volume])
+# ---------------------------------------------------------
+def _parse_bybit(data):
+    try:
+        if data.get("retCode") != 0:
+            return None
+        result = data.get("result", {}).get("list", [])
+        # Bybit: [time, open, high, low, close, volume, turnover]
+        return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
+    except Exception:
+        return None
+
+
+def _parse_okx(data):
+    try:
+        result = data.get("data", [])
+        # OKX: [time, open, high, low, close, vol, volCcy, volCcyQuote]
+        return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
+    except Exception:
+        return None
+
+
+def _parse_kucoin(data):
+    try:
+        result = data.get("data", [])
+        # KuCoin: [time, open, close, high, low, volume, turnover]
+        return [[int(x[0]), x[1], x[3], x[4], x[2], x[5]] for x in result]
+    except Exception:
+        return None
+
+
+def _parse_gateio(data):
+    try:
+        # Gate.io: [[time, volume, close, high, low, open], ...]
+        return [[int(x[0]), x[5], x[3], x[4], x[2], x[1]] for x in data]
+    except Exception:
+        return None
+
+
+def _parse_mexc(data):
+    try:
+        result = data.get("data", {}).get("time", [])
+        if not result:
+            return None
+        # MEXC ساختار پیچیده‌تری داره، ساده‌ش می‌کنیم
+        return None  # TODO: اگه نیاز داری پیاده‌سازی کن
+    except Exception:
+        return None
+
+
+def _parse_bitget(data):
+    try:
+        result = data.get("data", [])
+        # Bitget: [openPrice, highPrice, lowPrice, closePrice, volume, quoteVolume, time]
+        return [[int(x[6]), x[0], x[1], x[2], x[3], x[4]] for x in result]
+    except Exception:
+        return None
+
+
+def _parse_htx(data):
+    try:
+        result = data.get("data", [])
+        # HTX: [id, open, close, low, high, amount, vol, trade_turnover]
+        return [[int(x[0]), x[1], x[4], x[3], x[2], x[5]] for x in result]
+    except Exception:
+        return None
+
+
+def _parse_kraken(data):
+    try:
+        candles = data.get("candles", [])
+        # Kraken: {time, open, high, low, close, volume, ...}
+        return [[int(c["time"]), c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in candles]
+    except Exception:
+        return None
+
+
+def _parse_coinbase(data):
+    try:
+        # Coinbase: [[time, low, high, open, close, volume], ...]
+        return [[int(x[0]), x[3], x[2], x[1], x[4], x[5]] for x in data]
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------
+# ۴. دریافت کندل با Failover بین صرافی‌ها
+# ---------------------------------------------------------
+async def fetch_klines_with_failover(session, symbol, interval):
+    """
+    از صرافی‌ها به ترتیب اولویت تلاش می‌کنه.
+    اگر یکی fail شد، میره سراغ بعدی.
+    """
+    # صرافی‌ها رو بر اساس weight مرتب می‌کنیم (اولویت بالاتر = اول)
+    sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
+
+    for ex in sorted_exchanges:
+        try:
+            mapped_interval = ex["interval_map"].get(interval, interval)
+            url = ex["url"].format(symbol=symbol, interval=mapped_interval)
+
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=8),
+                headers={"User-Agent": "TradingBot/1.0"}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    klines = ex["parser"](data)
+                    if klines and len(klines) >= 50:
+                        LOGGER.debug(f"✅ {ex['name']} OK برای {symbol} {interval}")
+                        return klines
+                    else:
+                        LOGGER.debug(f"⚠️ {ex['name']} دیتای ناقص برای {symbol}")
+                elif resp.status == 429:
+                    LOGGER.warning(f"⏱️ {ex['name']} Rate Limit برای {symbol}")
+                else:
+                    LOGGER.debug(f"⚠️ {ex['name']} HTTP {resp.status} برای {symbol}")
+
+        except asyncio.TimeoutError:
+            LOGGER.debug(f"⏱️ {ex['name']} Timeout برای {symbol}")
+        except Exception as e:
+            LOGGER.debug(f"❌ {ex['name']} خطا برای {symbol}: {e}")
+
+        # کمی تأخیر بین صرافی‌ها برای جلوگیری از اسپم
+        await asyncio.sleep(0.1)
+
+    LOGGER.warning(f"❌ همه صرافی‌ها برای {symbol} {interval} fail شدند")
+    return None
+
+
+# ---------------------------------------------------------
+# ۵. دریافت لیست نمادها (از Binance به عنوان مرجع)
 # ---------------------------------------------------------
 async def get_all_usdt_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -53,17 +259,19 @@ async def get_all_usdt_symbols(session):
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return [
+                symbols = [
                     s["symbol"] for s in data["symbols"]
                     if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
                 ]
+                LOGGER.info(f"✅ {len(symbols)} نماد از Binance گرفته شد")
+                return symbols
     except Exception as e:
         LOGGER.error(f"Error fetching symbols: {e}")
     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XLMUSDT", "ZECUSDT"]
 
 
 # ---------------------------------------------------------
-# ۳. توابع کمکی تئوری داو
+# ۶. توابع کمکی تئوری داو
 # ---------------------------------------------------------
 def find_pivots(highs, lows, left_right=3):
     pivot_highs = []
@@ -97,9 +305,6 @@ def check_dow_theory_trend(pivot_highs, pivot_lows):
     return "NEUTRAL"
 
 
-# ---------------------------------------------------------
-# ۴. پاک‌سازی آلرت‌های قدیمی
-# ---------------------------------------------------------
 def cleanup_old_alerts():
     now = time.time()
     expired = [k for k, v in sent_alerts.items() if now - v > ALERT_TTL]
@@ -110,7 +315,7 @@ def cleanup_old_alerts():
 
 
 # ---------------------------------------------------------
-# ۵. الگوریتم اصلی تحلیل کندل ستاپ
+# ۷. الگوریتم اصلی تحلیل کندل ستاپ
 # ---------------------------------------------------------
 def analyze_candle_setup(klines, max_sl_percent=2.0):
     if len(klines) < 50:
@@ -211,19 +416,8 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     return None
 
 
-async def fetch_klines(session, symbol, interval):
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100"
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                return await resp.json()
-    except Exception:
-        pass
-    return None
-
-
 # ---------------------------------------------------------
-# ۶. ارسال پیام تلگرام با هندل دقیق خطا
+# ۸. ارسال پیام تلگرام
 # ---------------------------------------------------------
 async def send_telegram_message(bot, chat_id, text):
     try:
@@ -261,12 +455,11 @@ async def send_telegram_message(bot, chat_id, text):
 
 
 # ---------------------------------------------------------
-# ۷. چرخه اصلی اسکن
+# ۹. چرخه اصلی اسکن
 # ---------------------------------------------------------
 async def scanner_task():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-    # تست اتصال اولیه
     try:
         me = await bot.get_me()
         LOGGER.info(f"🤖 بوت متصل شد: @{me.username}")
@@ -274,7 +467,7 @@ async def scanner_task():
         LOGGER.error(f"❌ خطا در اتصال تلگرام: {e}")
         return
 
-    LOGGER.info("✅ Starting Market Scanner with Dow Theory...")
+    LOGGER.info("✅ Starting Multi-Exchange Scanner...")
 
     async with aiohttp.ClientSession() as session:
         symbols = await get_all_usdt_symbols(session)
@@ -283,7 +476,7 @@ async def scanner_task():
             try:
                 for symbol in symbols:
                     for interval in TIMEFRAMES:
-                        klines = await fetch_klines(session, symbol, interval)
+                        klines = await fetch_klines_with_failover(session, symbol, interval)
                         if not klines:
                             continue
 
@@ -320,11 +513,11 @@ async def scanner_task():
 
 
 # ---------------------------------------------------------
-# ۸. وب‌سرور سلامت
+# ۱۰. وب‌سرور سلامت
 # ---------------------------------------------------------
 async def health_check_handler(request):
     return web.Response(
-        text=f"Bot running | Alerts: {len(sent_alerts)}",
+        text=f"Multi-Exchange Bot running | Alerts: {len(sent_alerts)}",
         status=200
     )
 
