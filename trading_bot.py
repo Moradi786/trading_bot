@@ -1,138 +1,204 @@
 import asyncio
 import logging
 import os
-from telegram import Update
+import aiohttp
+from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# تنظیمات لاگ‌گیری
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+# ---------------------------------------------------------
+# ۱. تنظیمات اولیه ربات
+# ---------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
+)
 LOGGER = logging.getLogger(__name__)
 
-# فرض بر این است که شیء client یا دیتابیس شما از قبل تعریف شده است
-# async def get_market_data(session, symbol): ...
+# توکن ربات و آیدی چت تلگرام (از کلیدهای محیطی یا مستقیم جایگزین کنید)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
-async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تابع ثبت آلرت جدید با قابلیت جلوگیری از ثبت تکراری"""
-    message = update.message
-    if not message:
-        return
+# لیست جفت‌ارزها و تایم‌فریم‌های مورد نظر برای اسکن
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "XLMUSDT", "ZECUSDT", "SOLUSDT"]
+TIMEFRAMES = ["15m", "1h", "4h"]
+MAX_SL_PERCENT = 2.0  # حداکثر درصد حد زیان مجاز
 
-    chat_id = message.chat_id
-    text = message.text or message.caption or ""
-    photo_file_id = message.photo[-1].file_id if message.photo else None
+# حافظه موقت برای جلوگیری از ارسال پیام‌های تکراری
+sent_alerts = set()
 
-    # استخراج اطلاعات سمبل، جهت و تارگت (بسته به الگوی پارسر متن شما)
-    # مثال ساده: فرض کنید این مقادیر از متن استخراج شده‌اند
-    symbol = "BTC"  # به عنوان مثال
-    direction = "LONG"
-    target = 50000.0
-    entry_price = 48000.0
-    created_by = message.from_user.username or "Unknown"
-    source_link = message.link or ""
 
-    # ۱. جلوگیری از ثبت آلرت‌های تکراری
+# ---------------------------------------------------------
+# ۲. تابع الگوریتم تشخیص کندل ستاپ
+# ---------------------------------------------------------
+def analyze_candle_setup(klines, max_sl_percent=2.0):
+    """
+    بررسی کندل ستاپ، نقطه ورود در کندل بعدی، استاپ پشت شدو و TPهای 2, 5, 7
+    """
+    if len(klines) < 20:
+        return None
+
+    # استخراج قیمت‌های Open, High, Low, Close
+    opens = [float(k[1]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+
+    # محاسبه SMA 7 روی کندل‌های بسته شده
+    sma7 = sum(closes[-8:-1]) / 7
+
+    # کندل ستاپ (آخرین کندل بسته شده - Index -2)
+    c_open = opens[-2]
+    c_high = highs[-2]
+    c_low = lows[-2]
+    c_close = closes[-2]
+
+    body = abs(c_close - c_open)
+    total_range = c_high - c_low
+
+    if total_range == 0:
+        return None
+
+    upper_wick = c_high - max(c_open, c_close)
+    lower_wick = min(c_open, c_close) - c_low
+
+    # ----------------------------------------------------
+    # ستاپ LONG (صعودی)
+    # ----------------------------------------------------
+    is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
+    sma7_in_lower_wick = c_low <= sma7 <= min(c_open, c_close)
+
+    if is_long_wick and sma7_in_lower_wick:
+        entry_price = c_close  # ورود در شروع کندل بعدی (معادل Close کندل ستاپ)
+        stop_loss = c_low       # استاپ پشت شدوی بلند کندل ستاپ
+        risk = entry_price - stop_loss
+
+        if risk <= 0:
+            return None
+
+        sl_percent = (risk / entry_price) * 100
+        if sl_percent > max_sl_percent:
+            return None  # رد سیگنال در صورت استاپ‌لاس بزرگ
+
+        # محاسبه تارگت‌ها بر اساس ریسک به ریوارد
+        tp1 = entry_price + (risk * 2)  # R:R = 2
+        tp2 = entry_price + (risk * 5)  # R:R = 5
+        tp3 = entry_price + (risk * 7)  # R:R = 7
+
+        return {
+            "direction": "LONG 🟢",
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "sl_percent": round(sl_percent, 2),
+            "tp1": round(tp1, 5),
+            "tp2": round(tp2, 5),
+            "tp3": round(tp3, 5),
+            "sma7": round(sma7, 5),
+            "candle_time": klines[-2][0]
+        }
+
+    # ----------------------------------------------------
+    # ستاپ SHORT (نزولی)
+    # ----------------------------------------------------
+    is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
+    sma7_in_upper_wick = max(c_open, c_close) <= sma7 <= c_high
+
+    if is_short_wick and sma7_in_upper_wick:
+        entry_price = c_close  # ورود در شروع کندل بعدی
+        stop_loss = c_high      # استاپ پشت شدوی بلند کندل ستاپ
+        risk = stop_loss - entry_price
+
+        if risk <= 0:
+            return None
+
+        sl_percent = (risk / entry_price) * 100
+        if sl_percent > max_sl_percent:
+            return None  # رد سیگنال در صورت استاپ‌لاس بزرگ
+
+        # محاسبه تارگت‌ها بر اساس ریسک به ریوارد
+        tp1 = entry_price - (risk * 2)  # R:R = 2
+        tp2 = entry_price - (risk * 5)  # R:R = 5
+        tp3 = entry_price - (risk * 7)  # R:R = 7
+
+        return {
+            "direction": "SHORT 🔴",
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "sl_percent": round(sl_percent, 2),
+            "tp1": round(tp1, 5),
+            "tp2": round(tp2, 5),
+            "tp3": round(tp3, 5),
+            "sma7": round(sma7, 5),
+            "candle_time": klines[-2][0]
+        }
+
+    return None
+
+
+# ---------------------------------------------------------
+# ۳. دریافت آنلاین کندل‌ها از API صرافی بایننس
+# ---------------------------------------------------------
+async def fetch_klines(session, symbol, interval):
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=30"
     try:
-        check_dup = await client.execute(
-            "SELECT id FROM alerts WHERE chat_id = ? AND symbol = ? AND direction = ? AND target_price = ?",
-            (chat_id, symbol, direction, target)
-        )
-        if len(check_dup.rows) > 0:
-            bot_msg = await message.reply_text(
-                f"⚠️ Alert for <b>#{symbol} {direction} {target:g}</b> already exists!", 
-                parse_mode=ParseMode.HTML
-            )
-            # اگر تابعی برای پاکسازی خودکار پیام دارید اینجا فراخوانی کنید
-            return
-
-        # درج آلرت جدید در دیتابیس
-        await client.execute(
-            "INSERT INTO alerts (chat_id, symbol, direction, target_price, entry_price, created_by, photo_file_id, source_link) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, symbol, direction, target, entry_price, created_by, photo_file_id, source_link)
-        )
-        
-        confirmation_msg = await message.reply_text(f"✅ Alert saved for #{symbol} {direction} @ {target:g}")
-        
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                return await resp.json()
     except Exception as e:
-        LOGGER.error(f"Error in add_alert: {e}")
+        LOGGER.error(f"Error fetching data for {symbol} ({interval}): {e}")
+    return None
 
 
-async def check_alerts(application: Application, session):
-    """تابع پس‌زمینه برای بررسی و ارسال آلرت‌ها بدون مشکل اسپم"""
-    while True:
-        try:
-            # دریافت آلرت‌هایی که قیمتشان به تارگت رسیده است
-            # (فرض بر این است که تابع دیتابیس شما این رکوردها را برمی‌گرداند)
-            active_alerts = await client.execute("SELECT * FROM alerts") # یا کوئری شرطی بررسی قیمت
-            
-            for alert in active_alerts.rows:
-                alert_id = alert['id']
-                chat_id = alert['chat_id']
-                symbol = alert['symbol']
-                direction = alert['direction']
-                target = alert['target_price']
-                entry_price = alert['entry_price']
-                photo_file_id = alert['photo_file_id']
-                created_by = alert['created_by']
-                source_link = alert['source_link']
+# ---------------------------------------------------------
+# ۴. چرخه اصلی اسکن بازار و ارسال پیام
+# ---------------------------------------------------------
+async def main_scanner_loop():
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    LOGGER.info("Starting Candle Setup Bot Scanner...")
 
-                # شبیه‌سازی شرط رسیدن به تارگت
-                reached = True  # این مقدار بر اساس قیمت بازار محاسبه می‌شود
+    async with aiohttp.ClientSession() as session:
+        while True:
+            for symbol in SYMBOLS:
+                for interval in TIMEFRAMES:
+                    klines = await fetch_klines(session, symbol, interval)
+                    if not klines:
+                        continue
 
-                if reached:
-                    dir_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-                    m_data = await get_market_data(session, symbol)
+                    signal = analyze_candle_setup(klines, max_sl_percent=MAX_SL_PERCENT)
                     
-                    success_text = (
-                        f"🎯 <b>Target Reached!</b>\n"
-                        f"#{symbol} {dir_emoji}\n"
-                        f"Target: <code>{target:g}</code>\n"
-                        f"📊 Vol: <code>{m_data.get('volume', 0)}</code> | 🕒 RSI: <code>{m_data.get('rsi', 0)}</code>\n\n"
-                        f"{m_data.get('ai_analysis', '')}"
-                    )
-                    
-                    # ۲. اصلاح حیاتی: اول در تاریخچه ثبت و از جدول اصلی پاک می‌کنیم تا قطعی تلگرام باعث اسپم نشود
-                    try:
-                        await client.execute(
-                            "INSERT INTO alert_history (chat_id, symbol, direction, target_price, entry_price, created_by, photo_file_id, source_link) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (chat_id, symbol, direction, target, entry_price, 0.0, created_by, photo_file_id, source_link)
-                        )
-                        await client.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
-                    except Exception as db_err:
-                        LOGGER.error(f"Error updating DB for alert #{alert_id}: {db_err}")
-                        continue # اگر دیتابیس خطا داد، فعلاً به پیام تلگرام دست نزنیم تا لوپ نشود
+                    if signal:
+                        # کلید یکتا برای جلوگیری از ارسال مجدد یک سیگنال
+                        alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}"
 
-                    # ۳. سپس پیام را به تلگرام می‌فرستیم
-                    try:
-                        if photo_file_id:
-                            await application.bot.send_photo(
-                                chat_id=chat_id, photo=photo_file_id, caption=success_text, parse_mode=ParseMode.HTML
+                        if alert_id not in sent_alerts:
+                            sent_alerts.add(alert_id)
+
+                            # ساخت متن پیام سیگنال
+                            message_text = (
+                                f"🎯 **Candle Setup Signal Found!**\n\n"
+                                f"🪙 **Coin:** `#{symbol}` | **Timeframe:** `{interval}`\n"
+                                f"🚦 **Direction:** {signal['direction']}\n\n"
+                                f"📍 **Entry (Next Candle Open):** `{signal['entry_price']}`\n"
+                                f"🛡️ **Stop Loss (Behind Wick):** `{signal['stop_loss']}` (`{signal['sl_percent']}% Risk`)\n\n"
+                                f"🎯 **Take Profit Targets:**\n"
+                                f"🔹 **TP1 (R:R 1:2):** `{signal['tp1']}`\n"
+                                f"🔹 **TP2 (R:R 1:5):** `{signal['tp2']}`\n"
+                                f"🔹 **TP3 (R:R 1:7):** `{signal['tp3']}`\n\n"
+                                f"📉 **SMA 7 Level:** `{signal['sma7']}`"
                             )
-                        else:
-                            await application.bot.send_message(
-                                chat_id=chat_id, text=success_text, parse_mode=ParseMode.HTML
-                            )
-                    except Exception as msg_err:
-                        LOGGER.error(f"Failed to dispatch alert notification to chat {chat_id} for ID {alert_id}: {msg_err}")
-                    
-        except Exception as loop_err:
-            LOGGER.error(f"Error in check_alerts loop: {loop_err}")
-            
-        await asyncio.sleep(30) # بررسی هر ۳۰ ثانیه یک‌بار
 
+                            try:
+                                await bot.send_message(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    text=message_text,
+                                    parse_mode=ParseMode.MARKDOWN
+                                )
+                                LOGGER.info(f"Alert sent for {symbol} ({interval})")
+                            except Exception as err:
+                                LOGGER.error(f"Failed to send Telegram alert: {err}")
 
-def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    application = Application.builder().token(token).build()
+            # ۳۰ ثانیه صبر پیش از اسکن بعدی
+            await asyncio.sleep(30)
 
-    # ثبت هندلرها
-    application.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), add_alert))
-
-    # راه‌اندازی ربات
-    LOGGER.info("Bot is starting...")
-    application.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_scanner_loop())
