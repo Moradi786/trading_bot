@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import time
-import random
 import aiohttp
 from aiohttp import web
 from telegram import Bot
@@ -112,9 +111,6 @@ EXCHANGES = [
 ]
 
 
-# ---------------------------------------------------------
-# ۳. پارسرها
-# ---------------------------------------------------------
 def _parse_bybit(data):
     try:
         if data.get("retCode") != 0:
@@ -180,7 +176,7 @@ def _parse_coinbase(data):
 
 
 # ---------------------------------------------------------
-# ۴. دریافت کندل با Failover
+# ۳. دریافت کندل با Failover
 # ---------------------------------------------------------
 async def fetch_klines_with_failover(session, symbol, interval):
     sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
@@ -200,6 +196,11 @@ async def fetch_klines_with_failover(session, symbol, interval):
                     klines = ex["parser"](data)
                     if klines and len(klines) >= 50:
                         return klines
+                elif resp.status == 429:
+                    LOGGER.warning(f"⏱️ {ex['name']} Rate Limit برای {symbol}")
+
+        except asyncio.TimeoutError:
+            pass
         except Exception:
             pass
 
@@ -209,7 +210,7 @@ async def fetch_klines_with_failover(session, symbol, interval):
 
 
 # ---------------------------------------------------------
-# ۵. دریافت لیست نمادها و فیلتر حجم بالای ۲۵۰ بیت‌کوین
+# ۴. دریافت لیست نمادها و فیلتر حجم
 # ---------------------------------------------------------
 async def get_all_usdt_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -217,15 +218,13 @@ async def get_all_usdt_symbols(session):
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                
-                # پیدا کردن قیمت لحظه‌ای بیت‌کوین
-                btc_price = 60000.0  # مقدار پیش‌فرض در صورت عدم دریافت
+
+                btc_price = 60000.0
                 for item in data:
                     if item.get("symbol") == "BTCUSDT":
                         btc_price = float(item.get("lastPrice", 60000.0))
                         break
 
-                # حداقل حجم به تتر معادل 250 بیت‌کوین
                 min_usdt_volume = MIN_BTC_VOLUME * btc_price
 
                 valid_symbols = []
@@ -236,15 +235,15 @@ async def get_all_usdt_symbols(session):
                     if symbol.endswith("USDT") and quote_volume >= min_usdt_volume:
                         valid_symbols.append(symbol)
 
-                LOGGER.info(f"✅ {len(valid_symbols)} نماد با حجم بالای 250 BTC انتخاب شدند (حداقل حجم: ${min_usdt_volume:,.0f})")
+                LOGGER.info(f"✅ {len(valid_symbols)} نماد با حجم بالای {MIN_BTC_VOLUME} BTC انتخاب شدند")
                 return valid_symbols
     except Exception as e:
-        LOGGER.error(f"Error fetching symbols & volume filter: {e}")
+        LOGGER.error(f"Error fetching symbols: {e}")
     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XLMUSDT", "ZECUSDT"]
 
 
 # ---------------------------------------------------------
-# ۶. توابع تئوری داو و مدیریت حافظه
+# ۵. توابع تئوری داو و مدیریت حافظه
 # ---------------------------------------------------------
 def find_pivots(highs, lows, left_right=3):
     pivot_highs = []
@@ -286,9 +285,16 @@ def cleanup_old_alerts():
 
 
 # ---------------------------------------------------------
-# ۷. الگوریتم اصلی تحلیل کندل ستاپ
+# ۶. الگوریتم اصلی کندل ستاپ (پین‌بار کلاسیک)
 # ---------------------------------------------------------
 def analyze_candle_setup(klines, max_sl_percent=2.0):
+    """
+    تشخیص کندل ستاپ پین‌بار کلاسیک:
+    - بدنه کوچک
+    - فتیله اصلی بلند (ریجکشن)
+    - فتیله مخالف خیلی کوچک
+    - SMA7 داخل فتیله اصلی
+    """
     if len(klines) < 50:
         return None
 
@@ -299,6 +305,7 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
 
     sma7 = sum(closes[-8:-1]) / 7
 
+    # کندل سیگنال (آخرین کندل بسته‌شده)
     c_open = opens[-2]
     c_high = highs[-2]
     c_low = lows[-2]
@@ -306,7 +313,7 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
 
     body_bottom = min(c_open, c_close)
     body_top = max(c_open, c_close)
-    body = abs(c_close - c_open)
+    body = body_top - body_bottom
     total_range = c_high - c_low
 
     if total_range == 0 or body == 0:
@@ -315,6 +322,17 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     upper_wick = c_high - body_top
     lower_wick = body_bottom - c_low
 
+    # 🛑 فیلتر اول: SMA7 نباید داخل بدنه کندل باشه
+    if body_bottom <= sma7 <= body_top:
+        return None
+
+    # 🛑 فیلتر دوم: بدنه باید کوچک باشه (حداکثر ۳۵٪ رنج کندل)
+    if body / total_range > 0.35:
+        return None
+
+    # ----------------------------------------------------
+    # بررسی سطوح حمایت/مقاومت و روند داو
+    # ----------------------------------------------------
     pivot_highs, pivot_lows = find_pivots(highs[:-1], lows[:-1])
     trend = check_dow_theory_trend(pivot_highs, pivot_lows)
 
@@ -322,19 +340,23 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     latest_support = min([pl[1] for pl in pivot_lows[-5:]]) if pivot_lows else c_low
 
     # ----------------------------------------------------
-    # LONG Setup
+    # 🟢 LONG Setup (Bullish Pin Bar / Hammer)
     # ----------------------------------------------------
-    is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
-    
-    # شرط ۱: بدنه حداقل ۳ برابر شدوی بالا باشد
-    body_gt_upper = (body >= 3 * upper_wick)
-    
-    # شرط ۲: SMA 7 تنها و دقیقاً از داخل شدوی پایین رد شده باشد
-    sma7_only_in_lower_wick = (c_low <= sma7 < body_bottom)
-    
-    dow_long_valid = (trend == "BULLISH") or (c_close >= latest_resistance)
+    # شرط ۱: فتیله پایینی بلند (حداقل ۲ برابر بدنه)
+    long_wick_ok = lower_wick >= 2.0 * body
+    # شرط ۲: فتیله پایینی حداقل ۵۰٪ کل رنج
+    long_wick_dominant = lower_wick / total_range >= 0.50
+    # شرط ۳: فتیله بالایی خیلی کوچک (حداکثر ۳۰٪ بدنه)
+    opposite_wick_small = upper_wick <= 0.3 * body
+    # شرط ۴: SMA7 دقیقاً داخل فتیله پایینی
+    sma7_in_wick = c_low <= sma7 < body_bottom
 
-    if is_long_wick and body_gt_upper and sma7_only_in_lower_wick and dow_long_valid:
+    if long_wick_ok and long_wick_dominant and opposite_wick_small and sma7_in_wick:
+        # تاییدیه داو
+        dow_long_valid = (trend == "BULLISH") or (c_close >= latest_resistance)
+        if not dow_long_valid:
+            return None
+
         entry_price = c_close
         stop_loss = c_low
         risk = entry_price - stop_loss
@@ -360,19 +382,23 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
         }
 
     # ----------------------------------------------------
-    # SHORT Setup
+    # 🔴 SHORT Setup (Bearish Pin Bar / Shooting Star)
     # ----------------------------------------------------
-    is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
-    
-    # شرط ۱: بدنه حداقل ۳ برابر شدوی پایین باشد
-    body_gt_lower = (body >= 3 * lower_wick)
-    
-    # شرط ۲: SMA 7 تنها و دقیقاً از داخل شدوی بالا رد شده باشد
-    sma7_only_in_upper_wick = (body_top < sma7 <= c_high)
-    
-    dow_short_valid = (trend == "BEARISH") or (c_close <= latest_support)
+    # شرط ۱: فتیله بالایی بلند (حداقل ۲ برابر بدنه)
+    short_wick_ok = upper_wick >= 2.0 * body
+    # شرط ۲: فتیله بالایی حداقل ۵۰٪ کل رنج
+    short_wick_dominant = upper_wick / total_range >= 0.50
+    # شرط ۳: فتیله پایینی خیلی کوچک (حداکثر ۳۰٪ بدنه)
+    opposite_wick_small = lower_wick <= 0.3 * body
+    # شرط ۴: SMA7 دقیقاً داخل فتیله بالایی
+    sma7_in_wick = body_top < sma7 <= c_high
 
-    if is_short_wick and body_gt_lower and sma7_only_in_upper_wick and dow_short_valid:
+    if short_wick_ok and short_wick_dominant and opposite_wick_small and sma7_in_wick:
+        # تاییدیه داو
+        dow_short_valid = (trend == "BEARISH") or (c_close <= latest_support)
+        if not dow_short_valid:
+            return None
+
         entry_price = c_close
         stop_loss = c_high
         risk = stop_loss - entry_price
@@ -401,7 +427,7 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
 
 
 # ---------------------------------------------------------
-# ۸. ارسال پیام تلگرام
+# ۷. ارسال پیام تلگرام
 # ---------------------------------------------------------
 async def send_telegram_message(bot, chat_id, text):
     try:
@@ -416,32 +442,42 @@ async def send_telegram_message(bot, chat_id, text):
         err = str(e).lower()
         if "chat not found" in err:
             LOGGER.error(f"❌ Chat not found: {chat_id}")
-        elif "parse" in err:
+            LOGGER.error("   → اگر گروه/کاناله، بوت رو عضو کن")
+            LOGGER.error("   → اگر کاربر خصوصیه، اول /start بزن")
+        elif "can't parse entities" in err or "parse" in err:
+            LOGGER.warning("⚠️ Markdown خراب بود، بدون فرمت ارسال می‌شه")
             try:
                 await bot.send_message(chat_id=chat_id, text=text)
                 return True
             except Exception as e2:
-                LOGGER.error(f"❌ Fail without format: {e2}")
+                LOGGER.error(f"❌ ارسال بدون فرمت هم ناموفق: {e2}")
+        else:
+            LOGGER.error(f"❌ BadRequest: {e}")
         return False
+
+    except Forbidden as e:
+        LOGGER.error(f"🚫 Forbidden: {e} (کاربر بوت رو بلاک کرده)")
+        return False
+
     except Exception as e:
-        LOGGER.error(f"❌ Telegram error: {e}")
+        LOGGER.error(f"❌ خطای تلگرام: {e}")
         return False
 
 
 # ---------------------------------------------------------
-# ۹. چرخه اصلی اسکن
+# ۸. چرخه اصلی اسکن
 # ---------------------------------------------------------
 async def scanner_task():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     try:
         me = await bot.get_me()
-        LOGGER.info(f"🤖 Bot connected: @{me.username}")
+        LOGGER.info(f"🤖 بوت متصل شد: @{me.username}")
     except Exception as e:
-        LOGGER.error(f"❌ Telegram Auth Error: {e}")
+        LOGGER.error(f"❌ خطا در اتصال تلگرام: {e}")
         return
 
-    LOGGER.info("✅ Starting Multi-Exchange Scanner...")
+    LOGGER.info("✅ Starting Pin Bar Scanner...")
 
     async with aiohttp.ClientSession() as session:
         symbols = await get_all_usdt_symbols(session)
@@ -461,7 +497,7 @@ async def scanner_task():
                                 sent_alerts[alert_id] = time.time()
 
                                 msg = (
-                                    f"🎯 **Candle Setup Signal Found!**\n\n"
+                                    f"🎯 **Pin Bar Setup Found!**\n\n"
                                     f"🪙 **Coin:** `#{symbol}` | **Timeframe:** `{interval}`\n"
                                     f"🚦 **Direction:** {signal['direction']}\n"
                                     f"📈 **Dow Market Trend:** `{signal['trend']}`\n\n"
@@ -482,16 +518,16 @@ async def scanner_task():
                 await asyncio.sleep(15)
 
             except Exception as e:
-                LOGGER.error(f"❌ Main loop error: {e}")
+                LOGGER.error(f"❌ خطای حلقه اصلی: {e}")
                 await asyncio.sleep(30)
 
 
 # ---------------------------------------------------------
-# ۱۰. وب‌سرور سلامت
+# ۹. وب‌سرور سلامت
 # ---------------------------------------------------------
 async def health_check_handler(request):
     return web.Response(
-        text=f"Multi-Exchange Bot running | Alerts: {len(sent_alerts)}",
+        text=f"Pin Bar Bot running | Alerts: {len(sent_alerts)}",
         status=200
     )
 
