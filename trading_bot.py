@@ -36,13 +36,13 @@ except ValueError:
 
 TIMEFRAMES = ["15m", "1h", "4h"]
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 30.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین
+MIN_BTC_VOLUME = 30.0
 sent_alerts = {}
 ALERT_TTL = 86400
 
 
 # ---------------------------------------------------------
-# ۲. تعریف صرافی‌ها با Endpoint
+# ۲. تعریف صرافی‌ها
 # ---------------------------------------------------------
 EXCHANGES = [
     {
@@ -210,7 +210,7 @@ async def fetch_klines_with_failover(session, symbol, interval):
 
 
 # ---------------------------------------------------------
-# ۴. دریافت لیست نمادها و فیلتر حجم
+# ۴. دریافت لیست نمادها
 # ---------------------------------------------------------
 async def get_all_usdt_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -243,7 +243,7 @@ async def get_all_usdt_symbols(session):
 
 
 # ---------------------------------------------------------
-# ۵. توابع تئوری داو و مدیریت حافظه
+# ۵. توابع تئوری داو
 # ---------------------------------------------------------
 def find_pivots(highs, lows, left_right=3):
     pivot_highs = []
@@ -285,14 +285,14 @@ def cleanup_old_alerts():
 
 
 # ---------------------------------------------------------
-# ۶. الگوریتم اصلی کندل ستاپ (پین‌بار کلاسیک)
+# ۶. الگوریتم اصلی کندل ستاپ (پین‌بار کلاسیک - سخت‌گیرانه)
 # ---------------------------------------------------------
 def analyze_candle_setup(klines, max_sl_percent=2.0):
     """
-    تشخیص کندل ستاپ پین‌بار کلاسیک:
-    - بدنه کوچک
-    - فتیله اصلی بلند (ریجکشن)
-    - فتیله مخالف خیلی کوچک
+    تشخیص پین‌بار کلاسیک با فیلترهای بصری سخت‌گیرانه:
+    - بدنه کوچک ولی قابل‌مشاهده (نه دوجی)
+    - فتیله اصلی خیلی بلند و غالب
+    - فتیله مخالف ناچیز
     - SMA7 داخل فتیله اصلی
     """
     if len(klines) < 50:
@@ -305,7 +305,6 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
 
     sma7 = sum(closes[-8:-1]) / 7
 
-    # کندل سیگنال (آخرین کندل بسته‌شده)
     c_open = opens[-2]
     c_high = highs[-2]
     c_low = lows[-2]
@@ -321,18 +320,18 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
 
     upper_wick = c_high - body_top
     lower_wick = body_bottom - c_low
+    body_ratio = body / total_range
 
-    # 🛑 فیلتر اول: SMA7 نباید داخل بدنه کندل باشه
+    # 🛑 فیلتر ۱: SMA7 نباید داخل بدنه باشه
     if body_bottom <= sma7 <= body_top:
         return None
 
-    # 🛑 فیلتر دوم: بدنه باید کوچک باشه (حداکثر ۳۵٪ رنج کندل)
-    if body / total_range > 0.35:
+    # 🛑 فیلتر ۲: بدنه باید قابل‌مشاهده باشه ولی کوچک
+    # بین ۱۰٪ تا ۳۰٪ رنج کندل (دوجی‌ها رد می‌شن، بدنه بزرگ هم رد می‌شه)
+    if not (0.10 <= body_ratio <= 0.30):
         return None
 
-    # ----------------------------------------------------
-    # بررسی سطوح حمایت/مقاومت و روند داو
-    # ----------------------------------------------------
+    # محاسبه سطوح حمایت/مقاومت و روند
     pivot_highs, pivot_lows = find_pivots(highs[:-1], lows[:-1])
     trend = check_dow_theory_trend(pivot_highs, pivot_lows)
 
@@ -340,19 +339,18 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     latest_support = min([pl[1] for pl in pivot_lows[-5:]]) if pivot_lows else c_low
 
     # ----------------------------------------------------
-    # 🟢 LONG Setup (Bullish Pin Bar / Hammer)
+    # 🟢 LONG Setup (Bullish Pin Bar)
     # ----------------------------------------------------
-    # شرط ۱: فتیله پایینی بلند (حداقل ۲ برابر بدنه)
-    long_wick_ok = lower_wick >= 2.0 * body
-    # شرط ۲: فتیله پایینی حداقل ۵۰٪ کل رنج
-    long_wick_dominant = lower_wick / total_range >= 0.50
-    # شرط ۳: فتیله بالایی خیلی کوچک (حداکثر ۳۰٪ بدنه)
-    opposite_wick_small = upper_wick <= 0.3 * body
+    # شرط ۱: فتیله پایینی غالب (حداقل ۶۰٪ کل رنج)
+    wick_dominant = lower_wick / total_range >= 0.60
+    # شرط ۲: فتیله پایینی حداقل ۳ برابر بدنه
+    wick_long = lower_wick >= 3.0 * body
+    # شرط ۳: فتیله بالایی ناچیز (حداکثر ۱۵٪ بدنه)
+    opposite_small = upper_wick <= 0.15 * body
     # شرط ۴: SMA7 دقیقاً داخل فتیله پایینی
     sma7_in_wick = c_low <= sma7 < body_bottom
 
-    if long_wick_ok and long_wick_dominant and opposite_wick_small and sma7_in_wick:
-        # تاییدیه داو
+    if wick_dominant and wick_long and opposite_small and sma7_in_wick:
         dow_long_valid = (trend == "BULLISH") or (c_close >= latest_resistance)
         if not dow_long_valid:
             return None
@@ -382,19 +380,14 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
         }
 
     # ----------------------------------------------------
-    # 🔴 SHORT Setup (Bearish Pin Bar / Shooting Star)
+    # 🔴 SHORT Setup (Bearish Pin Bar)
     # ----------------------------------------------------
-    # شرط ۱: فتیله بالایی بلند (حداقل ۲ برابر بدنه)
-    short_wick_ok = upper_wick >= 2.0 * body
-    # شرط ۲: فتیله بالایی حداقل ۵۰٪ کل رنج
-    short_wick_dominant = upper_wick / total_range >= 0.50
-    # شرط ۳: فتیله پایینی خیلی کوچک (حداکثر ۳۰٪ بدنه)
-    opposite_wick_small = lower_wick <= 0.3 * body
-    # شرط ۴: SMA7 دقیقاً داخل فتیله بالایی
+    wick_dominant = upper_wick / total_range >= 0.60
+    wick_long = upper_wick >= 3.0 * body
+    opposite_small = lower_wick <= 0.15 * body
     sma7_in_wick = body_top < sma7 <= c_high
 
-    if short_wick_ok and short_wick_dominant and opposite_wick_small and sma7_in_wick:
-        # تاییدیه داو
+    if wick_dominant and wick_long and opposite_small and sma7_in_wick:
         dow_short_valid = (trend == "BEARISH") or (c_close <= latest_support)
         if not dow_short_valid:
             return None
@@ -477,7 +470,7 @@ async def scanner_task():
         LOGGER.error(f"❌ خطا در اتصال تلگرام: {e}")
         return
 
-    LOGGER.info("✅ Starting Pin Bar Scanner...")
+    LOGGER.info("✅ Starting Pin Bar Scanner (Strict Mode)...")
 
     async with aiohttp.ClientSession() as session:
         symbols = await get_all_usdt_symbols(session)
@@ -527,7 +520,7 @@ async def scanner_task():
 # ---------------------------------------------------------
 async def health_check_handler(request):
     return web.Response(
-        text=f"Pin Bar Bot running | Alerts: {len(sent_alerts)}",
+        text=f"Pin Bar Bot (Strict) running | Alerts: {len(sent_alerts)}",
         status=200
     )
 
