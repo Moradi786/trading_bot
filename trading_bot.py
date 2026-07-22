@@ -42,7 +42,7 @@ ALERT_TTL = 86400
 
 
 # ---------------------------------------------------------
-# ۲. تعریف ۱۰ صرافی با endpoint کندل
+# ۲. تعریف صرافی‌ها با Endpoint
 # ---------------------------------------------------------
 EXCHANGES = [
     {
@@ -81,13 +81,6 @@ EXCHANGES = [
         "parser": lambda data: _parse_gateio(data),
     },
     {
-        "name": "MEXC",
-        "weight": 5,
-        "url": "https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval={interval}&limit=100",
-        "interval_map": {"15m": "Min15", "1h": "Min60", "4h": "Hour4"},
-        "parser": lambda data: _parse_mexc(data),
-    },
-    {
         "name": "Bitget",
         "weight": 5,
         "url": "https://api.bitget.com/api/v2/mix/market/candles?symbol={symbol}&granularity={interval}&limit=100&productType=USDT-FUTURES",
@@ -119,14 +112,13 @@ EXCHANGES = [
 
 
 # ---------------------------------------------------------
-# ۳. پارسرهای هر صرافی (تبدیل به فرمت استاندارد [time, open, high, low, close, volume])
+# ۳. پارسرها
 # ---------------------------------------------------------
 def _parse_bybit(data):
     try:
         if data.get("retCode") != 0:
             return None
         result = data.get("result", {}).get("list", [])
-        # Bybit: [time, open, high, low, close, volume, turnover]
         return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
     except Exception:
         return None
@@ -135,7 +127,6 @@ def _parse_bybit(data):
 def _parse_okx(data):
     try:
         result = data.get("data", [])
-        # OKX: [time, open, high, low, close, vol, volCcy, volCcyQuote]
         return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
     except Exception:
         return None
@@ -144,7 +135,6 @@ def _parse_okx(data):
 def _parse_kucoin(data):
     try:
         result = data.get("data", [])
-        # KuCoin: [time, open, close, high, low, volume, turnover]
         return [[int(x[0]), x[1], x[3], x[4], x[2], x[5]] for x in result]
     except Exception:
         return None
@@ -152,19 +142,7 @@ def _parse_kucoin(data):
 
 def _parse_gateio(data):
     try:
-        # Gate.io: [[time, volume, close, high, low, open], ...]
         return [[int(x[0]), x[5], x[3], x[4], x[2], x[1]] for x in data]
-    except Exception:
-        return None
-
-
-def _parse_mexc(data):
-    try:
-        result = data.get("data", {}).get("time", [])
-        if not result:
-            return None
-        # MEXC ساختار پیچیده‌تری داره، ساده‌ش می‌کنیم
-        return None  # TODO: اگه نیاز داری پیاده‌سازی کن
     except Exception:
         return None
 
@@ -172,7 +150,6 @@ def _parse_mexc(data):
 def _parse_bitget(data):
     try:
         result = data.get("data", [])
-        # Bitget: [openPrice, highPrice, lowPrice, closePrice, volume, quoteVolume, time]
         return [[int(x[6]), x[0], x[1], x[2], x[3], x[4]] for x in result]
     except Exception:
         return None
@@ -181,7 +158,6 @@ def _parse_bitget(data):
 def _parse_htx(data):
     try:
         result = data.get("data", [])
-        # HTX: [id, open, close, low, high, amount, vol, trade_turnover]
         return [[int(x[0]), x[1], x[4], x[3], x[2], x[5]] for x in result]
     except Exception:
         return None
@@ -190,7 +166,6 @@ def _parse_htx(data):
 def _parse_kraken(data):
     try:
         candles = data.get("candles", [])
-        # Kraken: {time, open, high, low, close, volume, ...}
         return [[int(c["time"]), c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in candles]
     except Exception:
         return None
@@ -198,21 +173,15 @@ def _parse_kraken(data):
 
 def _parse_coinbase(data):
     try:
-        # Coinbase: [[time, low, high, open, close, volume], ...]
         return [[int(x[0]), x[3], x[2], x[1], x[4], x[5]] for x in data]
     except Exception:
         return None
 
 
 # ---------------------------------------------------------
-# ۴. دریافت کندل با Failover بین صرافی‌ها
+# ۴. دریافت کندل با Failover
 # ---------------------------------------------------------
 async def fetch_klines_with_failover(session, symbol, interval):
-    """
-    از صرافی‌ها به ترتیب اولویت تلاش می‌کنه.
-    اگر یکی fail شد، میره سراغ بعدی.
-    """
-    # صرافی‌ها رو بر اساس weight مرتب می‌کنیم (اولویت بالاتر = اول)
     sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
 
     for ex in sorted_exchanges:
@@ -229,29 +198,17 @@ async def fetch_klines_with_failover(session, symbol, interval):
                     data = await resp.json()
                     klines = ex["parser"](data)
                     if klines and len(klines) >= 50:
-                        LOGGER.debug(f"✅ {ex['name']} OK برای {symbol} {interval}")
                         return klines
-                    else:
-                        LOGGER.debug(f"⚠️ {ex['name']} دیتای ناقص برای {symbol}")
-                elif resp.status == 429:
-                    LOGGER.warning(f"⏱️ {ex['name']} Rate Limit برای {symbol}")
-                else:
-                    LOGGER.debug(f"⚠️ {ex['name']} HTTP {resp.status} برای {symbol}")
+        except Exception:
+            pass
 
-        except asyncio.TimeoutError:
-            LOGGER.debug(f"⏱️ {ex['name']} Timeout برای {symbol}")
-        except Exception as e:
-            LOGGER.debug(f"❌ {ex['name']} خطا برای {symbol}: {e}")
+        await asyncio.sleep(0.05)
 
-        # کمی تأخیر بین صرافی‌ها برای جلوگیری از اسپم
-        await asyncio.sleep(0.1)
-
-    LOGGER.warning(f"❌ همه صرافی‌ها برای {symbol} {interval} fail شدند")
     return None
 
 
 # ---------------------------------------------------------
-# ۵. دریافت لیست نمادها (از Binance به عنوان مرجع)
+# ۵. دریافت لیست نمادها از Binance
 # ---------------------------------------------------------
 async def get_all_usdt_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -259,19 +216,17 @@ async def get_all_usdt_symbols(session):
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                symbols = [
+                return [
                     s["symbol"] for s in data["symbols"]
                     if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
                 ]
-                LOGGER.info(f"✅ {len(symbols)} نماد از Binance گرفته شد")
-                return symbols
     except Exception as e:
         LOGGER.error(f"Error fetching symbols: {e}")
     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XLMUSDT", "ZECUSDT"]
 
 
 # ---------------------------------------------------------
-# ۶. توابع کمکی تئوری داو
+# ۶. توابع تئوری داو و مدیریت حافظه
 # ---------------------------------------------------------
 def find_pivots(highs, lows, left_right=3):
     pivot_highs = []
@@ -310,8 +265,6 @@ def cleanup_old_alerts():
     expired = [k for k, v in sent_alerts.items() if now - v > ALERT_TTL]
     for k in expired:
         del sent_alerts[k]
-    if expired:
-        LOGGER.info(f"🧹 {len(expired)} آلرت قدیمی پاک شد")
 
 
 # ---------------------------------------------------------
@@ -338,14 +291,11 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     body = abs(c_close - c_open)
     total_range = c_high - c_low
 
-    if total_range == 0:
+    if total_range == 0 or body == 0:
         return None
 
     upper_wick = c_high - body_top
     lower_wick = body_bottom - c_low
-
-    if body_bottom <= sma7 <= body_top:
-        return None
 
     pivot_highs, pivot_lows = find_pivots(highs[:-1], lows[:-1])
     trend = check_dow_theory_trend(pivot_highs, pivot_lows)
@@ -353,12 +303,20 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     latest_resistance = max([ph[1] for ph in pivot_highs[-5:]]) if pivot_highs else c_high
     latest_support = min([pl[1] for pl in pivot_lows[-5:]]) if pivot_lows else c_low
 
-    # LONG
+    # ----------------------------------------------------
+    # LONG Setup
+    # ----------------------------------------------------
     is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
-    sma7_in_lower_wick = (c_low <= sma7 < body_bottom)
+    
+    # شرط ۱: بدنه حداقل ۳ برابر شدوی بالا باشد
+    body_gt_upper = (body >= 3 * upper_wick)
+    
+    # شرط ۲: SMA 7 تنها و دقیقاً از داخل شدوی پایین رد شده باشد
+    sma7_only_in_lower_wick = (c_low <= sma7 < body_bottom)
+    
     dow_long_valid = (trend == "BULLISH") or (c_close >= latest_resistance)
 
-    if is_long_wick and sma7_in_lower_wick and dow_long_valid:
+    if is_long_wick and body_gt_upper and sma7_only_in_lower_wick and dow_long_valid:
         entry_price = c_close
         stop_loss = c_low
         risk = entry_price - stop_loss
@@ -383,12 +341,20 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
             "candle_time": klines[-2][0]
         }
 
-    # SHORT
+    # ----------------------------------------------------
+    # SHORT Setup
+    # ----------------------------------------------------
     is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
-    sma7_in_upper_wick = (body_top < sma7 <= c_high)
+    
+    # شرط ۱: بدنه حداقل ۳ برابر شدوی پایین باشد
+    body_gt_lower = (body >= 3 * lower_wick)
+    
+    # شرط ۲: SMA 7 تنها و دقیقاً از داخل شدوی بالا رد شده باشد
+    sma7_only_in_upper_wick = (body_top < sma7 <= c_high)
+    
     dow_short_valid = (trend == "BEARISH") or (c_close <= latest_support)
 
-    if is_short_wick and sma7_in_upper_wick and dow_short_valid:
+    if is_short_wick and body_gt_lower and sma7_only_in_upper_wick and dow_short_valid:
         entry_price = c_close
         stop_loss = c_high
         risk = stop_loss - entry_price
@@ -432,25 +398,15 @@ async def send_telegram_message(bot, chat_id, text):
         err = str(e).lower()
         if "chat not found" in err:
             LOGGER.error(f"❌ Chat not found: {chat_id}")
-            LOGGER.error("   → اگر گروه/کاناله، بوت رو عضو کن")
-            LOGGER.error("   → اگر کاربر خصوصیه، اول /start بزن")
-        elif "can't parse entities" in err or "parse" in err:
-            LOGGER.warning("⚠️ Markdown خراب بود، بدون فرمت ارسال می‌شه")
+        elif "parse" in err:
             try:
                 await bot.send_message(chat_id=chat_id, text=text)
                 return True
             except Exception as e2:
-                LOGGER.error(f"❌ ارسال بدون فرمت هم ناموفق: {e2}")
-        else:
-            LOGGER.error(f"❌ BadRequest: {e}")
+                LOGGER.error(f"❌ Fail without format: {e2}")
         return False
-
-    except Forbidden as e:
-        LOGGER.error(f"🚫 Forbidden: {e} (کاربر بوت رو بلاک کرده)")
-        return False
-
     except Exception as e:
-        LOGGER.error(f"❌ خطای تلگرام: {e}")
+        LOGGER.error(f"❌ Telegram error: {e}")
         return False
 
 
@@ -462,9 +418,9 @@ async def scanner_task():
 
     try:
         me = await bot.get_me()
-        LOGGER.info(f"🤖 بوت متصل شد: @{me.username}")
+        LOGGER.info(f"🤖 Bot connected: @{me.username}")
     except Exception as e:
-        LOGGER.error(f"❌ خطا در اتصال تلگرام: {e}")
+        LOGGER.error(f"❌ Telegram Auth Error: {e}")
         return
 
     LOGGER.info("✅ Starting Multi-Exchange Scanner...")
@@ -508,7 +464,7 @@ async def scanner_task():
                 await asyncio.sleep(15)
 
             except Exception as e:
-                LOGGER.error(f"❌ خطای حلقه اصلی: {e}")
+                LOGGER.error(f"❌ Main loop error: {e}")
                 await asyncio.sleep(30)
 
 
