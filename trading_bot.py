@@ -37,6 +37,7 @@ except ValueError:
 
 TIMEFRAMES = ["15m", "1h", "4h"]
 MAX_SL_PERCENT = 2.0
+MIN_BTC_VOLUME = 250.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین
 sent_alerts = {}
 ALERT_TTL = 86400
 
@@ -208,20 +209,37 @@ async def fetch_klines_with_failover(session, symbol, interval):
 
 
 # ---------------------------------------------------------
-# ۵. دریافت لیست نمادها از Binance
+# ۵. دریافت لیست نمادها و فیلتر حجم بالای ۲۵۰ بیت‌کوین
 # ---------------------------------------------------------
 async def get_all_usdt_symbols(session):
-    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return [
-                    s["symbol"] for s in data["symbols"]
-                    if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
-                ]
+                
+                # پیدا کردن قیمت لحظه‌ای بیت‌کوین
+                btc_price = 60000.0  # مقدار پیش‌فرض در صورت عدم دریافت
+                for item in data:
+                    if item.get("symbol") == "BTCUSDT":
+                        btc_price = float(item.get("lastPrice", 60000.0))
+                        break
+
+                # حداقل حجم به تتر معادل 250 بیت‌کوین
+                min_usdt_volume = MIN_BTC_VOLUME * btc_price
+
+                valid_symbols = []
+                for item in data:
+                    symbol = item.get("symbol", "")
+                    quote_volume = float(item.get("quoteVolume", 0))
+
+                    if symbol.endswith("USDT") and quote_volume >= min_usdt_volume:
+                        valid_symbols.append(symbol)
+
+                LOGGER.info(f"✅ {len(valid_symbols)} نماد با حجم بالای 250 BTC انتخاب شدند (حداقل حجم: ${min_usdt_volume:,.0f})")
+                return valid_symbols
     except Exception as e:
-        LOGGER.error(f"Error fetching symbols: {e}")
+        LOGGER.error(f"Error fetching symbols & volume filter: {e}")
     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XLMUSDT", "ZECUSDT"]
 
 
