@@ -37,7 +37,7 @@ except ValueError:
 
 TIMEFRAMES = ["15m", "1h", "4h"]
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 250.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین
+MIN_BTC_VOLUME = 30.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین
 sent_alerts = {}
 ALERT_TTL = 86400
 
