@@ -41,6 +41,7 @@ MAX_SLIPPAGE_PERCENT = 0.2    # حداکثر جابه‌جایی مجاز قیم
 
 sent_alerts = {}
 active_trades = {}  # ذخیره پوزیشن‌های فعال جهت تعقیب TP/SL
+active_trades_lock = asyncio.Lock()  # Lock برای جلوگیری از Race Condition
 ALERT_TTL = 86400
 GLOBAL_BTC_TREND = "NEUTRAL"
 BTC_VOLATILITY_PAUSE_UNTIL = 0  # زمان توقف در صورت نوسان شدید BTC
@@ -54,14 +55,49 @@ STATS = {
     "sl_hits": 0
 }
 
+# کش نمادها
+_symbol_cache = {"symbols": [], "last_update": 0}
+
 
 # ---------------------------------------------------------
-# ۲. تعریف صرافی‌ها
+# ۲. سیستم Rate Limiting
+# ---------------------------------------------------------
+class RateLimiter:
+    """Token Bucket Rate Limiter برای جلوگیری از Rate Limit API"""
+    def __init__(self, rate=10, per=1):
+        self.rate = rate
+        self.per = per
+        self.tokens = float(rate)
+        self.updated_at = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.updated_at
+            self.tokens = min(self.rate, self.tokens + elapsed * (self.rate / self.per))
+            self.updated_at = now
+            if self.tokens < 1:
+                wait_time = (1 - self.tokens) * (self.per / self.rate)
+                await asyncio.sleep(wait_time)
+                self.tokens = 0
+            else:
+                self.tokens -= 1
+
+# Rate Limiter برای هر صرافی
+binance_limiter = RateLimiter(rate=20, per=1)    # 20 req/sec
+bybit_limiter = RateLimiter(rate=10, per=1)      # 10 req/sec
+okx_limiter = RateLimiter(rate=10, per=1)        # 10 req/sec
+
+
+# ---------------------------------------------------------
+# ۳. تعریف صرافی‌ها
 # ---------------------------------------------------------
 EXCHANGES = [
     {
         "name": "Binance",
         "weight": 10,
+        "limiter": binance_limiter,
         "url": "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100",
         "interval_map": {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"},
         "parser": lambda data: data if isinstance(data, list) else None,
@@ -69,6 +105,7 @@ EXCHANGES = [
     {
         "name": "Bybit",
         "weight": 8,
+        "limiter": bybit_limiter,
         "url": "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit=100",
         "interval_map": {"15m": "15", "1h": "60", "4h": "240", "1d": "D"},
         "parser": lambda data: _parse_bybit(data),
@@ -76,6 +113,7 @@ EXCHANGES = [
     {
         "name": "OKX",
         "weight": 8,
+        "limiter": okx_limiter,
         "url": "https://www.okx.com/api/v5/market/history-candles?instId={symbol}-SWAP&bar={interval}&limit=100",
         "interval_map": {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"},
         "parser": lambda data: _parse_okx(data),
@@ -84,7 +122,7 @@ EXCHANGES = [
 
 
 # ---------------------------------------------------------
-# ۳. پارسرها
+# ۴. پارسرها
 # ---------------------------------------------------------
 def _parse_bybit(data):
     try:
@@ -103,11 +141,13 @@ def _parse_okx(data):
 
 
 # ---------------------------------------------------------
-# ۴. اندیکاتورها و محاسبات تکنیکال
+# ۵. اندیکاتورها و محاسبات تکنیکال
 # ---------------------------------------------------------
 def calculate_rsi(closes, period=14):
+    """RSI با Wilder's Smoothing (EMA) — سازگار با TradingView"""
     if len(closes) < period + 1:
         return 50.0
+
     gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i - 1]
@@ -118,12 +158,15 @@ def calculate_rsi(closes, period=14):
             gains.append(0.0)
             losses.append(abs(diff))
 
+    # میانگین اولیه با SMA
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
+    # Wilder's Smoothing (EMA)
+    alpha = 1.0 / period
     for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        avg_gain = alpha * gains[i] + (1 - alpha) * avg_gain
+        avg_loss = alpha * losses[i] + (1 - alpha) * avg_loss
 
     if avg_loss == 0:
         return 100.0
@@ -142,7 +185,7 @@ def calculate_atr(highs, lows, closes, period=14):
             abs(lows[i] - closes[i - 1])
         )
         tr_list.append(tr)
-    
+
     atr = sum(tr_list[:period]) / period
     for i in range(period, len(tr_list)):
         atr = (atr * (period - 1) + tr_list[i]) / period
@@ -190,12 +233,13 @@ def extract_htf_sr_levels(klines_4h, klines_1d):
 
 
 # ---------------------------------------------------------
-# ۵. دریافت داده‌ها و کنترل نوسان بیت‌کوین
+# ۶. دریافت داده‌ها و کنترل نوسان بیت‌کوین
 # ---------------------------------------------------------
 async def fetch_klines_with_failover(session, symbol, interval):
     sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
     for ex in sorted_exchanges:
         try:
+            await ex["limiter"].acquire()  # Rate Limiting
             mapped_interval = ex["interval_map"].get(interval, interval)
             url = ex["url"].format(symbol=symbol, interval=mapped_interval)
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), headers={"User-Agent": "TradingBot/1.0"}) as resp:
@@ -239,11 +283,15 @@ async def get_all_usdt_symbols(session):
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                btc_price = 60000.0
+                btc_price = None
                 for item in data:
                     if item.get("symbol") == "BTCUSDT":
-                        btc_price = float(item.get("lastPrice", 60000.0))
+                        btc_price = float(item.get("lastPrice", 0))
                         break
+
+                if btc_price is None or btc_price <= 0:
+                    LOGGER.warning("⚠️ Could not fetch BTC price, using fallback list.")
+                    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
                 min_usdt_volume = MIN_BTC_VOLUME * btc_price
                 valid_symbols = []
@@ -257,11 +305,22 @@ async def get_all_usdt_symbols(session):
                 return valid_symbols
     except Exception as e:
         LOGGER.error(f"Error fetching symbols: {e}")
-    return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+
+
+async def get_all_usdt_symbols_cached(session):
+    """کش کردن لیست نمادها — آپدیت هر ۵ دقیقه"""
+    global _symbol_cache
+    now = time.time()
+    if now - _symbol_cache["last_update"] > 300 or not _symbol_cache["symbols"]:
+        _symbol_cache["symbols"] = await get_all_usdt_symbols(session)
+        _symbol_cache["last_update"] = now
+        LOGGER.info(f"🔄 Symbol cache refreshed: {len(_symbol_cache['symbols'])} symbols")
+    return _symbol_cache["symbols"]
 
 
 # ---------------------------------------------------------
-# ۶. تحلیل تکنیکال با شرط عدم ورود SMA7 به بدنه کندل
+# ۷. تحلیل تکنیکال با شرط عدم ورود SMA7 به بدنه کندل
 # ---------------------------------------------------------
 def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=2.0):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
@@ -300,6 +359,11 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
     upper_wick = c_high - body_top
     lower_wick = body_bottom - c_low
+
+    # فیلتر اسپرد (اختیاری — برای جلوگیری از نمادهای با اسپرد بالا)
+    spread_pct = (total_range / c_low) * 100
+    if spread_pct > 2.0:  # اگر اسپرد بیش از ۲٪ باشد
+        return None
 
     pivot_highs, pivot_lows = find_pivots(highs, lows)
     trend = check_dow_theory_trend(pivot_highs, pivot_lows)
@@ -469,14 +533,17 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
 
 # ---------------------------------------------------------
-# ۷. سیستم تعقیب هوشمند پوزیشن‌ها (Auto Signal Tracker)
+# ۸. سیستم تعقیب هوشمند پوزیشن‌ها (Auto Signal Tracker)
 # ---------------------------------------------------------
 async def track_active_trades(session, bot):
     """تعقیب لحظه‌ای پوزیشن‌ها برای اعلام رسیدن به TP و SL"""
     if not active_trades:
         return
 
-    for trade_id, trade in list(active_trades.items()):
+    async with active_trades_lock:
+        trades = list(active_trades.items())
+
+    for trade_id, trade in trades:
         symbol = trade["symbol"]
         klines = await fetch_klines_with_failover(session, symbol, "15m")
         if not klines:
@@ -484,67 +551,77 @@ async def track_active_trades(session, bot):
 
         current_price = float(klines[-1][4])
 
-        if trade["direction"] == "LONG 🟢":
-            if current_price <= trade["stop_loss"]:
-                msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                STATS["sl_hits"] += 1
-                del active_trades[trade_id]
+        async with active_trades_lock:
+            if trade_id not in active_trades:
+                continue
 
-            elif current_price >= trade["tp3"] and not trade.get("tp3_hit"):
-                msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                STATS["tp3_hits"] += 1
-                del active_trades[trade_id]
+            if trade["direction"] == "LONG 🟢":
+                if current_price <= trade["stop_loss"]:
+                    msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)")
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                    STATS["sl_hits"] += 1
+                    del active_trades[trade_id]
 
-            elif current_price >= trade["tp2"] and not trade.get("tp2_hit"):
-                trade["tp2_hit"] = True
-                msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                STATS["tp2_hits"] += 1
+                elif current_price >= trade["tp3"] and not trade.get("tp3_hit"):
+                    msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥")
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                    STATS["tp3_hits"] += 1
+                    del active_trades[trade_id]
 
-            elif current_price >= trade["tp1"] and not trade.get("tp1_hit"):
-                trade["tp1_hit"] = True
-                msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                STATS["tp1_hits"] += 1
+                elif current_price >= trade["tp2"] and not trade.get("tp2_hit"):
+                    active_trades[trade_id]["tp2_hit"] = True
+                    msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`")
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                    STATS["tp2_hits"] += 1
 
-        elif trade["direction"] == "SHORT 🔴":
-            if current_price >= trade["stop_loss"]:
-                msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                STATS["sl_hits"] += 1
-                del active_trades[trade_id]
+                elif current_price >= trade["tp1"] and not trade.get("tp1_hit"):
+                    active_trades[trade_id]["tp1_hit"] = True
+                    msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`")
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                    STATS["tp1_hits"] += 1
 
-            elif current_price <= trade["tp3"] and not trade.get("tp3_hit"):
-                msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                STATS["tp3_hits"] += 1
-                del active_trades[trade_id]
+            elif trade["direction"] == "SHORT 🔴":
+                if current_price >= trade["stop_loss"]:
+                    msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)")
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                    STATS["sl_hits"] += 1
+                    del active_trades[trade_id]
 
-            elif current_price <= trade["tp2"] and not trade.get("tp2_hit"):
-                trade["tp2_hit"] = True
-                msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                STATS["tp2_hits"] += 1
+                elif current_price <= trade["tp3"] and not trade.get("tp3_hit"):
+                    msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥")
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                    STATS["tp3_hits"] += 1
+                    del active_trades[trade_id]
 
-            elif current_price <= trade["tp1"] and not trade.get("tp1_hit"):
-                trade["tp1_hit"] = True
-                msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                STATS["tp1_hits"] += 1
+                elif current_price <= trade["tp2"] and not trade.get("tp2_hit"):
+                    active_trades[trade_id]["tp2_hit"] = True
+                    msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`")
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                    STATS["tp2_hits"] += 1
+
+                elif current_price <= trade["tp1"] and not trade.get("tp1_hit"):
+                    active_trades[trade_id]["tp1_hit"] = True
+                    msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`")
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                    STATS["tp1_hits"] += 1
 
 
 # ---------------------------------------------------------
-# ۸. ارسال تلگرام و شنونده هوشمند دستورات (پشتیبانی از گروه و پیوی)
+# ۹. ارسال تلگرام و شنونده هوشمند دستورات
 # ---------------------------------------------------------
-async def send_telegram_message(bot, chat_id, text, reply_markup=None):
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-        return True
-    except Exception as e:
-        LOGGER.error(f"Telegram error: {e}")
-        return False
+async def send_telegram_message(bot, chat_id, text, reply_markup=None, retries=3):
+    """ارسال پیام با Exponential Backoff"""
+    for i in range(retries):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+            return True
+        except Exception as e:
+            if i == retries - 1:
+                LOGGER.error(f"Telegram error after {retries} retries: {e}")
+                return False
+            wait = 2 ** i
+            LOGGER.warning(f"Telegram send failed (attempt {i+1}/{retries}), retrying in {wait}s...")
+            await asyncio.sleep(wait)
 
 
 async def telegram_command_listener(bot):
@@ -580,12 +657,13 @@ async def telegram_command_listener(bot):
                         await send_telegram_message(bot, chat_id, msg)
 
                     elif cmd == "/active":
-                        if not active_trades:
-                            await send_telegram_message(bot, chat_id, "ℹ️ هیچ پوزیشن فعالی در حال حاضر وجود ندارد.")
-                        else:
-                            active_list = "\n".join([f"🔹 `#{v['symbol']}` ({v['direction']}) - Entry: `{v['entry_price']}`" for k, v in active_trades.items()])
-                            msg = f"📌 **Active Tracked Trades ({len(active_trades)}):**\n\n{active_list}"
-                            await send_telegram_message(bot, chat_id, msg)
+                        async with active_trades_lock:
+                            if not active_trades:
+                                await send_telegram_message(bot, chat_id, "ℹ️ هیچ پوزیشن فعالی در حال حاضر وجود ندارد.")
+                            else:
+                                active_list = "\n".join([f"🔹 `#{v['symbol']}` ({v['direction']}) - Entry: `{v['entry_price']}`" for k, v in active_trades.items()])
+                                msg = f"📌 **Active Tracked Trades ({len(active_trades)}):**\n\n{active_list}"
+                                await send_telegram_message(bot, chat_id, msg)
 
                     elif cmd in ["/start", "/help"]:
                         msg = (
@@ -609,7 +687,7 @@ def cleanup_old_alerts():
 
 
 # ---------------------------------------------------------
-# ۹. چرخه اصلی اسکنر بازار (Main Scanner Loop)
+# ۱۰. چرخه اصلی اسکنر بازار (Main Scanner Loop)
 # ---------------------------------------------------------
 async def scanner_task():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -624,7 +702,7 @@ async def scanner_task():
 
     async with aiohttp.ClientSession() as session:
         await update_btc_trend_and_volatility(session)
-        symbols = await get_all_usdt_symbols(session)
+        symbols = await get_all_usdt_symbols_cached(session)
         btc_counter = 0
 
         while True:
@@ -659,7 +737,8 @@ async def scanner_task():
                             alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}"
                             if alert_id not in sent_alerts:
                                 sent_alerts[alert_id] = time.time()
-                                active_trades[alert_id] = {**signal, "symbol": symbol}
+                                async with active_trades_lock:
+                                    active_trades[alert_id] = {**signal, "symbol": symbol}
                                 STATS["total_signals"] += 1
 
                                 tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
@@ -688,7 +767,7 @@ async def scanner_task():
                         await asyncio.sleep(0.02)
 
                 cleanup_old_alerts()
-                symbols = await get_all_usdt_symbols(session)
+                symbols = await get_all_usdt_symbols_cached(session)
                 await asyncio.sleep(5)
 
             except Exception as e:
@@ -703,6 +782,7 @@ async def health_check_handler(request):
 async def main():
     app = web.Application()
     app.router.add_get("/", health_check_handler)
+    app.router.add_get("/health", health_check_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
