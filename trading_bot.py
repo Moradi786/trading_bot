@@ -35,7 +35,7 @@ try:
 except ValueError:
     pass
 
-TIMEFRAMES = ["15m", "1h", "4h", "1d"]  # اضافه شدن تایم‌فریم روزانه
+TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
 MIN_BTC_VOLUME = 50.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین
 sent_alerts = {}
@@ -284,7 +284,7 @@ def cleanup_old_alerts():
 
 
 # ---------------------------------------------------------
-# ۷. تحلیل تکنیکال (فیلتر رنج + کندل ستاپ + شکست محدوده‌ها)
+# ۷. تحلیل تکنیکال (ترکیب استراتژی‌ها و ادغام سیگنال)
 # ---------------------------------------------------------
 def analyze_market_signal(klines, max_sl_percent=2.0):
     if len(klines) < 50:
@@ -321,80 +321,39 @@ def analyze_market_signal(klines, max_sl_percent=2.0):
     latest_resistance = max([ph[1] for ph in pivot_highs[-5:]]) if pivot_highs else c_high
     latest_support = min([pl[1] for pl in pivot_lows[-5:]]) if pivot_lows else c_low
 
-    # ----------------------------------------------------
-    # ۱. استراتژی کندل ستاپ (در بازار رنج NEUTRAL کاملاً غیرفعال است)
-    # ----------------------------------------------------
-    if trend == "BULLISH":
-        is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
-        body_gt_upper = (body >= 3 * upper_wick)
-        sma7_only_in_lower_wick = (c_low <= sma7 < body_bottom)
-
-        if is_long_wick and body_gt_upper and sma7_only_in_lower_wick:
-            entry_price = c_close
-            stop_loss = c_low
-            risk = entry_price - stop_loss
-
-            if risk > 0:
-                sl_percent = (risk / entry_price) * 100
-                if sl_percent <= max_sl_percent:
-                    return {
-                        "strategy": "Candle Setup 📌",
-                        "direction": "LONG 🟢",
-                        "entry_price": entry_price,
-                        "stop_loss": stop_loss,
-                        "sl_percent": round(sl_percent, 2),
-                        "tp1": round(entry_price + (risk * 2), 5),
-                        "tp2": round(entry_price + (risk * 5), 5),
-                        "tp3": round(entry_price + (risk * 7), 5),
-                        "sma7": round(sma7, 5),
-                        "trend": trend,
-                        "candle_time": klines[-2][0]
-                    }
-
-    elif trend == "BEARISH":
-        is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
-        body_gt_lower = (body >= 3 * lower_wick)
-        sma7_only_in_upper_wick = (body_top < sma7 <= c_high)
-
-        if is_short_wick and body_gt_lower and sma7_only_in_upper_wick:
-            entry_price = c_close
-            stop_loss = c_high
-            risk = stop_loss - entry_price
-
-            if risk > 0:
-                sl_percent = (risk / entry_price) * 100
-                if sl_percent <= max_sl_percent:
-                    return {
-                        "strategy": "Candle Setup 📌",
-                        "direction": "SHORT 🔴",
-                        "entry_price": entry_price,
-                        "stop_loss": stop_loss,
-                        "sl_percent": round(sl_percent, 2),
-                        "tp1": round(entry_price - (risk * 2), 5),
-                        "tp2": round(entry_price - (risk * 5), 5),
-                        "tp3": round(entry_price - (risk * 7), 5),
-                        "sma7": round(sma7, 5),
-                        "trend": trend,
-                        "candle_time": klines[-2][0]
-                    }
-
-    # ----------------------------------------------------
-    # ۲. استراتژی شکست محدوده رنج / مقاومت و حمایت (Range Breakout)
-    # ----------------------------------------------------
     avg_volume_20 = sum(volumes[-22:-2]) / 20 if len(volumes) >= 22 else 0
     is_volume_confirmed = (c_vol >= 1.5 * avg_volume_20) if avg_volume_20 > 0 else False
 
-    # شکست مقاومت سقف رنج (Range High Breakout)
-    if c_close > latest_resistance and c_close > c_open and is_volume_confirmed:
+    # ----------------------------------------------------
+    # ۱. بررسی شروط صعودی (LONG)
+    # ----------------------------------------------------
+    is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
+    body_gt_upper = (body >= 3 * upper_wick)
+    sma7_only_in_lower_wick = (c_low <= sma7 < body_bottom)
+    
+    is_candle_setup_long = (trend != "BEARISH") and is_long_wick and body_gt_upper and sma7_only_in_lower_wick
+    is_breakout_long = (c_close > latest_resistance) and (c_close > c_open) and is_volume_confirmed
+
+    if is_candle_setup_long or is_breakout_long:
         entry_price = c_close
-        stop_loss = latest_resistance * 0.995
+        stop_loss = c_low if is_candle_setup_long else (latest_resistance * 0.995)
         risk = entry_price - stop_loss
 
         if risk > 0:
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
+                confirmed_strategies = []
+                if is_candle_setup_long:
+                    confirmed_strategies.append("Candle Setup 📌")
+                if is_breakout_long:
+                    confirmed_strategies.append("Range Breakout ⚡")
+
+                strategy_text = " + ".join(confirmed_strategies)
+                if len(confirmed_strategies) > 1:
+                    strategy_text += f" 🔥 ({len(confirmed_strategies)} Strategies Confirmed!)"
+
                 return {
-                    "strategy": "Range Breakout ⚡",
+                    "strategy": strategy_text,
                     "direction": "LONG 🟢",
                     "entry_price": entry_price,
                     "stop_loss": round(stop_loss, 5),
@@ -407,17 +366,36 @@ def analyze_market_signal(klines, max_sl_percent=2.0):
                     "candle_time": klines[-2][0]
                 }
 
-    # شکست حمایت کف رنج (Range Low Breakout)
-    if c_close < latest_support and c_close < c_open and is_volume_confirmed:
+    # ----------------------------------------------------
+    # ۲. بررسی شروط نزولی (SHORT)
+    # ----------------------------------------------------
+    is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
+    body_gt_lower = (body >= 3 * lower_wick)
+    sma7_only_in_upper_wick = (body_top < sma7 <= c_high)
+
+    is_candle_setup_short = (trend != "BULLISH") and is_short_wick and body_gt_lower and sma7_only_in_upper_wick
+    is_breakout_short = (c_close < latest_support) and (c_close < c_open) and is_volume_confirmed
+
+    if is_candle_setup_short or is_breakout_short:
         entry_price = c_close
-        stop_loss = latest_support * 1.005
+        stop_loss = c_high if is_candle_setup_short else (latest_support * 1.005)
         risk = stop_loss - entry_price
 
         if risk > 0:
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
+                confirmed_strategies = []
+                if is_candle_setup_short:
+                    confirmed_strategies.append("Candle Setup 📌")
+                if is_breakout_short:
+                    confirmed_strategies.append("Range Breakout ⚡")
+
+                strategy_text = " + ".join(confirmed_strategies)
+                if len(confirmed_strategies) > 1:
+                    strategy_text += f" 🔥 ({len(confirmed_strategies)} Strategies Confirmed!)"
+
                 return {
-                    "strategy": "Range Breakout ⚡",
+                    "strategy": strategy_text,
                     "direction": "SHORT 🔴",
                     "entry_price": entry_price,
                     "stop_loss": round(stop_loss, 5),
@@ -489,7 +467,8 @@ async def scanner_task():
 
                         signal = analyze_market_signal(klines, max_sl_percent=MAX_SL_PERCENT)
                         if signal:
-                            alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}_{signal['strategy']}"
+                            # شناسه منحصربه‌فرد برای جلوگیری از پیام تکراری
+                            alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}"
                             if alert_id not in sent_alerts:
                                 sent_alerts[alert_id] = time.time()
 
