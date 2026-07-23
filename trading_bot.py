@@ -6,7 +6,6 @@ import aiohttp
 from aiohttp import web
 from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
 
 # ---------------------------------------------------------
 # ۱. تنظیمات اولیه
@@ -36,8 +35,8 @@ except ValueError:
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 250.0  # حداقل حجم ۲۴ ساعته: بالای ۲۵۰ بیت‌کوین
-MAX_SIGNAL_AGE_SECONDS = 180  # حداکثر زمان مجاز ارسال سیگنال (۳ دقیقه پس از بسته‌شدن کندل)
+MIN_BTC_VOLUME = 250.0          # حداقل حجم ۲۴ ساعته: بالای ۲۵۰ بیت‌کوین
+MAX_SIGNAL_AGE_SECONDS = 180  # حداکثر زمان مجاز ارسال سیگنال (۳ دقیقه)
 MAX_SLIPPAGE_PERCENT = 0.2    # حداکثر جابه‌جایی مجاز قیمت بازار نسبت به Entry
 
 sent_alerts = {}
@@ -93,7 +92,7 @@ def _parse_okx(data):
 
 
 # ---------------------------------------------------------
-# ۴. اندیکاتورها (محاسبه دقیق روی کندل‌های بسته‌شده)
+# ۴. اندیکاتورها و محاسبات تکنیکال
 # ---------------------------------------------------------
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -167,6 +166,19 @@ def check_dow_theory_trend(pivot_highs, pivot_lows):
     return "NEUTRAL"
 
 
+def extract_htf_sr_levels(klines_4h, klines_1d):
+    """استخراج سطوح حمایت و مقاومت تایم‌فریم‌های ۴ ساعته و روزانه"""
+    supports, resistances = [], []
+    for klines in [klines_4h, klines_1d]:
+        if klines and len(klines) >= 30:
+            h = [float(k[2]) for k in klines[:-1]]
+            l = [float(k[3]) for k in klines[:-1]]
+            ph, pl = find_pivots(h, l)
+            resistances.extend([p[1] for p in ph[-3:]])
+            supports.extend([p[1] for p in pl[-3:]])
+    return supports, resistances
+
+
 # ---------------------------------------------------------
 # ۵. دریافت داده‌ها
 # ---------------------------------------------------------
@@ -230,21 +242,20 @@ async def get_all_usdt_symbols(session):
 
 
 # ---------------------------------------------------------
-# ۶. تحلیل تکنیکال با کنترل دقیق زمان و قیمت
+# ۶. تحلیل تکنیکال (Candle Setup + HTF Range Breakout)
 # ---------------------------------------------------------
-def analyze_market_signal(klines, symbol, max_sl_percent=2.0):
+def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_percent=2.0):
     if len(klines) < 50:
         return None
 
-    # ۱. فیلتر زمان تازگی سیگنال (جلوگیری از سیگنال‌های دیرشده)
+    # ۱. فیلتر زمان تازگی سیگنال (حداکثر ۳ دقیقه پس از بسته شدن)
     current_time_ms = int(time.time() * 1000)
     current_candle_start_ms = int(klines[-1][0])
     elapsed_seconds = (current_time_ms - current_candle_start_ms) / 1000.0
 
     if elapsed_seconds > MAX_SIGNAL_AGE_SECONDS:
-        return None  # بیشتر از ۳ دقیقه از بسته‌شدن کندل گذشته؛ سیگنال سوخته است!
+        return None
 
-    # استفاده از کندل‌های بسته‌شده برای اندیکاتورها (جهت عدم تغییر نوسانی)
     closed_klines = klines[:-1]
     opens = [float(k[1]) for k in closed_klines]
     highs = [float(k[2]) for k in closed_klines]
@@ -252,7 +263,7 @@ def analyze_market_signal(klines, symbol, max_sl_percent=2.0):
     closes = [float(k[4]) for k in closed_klines]
     volumes = [float(k[5]) for k in closed_klines]
 
-    current_live_price = float(klines[-1][4])  # قیمت زنده و لحظه‌ای بازار
+    current_live_price = float(klines[-1][4])
 
     rsi = calculate_rsi(closes)
     atr = calculate_atr(highs, lows, closes)
@@ -263,7 +274,7 @@ def analyze_market_signal(klines, symbol, max_sl_percent=2.0):
     body = abs(c_close - c_open)
     total_range = c_high - c_low
 
-    if total_range == 0 or body == 0:
+    if total_range == 0 or body == 0 or atr == 0:
         return None
 
     upper_wick = c_high - body_top
@@ -272,23 +283,49 @@ def analyze_market_signal(klines, symbol, max_sl_percent=2.0):
     pivot_highs, pivot_lows = find_pivots(highs, lows)
     trend = check_dow_theory_trend(pivot_highs, pivot_lows)
 
-    latest_resistance = max([ph[1] for ph in pivot_highs[-5:]]) if pivot_highs else c_high
-    latest_support = min([pl[1] for pl in pivot_lows[-5:]]) if pivot_lows else c_low
+    # -----------------------------------------------------
+    # ۲. تشخیص محدوده رنج (Consolidation Range Detection)
+    # -----------------------------------------------------
+    lookback = 12
+    range_high = max(highs[-lookback:-1])
+    range_low = min(lows[-lookback:-1])
+    range_width_pct = ((range_high - range_low) / range_low) * 100 if range_low > 0 else 999.0
 
-    avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0
-    is_volume_confirmed = (c_vol >= 1.5 * avg_vol) if avg_vol > 0 else False
+    # محدوده رنج زمانی است که نوسان ۱۲ کندل قبلی کمتر از ۳.۵ درصد باشد
+    is_in_range = (range_width_pct <= 3.5)
+
+    # بررسی موقعیت محدوده نسبت به سطوح 4H و 1D
+    is_near_htf_support = any(range_low >= supp * 0.985 and range_low <= supp * 1.025 for supp in htf_supports) if htf_supports else True
+    is_near_htf_resistance = any(range_high <= res * 1.015 and range_high >= res * 0.975 for res in htf_resistances) if htf_resistances else True
 
     # -----------------------------------------------------
-    # سیگنال خرید (LONG)
+    # ۳. قوانین CANDLE SETUP + RANGE BREAKOUT (LONG)
     # -----------------------------------------------------
-    is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
-    body_gt_upper = (body >= 3 * upper_wick)
-    sma7_lower_wick = (c_low <= sma7 < body_bottom)
+    is_green_candle = (c_close > c_open)
+    is_valid_size = (total_range >= 0.5 * atr)
+    is_strong_lower_wick = (lower_wick >= 1.8 * body) and (lower_wick / total_range >= 0.45)
+    has_minimal_upper_wick = (upper_wick <= 0.25 * total_range)
+    is_sma7_bounce = (c_low <= sma7) and (c_close > sma7)
 
-    is_candle_setup_long = (trend != "BEARISH") and is_long_wick and body_gt_upper and sma7_lower_wick
-    is_breakout_long = (c_close > latest_resistance) and (c_close > c_open) and is_volume_confirmed
+    # کندل ستاپ استاندارد
+    is_base_candle_setup_long = (
+        (trend != "BEARISH") and 
+        is_green_candle and 
+        is_valid_size and 
+        is_strong_lower_wick and 
+        has_minimal_upper_wick and 
+        is_sma7_bounce
+    )
 
-    if is_candle_setup_long or is_breakout_long:
+    # شکست محدوده رنج با کندل ستاپ در بالای حمایت یا زیر مقاومت ۴ ساعته/روزانه
+    is_htf_range_breakout_long = (
+        is_in_range and 
+        (c_close > range_high) and 
+        is_green_candle and 
+        (is_near_htf_support or is_near_htf_resistance)
+    )
+
+    if is_base_candle_setup_long or is_htf_range_breakout_long:
         if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BEARISH":
             return None
         if rsi > 68.0:
@@ -296,24 +333,22 @@ def analyze_market_signal(klines, symbol, max_sl_percent=2.0):
 
         entry_price = c_close
 
-        # فیلتر پرش قیمت: اگر قیمت لحظه‌ای همین الان خیلی بالا رفته باشد، سیگنال باطل است
+        # فیلتر پرش قیمت لحظه‌ای
         price_diff_percent = ((current_live_price - entry_price) / entry_price) * 100
         if price_diff_percent > MAX_SLIPPAGE_PERCENT:
             return None
 
-        stop_loss = max(c_low, entry_price - (1.5 * atr)) if atr > 0 else c_low
+        stop_loss = max(c_low, entry_price - (1.5 * atr))
         risk = entry_price - stop_loss
 
         if risk > 0:
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 confirmed = []
-                if is_candle_setup_long: confirmed.append("Candle Setup 📌")
-                if is_breakout_long: confirmed.append("Range Breakout ⚡")
+                if is_base_candle_setup_long: confirmed.append("Candle Setup 📌")
+                if is_htf_range_breakout_long: confirmed.append("4H/1D Range Breakout 🚀")
 
                 strategy_text = " + ".join(confirmed)
-                if len(confirmed) > 1:
-                    strategy_text += f" 🔥 ({len(confirmed)} Strategies Confirmed!)"
 
                 return {
                     "strategy": strategy_text,
@@ -331,16 +366,30 @@ def analyze_market_signal(klines, symbol, max_sl_percent=2.0):
                 }
 
     # -----------------------------------------------------
-    # سیگنال فروش (SHORT)
+    # ۴. قوانین CANDLE SETUP + RANGE BREAKOUT (SHORT)
     # -----------------------------------------------------
-    is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
-    body_gt_lower = (body >= 3 * lower_wick)
-    sma7_upper_wick = (body_top < sma7 <= c_high)
+    is_red_candle = (c_close < c_open)
+    is_strong_upper_wick = (upper_wick >= 1.8 * body) and (upper_wick / total_range >= 0.45)
+    has_minimal_lower_wick = (lower_wick <= 0.25 * total_range)
+    is_sma7_rejection = (c_high >= sma7) and (c_close < sma7)
 
-    is_candle_setup_short = (trend != "BULLISH") and is_short_wick and body_gt_lower and sma7_upper_wick
-    is_breakout_short = (c_close < latest_support) and (c_close < c_open) and is_volume_confirmed
+    is_base_candle_setup_short = (
+        (trend != "BULLISH") and 
+        is_red_candle and 
+        is_valid_size and 
+        is_strong_upper_wick and 
+        has_minimal_lower_wick and 
+        is_sma7_rejection
+    )
 
-    if is_candle_setup_short or is_breakout_short:
+    is_htf_range_breakout_short = (
+        is_in_range and 
+        (c_close < range_low) and 
+        is_red_candle and 
+        (is_near_htf_resistance or is_near_htf_support)
+    )
+
+    if is_base_candle_setup_short or is_htf_range_breakout_short:
         if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BULLISH":
             return None
         if rsi < 32.0:
@@ -348,24 +397,22 @@ def analyze_market_signal(klines, symbol, max_sl_percent=2.0):
 
         entry_price = c_close
 
-        # فیلتر پرش قیمت نزولی
+        # فیلتر پرش قیمت لحظه‌ای
         price_diff_percent = ((entry_price - current_live_price) / entry_price) * 100
         if price_diff_percent > MAX_SLIPPAGE_PERCENT:
             return None
 
-        stop_loss = min(c_high, entry_price + (1.5 * atr)) if atr > 0 else c_high
+        stop_loss = min(c_high, entry_price + (1.5 * atr))
         risk = stop_loss - entry_price
 
         if risk > 0:
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 confirmed = []
-                if is_candle_setup_short: confirmed.append("Candle Setup 📌")
-                if is_breakout_short: confirmed.append("Range Breakout ⚡")
+                if is_base_candle_setup_short: confirmed.append("Candle Setup 📌")
+                if is_htf_range_breakout_short: confirmed.append("4H/1D Range Breakdown 📉")
 
                 strategy_text = " + ".join(confirmed)
-                if len(confirmed) > 1:
-                    strategy_text += f" 🔥 ({len(confirmed)} Strategies Confirmed!)"
 
                 return {
                     "strategy": strategy_text,
@@ -426,19 +473,31 @@ async def scanner_task():
                     btc_counter = 0
 
                 for symbol in symbols:
+                    # دریافت سطوح ۴ ساعته و روزانه برای فیلتر سطوح کلیدی
+                    klines_4h = await fetch_klines_with_failover(session, symbol, "4h")
+                    klines_1d = await fetch_klines_with_failover(session, symbol, "1d")
+                    htf_supports, htf_resistances = extract_htf_sr_levels(klines_4h, klines_1d)
+
                     for interval in TIMEFRAMES:
                         klines = await fetch_klines_with_failover(session, symbol, interval)
                         if not klines:
                             continue
 
-                        signal = analyze_market_signal(klines, symbol, max_sl_percent=MAX_SL_PERCENT)
+                        signal = analyze_market_signal(
+                            klines=klines, 
+                            symbol=symbol, 
+                            htf_supports=htf_supports, 
+                            htf_resistances=htf_resistances, 
+                            max_sl_percent=MAX_SL_PERCENT
+                        )
+
                         if signal:
                             alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}"
                             if alert_id not in sent_alerts:
                                 sent_alerts[alert_id] = time.time()
 
                                 msg = (
-                                    f"🎯 **Real-Time Signal Detected!**\n\n"
+                                    f"🎯 **High-Precision Signal Detected!**\n\n"
                                     f"⚙️ **Strategy:** `{signal['strategy']}`\n"
                                     f"🪙 **Coin:** `#{symbol}` | **Timeframe:** `{interval}`\n"
                                     f"🚦 **Direction:** {signal['direction']}\n"
