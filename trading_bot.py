@@ -39,6 +39,10 @@ MIN_BTC_VOLUME = 250.0
 MAX_SIGNAL_AGE_SECONDS = 180
 MAX_SLIPPAGE_PERCENT = 0.2
 
+# تنظیمات Volatility Pause
+VOLATILITY_PAUSE_MINUTES = 15      # از ۳۰ دقیقه به ۱۵ دقیقه
+VOLATILITY_THRESHOLD_PERCENT = 2.5  # از ۱.۵٪ به ۲.۵٪
+
 sent_alerts = {}
 active_trades = {}
 active_trades_lock = asyncio.Lock()
@@ -143,7 +147,6 @@ def _parse_okx(data):
 # ۵. اعتبارسنجی داده‌های API
 # ---------------------------------------------------------
 def validate_klines(klines, symbol):
-    """بررسی صحت داده‌های دریافتی از API"""
     if not klines or len(klines) < 10:
         LOGGER.warning(f"⚠️ [{symbol}] Too few klines: {len(klines) if klines else 0}")
         return False, "too_few_klines"
@@ -181,7 +184,6 @@ def validate_klines(klines, symbol):
 
 
 async def cross_check_price(session, symbol):
-    """مقایسه قیمت بین Binance و Bybit"""
     prices = {}
     try:
         url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
@@ -334,14 +336,16 @@ async def update_btc_trend_and_volatility(session):
             ph, pl = find_pivots(highs, lows)
             GLOBAL_BTC_TREND = check_dow_theory_trend(ph, pl)
 
+        # اصلاح: بررسی کندل در حال اجرا (klines[-1]) نه کندل بسته شده (klines[-2])
         klines_15m = await fetch_klines_with_failover(session, "BTCUSDT", "15m")
-        if klines_15m and len(klines_15m) >= 2:
-            b_open = float(klines_15m[-2][1])
-            b_close = float(klines_15m[-2][4])
+        if klines_15m and len(klines_15m) >= 1:
+            b_open = float(klines_15m[-1][1])   # کندل در حال اجرا
+            b_close = float(klines_15m[-1][4])  # کندل در حال اجرا
             change_pct = abs((b_close - b_open) / b_open) * 100
-            if change_pct >= 1.5:
-                BTC_VOLATILITY_PAUSE_UNTIL = time.time() + 1800
-                LOGGER.warning(f"⚠️ BTC Volatility Spike ({change_pct:.2f}%). Pausing signals for 30m.")
+            if change_pct >= VOLATILITY_THRESHOLD_PERCENT:  # ۲.۵٪
+                BTC_VOLATILITY_PAUSE_UNTIL = time.time() + (VOLATILITY_PAUSE_MINUTES * 60)  # ۱۵ دقیقه
+                LOGGER.warning(f"⚠️ BTC Volatility Spike ({change_pct:.2f}%). Pausing signals for {VOLATILITY_PAUSE_MINUTES}m.")
+
     except Exception as e:
         LOGGER.error(f"Error updating BTC status: {e}")
 
@@ -450,13 +454,9 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     # ==================== LONG SETUP ====================
     is_green_candle = (c_close > c_open)
     is_valid_size = (total_range >= 0.5 * atr)
-    # سایه پایین قوی: حداقل ۲ برابر بدنه و حداقل ۵۰٪ محدوده کل
     is_strong_lower_wick = (lower_wick >= 2.0 * body) and (lower_wick / total_range >= 0.50)
-    # سایه بالا خیلی کوتاه: حداکثر ۲۰٪ محدوده کل
     has_minimal_upper_wick = (upper_wick <= 0.20 * total_range)
-    # SMA7 در ناحیه سایه پایین (بین Low و body_top)
     is_sma7_bounce = (c_low <= sma7) and (sma7 <= body_top)
-    # کندل باید از SMA7 برگشته باشد به بالا
     is_bounce_confirmed = c_close > sma7
 
     is_candle_setup_long = (
@@ -520,13 +520,9 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
     # ==================== SHORT SETUP ====================
     is_red_candle = (c_close < c_open)
-    # سایه بالا قوی: حداقل ۲ برابر بدنه و حداقل ۵۰٪ محدوده کل
     is_strong_upper_wick = (upper_wick >= 2.0 * body) and (upper_wick / total_range >= 0.50)
-    # سایه پایین خیلی کوتاه: حداکثر ۲۰٪ محدوده کل
     has_minimal_lower_wick = (lower_wick <= 0.20 * total_range)
-    # SMA7 در ناحیه سایه بالا (بین body_bottom و High)
     is_sma7_rejection = (c_high >= sma7) and (sma7 >= body_bottom)
-    # کندل باید از SMA7 برگشته باشد به پایین
     is_rejection_confirmed = c_close < sma7
 
     is_candle_setup_short = (
@@ -720,6 +716,12 @@ async def telegram_command_listener(bot):
                                 msg = f"📌 **Active Tracked Trades ({len(active_trades)}):**\n\n{active_list}"
                                 await send_telegram_message(bot, chat_id, msg)
 
+                    elif cmd == "/pause":
+                        global BTC_VOLATILITY_PAUSE_UNTIL
+                        BTC_VOLATILITY_PAUSE_UNTIL = 0
+                        await send_telegram_message(bot, chat_id, "⏸️ **Volatility pause deactivated.**\n✅ Bot is now active.")
+                        LOGGER.info("🟢 Volatility pause manually deactivated via /pause command")
+
                     elif cmd == "/debug":
                         msg = (
                             "🔍 **Debug Info:**\n\n"
@@ -736,6 +738,7 @@ async def telegram_command_listener(bot):
                             "🤖 **Trading Bot Control Menu**\n\n"
                             "▫️ `/stats` : مشاهده آمار\n"
                             "▫️ `/active` : پوزیشن‌های فعال\n"
+                            "▫️ `/pause` : غیرفعال کردن Volatility Pause\n"
                             "▫️ `/debug` : اطلاعات دیباگ\n"
                             "▫️ `/help` : راهنما"
                         )
