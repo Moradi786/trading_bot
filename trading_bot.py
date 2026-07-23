@@ -37,7 +37,7 @@ except ValueError:
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 50.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین
+MIN_BTC_VOLUME = 250.0  # حداقل حجم ۲۴ ساعته: فقط بالای ۲۵۰ بیت‌کوین
 sent_alerts = {}
 ALERT_TTL = 86400
 
@@ -209,7 +209,7 @@ async def fetch_klines_with_failover(session, symbol, interval):
 
 
 # ---------------------------------------------------------
-# ۵. دریافت لیست نمادها و فیلتر حجم بالای ۵۰ بیت‌کوین
+# ۵. دریافت لیست نمادها و فیلتر حجم بالای ۲۵۰ بیت‌کوین
 # ---------------------------------------------------------
 async def get_all_usdt_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -234,11 +234,11 @@ async def get_all_usdt_symbols(session):
                     if symbol.endswith("USDT") and quote_volume >= min_usdt_volume:
                         valid_symbols.append(symbol)
 
-                LOGGER.info(f"✅ {len(valid_symbols)} نماد با حجم بالای 50 BTC انتخاب شدند")
+                LOGGER.info(f"✅ {len(valid_symbols)} نماد با حجم بالای 250 BTC انتخاب شدند")
                 return valid_symbols
     except Exception as e:
         LOGGER.error(f"Error fetching symbols & volume filter: {e}")
-    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XLMUSDT", "ZECUSDT"]
+    return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 
 # ---------------------------------------------------------
