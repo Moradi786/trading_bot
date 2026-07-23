@@ -1,10 +1,13 @@
 import asyncio
 import logging
 import os
+import sqlite3
 import time
 import aiohttp
 from aiohttp import web
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+import pandas as pd
+from xgboost import XGBClassifier
+from telegram import Bot
 from telegram.constants import ParseMode
 
 # ---------------------------------------------------------
@@ -39,9 +42,8 @@ MIN_BTC_VOLUME = 250.0
 MAX_SIGNAL_AGE_SECONDS = 180
 MAX_SLIPPAGE_PERCENT = 0.2
 
-# تنظیمات Volatility Pause
-VOLATILITY_PAUSE_MINUTES = 15      # از ۳۰ دقیقه به ۱۵ دقیقه
-VOLATILITY_THRESHOLD_PERCENT = 2.5  # از ۱.۵٪ به ۲.۵٪
+VOLATILITY_PAUSE_MINUTES = 15
+VOLATILITY_THRESHOLD_PERCENT = 2.5
 
 sent_alerts = {}
 active_trades = {}
@@ -59,10 +61,92 @@ STATS = {
 }
 
 _symbol_cache = {"symbols": [], "last_update": 0}
-
+DB_NAME = "trading_ai_dataset.db"
 
 # ---------------------------------------------------------
-# ۲. Rate Limiting
+# ۲. دیتابیس SQLite و موتور یادگیری هوش مصنوعی
+# ---------------------------------------------------------
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trade_features (
+                id TEXT PRIMARY KEY,
+                symbol TEXT,
+                direction TEXT,
+                rsi REAL,
+                spread_pct REAL,
+                vol_ratio REAL,
+                lower_wick_ratio REAL,
+                upper_wick_ratio REAL,
+                trend_code INTEGER,
+                outcome INTEGER
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        LOGGER.info("💾 SQLite Database initialized successfully.")
+    except Exception as e:
+        LOGGER.error(f"❌ Database initialization error: {e}")
+
+class SelfLearningAIEngine:
+    def __init__(self):
+        self.model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05, random_state=42)
+        self.is_trained = False
+        self.min_samples_to_train = 15
+
+    def retrain_model(self):
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            df = pd.read_sql_query("SELECT * FROM trade_features WHERE outcome IS NOT NULL", conn)
+            conn.close()
+
+            if len(df) < self.min_samples_to_train:
+                LOGGER.info(f"🧠 AI Learning: Need at least {self.min_samples_to_train} closed trades. Currently: {len(df)}")
+                return False
+
+            X = df[['rsi', 'spread_pct', 'vol_ratio', 'lower_wick_ratio', 'upper_wick_ratio', 'trend_code']]
+            y = df['outcome']
+
+            if len(y.unique()) < 2:
+                LOGGER.info("🧠 AI Learning: Both Win and Loss samples are required to train.")
+                return False
+
+            self.model.fit(X, y)
+            self.is_trained = True
+            LOGGER.info(f"✅ AI Model Successfully Retrained on {len(df)} past trades!")
+            return True
+        except Exception as e:
+            LOGGER.error(f"❌ Error during AI retraining: {e}")
+            return False
+
+    def predict_signal_quality(self, feature_dict):
+        if not self.is_trained:
+            return 0.80
+        try:
+            X_input = pd.DataFrame([feature_dict])
+            prob = self.model.predict_proba(X_input)[0][1]
+            return float(prob)
+        except Exception as e:
+            LOGGER.error(f"❌ Error during AI prediction: {e}")
+            return 0.80
+
+ai_engine = SelfLearningAIEngine()
+
+def update_trade_outcome(trade_id, outcome):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE trade_features SET outcome = ? WHERE id = ?", (outcome, trade_id))
+        conn.commit()
+        conn.close()
+        ai_engine.retrain_model()
+    except Exception as e:
+        LOGGER.error(f"❌ Error updating trade outcome: {e}")
+
+# ---------------------------------------------------------
+# ۳. Rate Limiting
 # ---------------------------------------------------------
 class RateLimiter:
     def __init__(self, rate=10, per=1):
@@ -85,15 +169,29 @@ class RateLimiter:
             else:
                 self.tokens -= 1
 
-
 binance_limiter = RateLimiter(rate=20, per=1)
 bybit_limiter = RateLimiter(rate=10, per=1)
 okx_limiter = RateLimiter(rate=10, per=1)
 
+# ---------------------------------------------------------
+# ۴. صرافی‌ها و پارسرها
+# ---------------------------------------------------------
+def _parse_bybit(data):
+    try:
+        if data.get("retCode") != 0:
+            return None
+        result = data.get("result", {}).get("list", [])
+        return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
+    except Exception:
+        return None
 
-# ---------------------------------------------------------
-# ۳. صرافی‌ها
-# ---------------------------------------------------------
+def _parse_okx(data):
+    try:
+        result = data.get("data", [])
+        return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
+    except Exception:
+        return None
+
 EXCHANGES = [
     {
         "name": "Binance",
@@ -121,67 +219,27 @@ EXCHANGES = [
     }
 ]
 
-
 # ---------------------------------------------------------
-# ۴. پارسرها
-# ---------------------------------------------------------
-def _parse_bybit(data):
-    try:
-        if data.get("retCode") != 0:
-            return None
-        result = data.get("result", {}).get("list", [])
-        return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
-    except Exception:
-        return None
-
-
-def _parse_okx(data):
-    try:
-        result = data.get("data", [])
-        return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------
-# ۵. اعتبارسنجی داده‌های API
+# ۵. اعتبارسنجی داده‌ها
 # ---------------------------------------------------------
 def validate_klines(klines, symbol):
     if not klines or len(klines) < 10:
-        LOGGER.warning(f"⚠️ [{symbol}] Too few klines: {len(klines) if klines else 0}")
         return False, "too_few_klines"
-
     try:
         last_close = float(klines[-1][4])
         prev_close = float(klines[-2][4])
-    except (IndexError, ValueError, TypeError) as e:
-        LOGGER.warning(f"⚠️ [{symbol}] Invalid kline format: {e}")
+    except (IndexError, ValueError, TypeError):
         return False, "invalid_format"
 
     if prev_close > 0:
         change = abs(last_close - prev_close) / prev_close
         if change > 0.5:
-            LOGGER.warning(f"⚠️ [{symbol}] Suspicious price jump: {change*100:.1f}%")
             return False, "suspicious_jump"
 
     if last_close > 1000000 or last_close < 0.000001:
-        LOGGER.warning(f"⚠️ [{symbol}] Suspicious price range: {last_close}")
         return False, "suspicious_range"
 
-    if last_close <= 0:
-        LOGGER.warning(f"⚠️ [{symbol}] Zero or negative price: {last_close}")
-        return False, "zero_price"
-
-    closes = [float(k[4]) for k in klines[-10:] if len(k) >= 5]
-    if len(closes) >= 2:
-        avg_close = sum(closes) / len(closes)
-        max_dev = max(abs(c - avg_close) for c in closes) / avg_close if avg_close > 0 else 0
-        if max_dev > 0.8:
-            LOGGER.warning(f"⚠️ [{symbol}] High price variance: {max_dev*100:.1f}%")
-            return False, "high_variance"
-
     return True, "ok"
-
 
 async def cross_check_price(session, symbol):
     prices = {}
@@ -211,10 +269,8 @@ async def cross_check_price(session, symbol):
         if len(vals) >= 2:
             max_diff = max(vals) / min(vals) - 1
             if max_diff > 0.05:
-                LOGGER.error(f"❌ [{symbol}] Price mismatch: {prices} | Diff: {max_diff*100:.1f}%")
                 return False, prices
     return True, prices
-
 
 # ---------------------------------------------------------
 # ۶. اندیکاتورها
@@ -245,7 +301,6 @@ def calculate_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
-
 def calculate_atr(highs, lows, closes, period=14):
     if len(highs) < period + 1:
         return 0.0
@@ -262,7 +317,6 @@ def calculate_atr(highs, lows, closes, period=14):
         atr = (atr * (period - 1) + tr_list[i]) / period
     return atr
 
-
 def find_pivots(highs, lows, left_right=3):
     pivot_highs, pivot_lows = [], []
     n = len(highs)
@@ -275,7 +329,6 @@ def find_pivots(highs, lows, left_right=3):
             pivot_lows.append((i, lows[i]))
     return pivot_highs, pivot_lows
 
-
 def check_dow_theory_trend(pivot_highs, pivot_lows):
     if len(pivot_highs) < 2 or len(pivot_lows) < 2:
         return "NEUTRAL"
@@ -287,7 +340,6 @@ def check_dow_theory_trend(pivot_highs, pivot_lows):
         return "BEARISH"
     return "NEUTRAL"
 
-
 def extract_htf_sr_levels(klines_4h, klines_1d):
     supports, resistances = [], []
     for klines in [klines_4h, klines_1d]:
@@ -298,7 +350,6 @@ def extract_htf_sr_levels(klines_4h, klines_1d):
             resistances.extend([p[1] for p in ph[-3:]])
             supports.extend([p[1] for p in pl[-3:]])
     return supports, resistances
-
 
 # ---------------------------------------------------------
 # ۷. دریافت داده‌ها
@@ -315,16 +366,13 @@ async def fetch_klines_with_failover(session, symbol, interval):
                     data = await resp.json()
                     klines = ex["parser"](data)
                     if klines and len(klines) >= 50:
-                        valid, reason = validate_klines(klines, symbol)
+                        valid, _ = validate_klines(klines, symbol)
                         if valid:
                             return klines
-                        else:
-                            LOGGER.warning(f"⚠️ [{symbol}] Data validation failed on {ex['name']}: {reason}")
         except Exception:
             pass
         await asyncio.sleep(0.05)
     return None
-
 
 async def update_btc_trend_and_volatility(session):
     global GLOBAL_BTC_TREND, BTC_VOLATILITY_PAUSE_UNTIL
@@ -336,19 +384,16 @@ async def update_btc_trend_and_volatility(session):
             ph, pl = find_pivots(highs, lows)
             GLOBAL_BTC_TREND = check_dow_theory_trend(ph, pl)
 
-        # اصلاح: بررسی کندل در حال اجرا (klines[-1]) نه کندل بسته شده (klines[-2])
         klines_15m = await fetch_klines_with_failover(session, "BTCUSDT", "15m")
         if klines_15m and len(klines_15m) >= 1:
-            b_open = float(klines_15m[-1][1])   # کندل در حال اجرا
-            b_close = float(klines_15m[-1][4])  # کندل در حال اجرا
+            b_open = float(klines_15m[-1][1])
+            b_close = float(klines_15m[-1][4])
             change_pct = abs((b_close - b_open) / b_open) * 100
-            if change_pct >= VOLATILITY_THRESHOLD_PERCENT:  # ۲.۵٪
-                BTC_VOLATILITY_PAUSE_UNTIL = time.time() + (VOLATILITY_PAUSE_MINUTES * 60)  # ۱۵ دقیقه
+            if change_pct >= VOLATILITY_THRESHOLD_PERCENT:
+                BTC_VOLATILITY_PAUSE_UNTIL = time.time() + (VOLATILITY_PAUSE_MINUTES * 60)
                 LOGGER.warning(f"⚠️ BTC Volatility Spike ({change_pct:.2f}%). Pausing signals for {VOLATILITY_PAUSE_MINUTES}m.")
-
     except Exception as e:
         LOGGER.error(f"Error updating BTC status: {e}")
-
 
 async def get_all_usdt_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -362,7 +407,6 @@ async def get_all_usdt_symbols(session):
                         btc_price = float(item.get("lastPrice", 0))
                         break
                 if btc_price is None or btc_price <= 0:
-                    LOGGER.warning("⚠️ Could not fetch BTC price, using fallback list.")
                     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
                 min_usdt_volume = MIN_BTC_VOLUME * btc_price
                 valid_symbols = []
@@ -371,12 +415,10 @@ async def get_all_usdt_symbols(session):
                     quote_volume = float(item.get("quoteVolume", 0))
                     if symbol.endswith("USDT") and quote_volume >= min_usdt_volume:
                         valid_symbols.append(symbol)
-                LOGGER.info(f"✅ {len(valid_symbols)} Symbols Selected (>250 BTC Vol)")
                 return valid_symbols
     except Exception as e:
         LOGGER.error(f"Error fetching symbols: {e}")
     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-
 
 async def get_all_usdt_symbols_cached(session):
     global _symbol_cache
@@ -387,9 +429,8 @@ async def get_all_usdt_symbols_cached(session):
         LOGGER.info(f"🔄 Symbol cache refreshed: {len(_symbol_cache['symbols'])} symbols")
     return _symbol_cache["symbols"]
 
-
 # ---------------------------------------------------------
-# ۸. تحلیل تکنیکال — کندل ستاپ اصلاح شده
+# ۸. تحلیل تکنیکال و فیلتر هوش مصنوعی
 # ---------------------------------------------------------
 def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=2.0):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
@@ -451,6 +492,17 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     is_near_htf_support = any(range_low >= supp * 0.985 and range_low <= supp * 1.025 for supp in htf_supports) if htf_supports else True
     is_near_htf_resistance = any(range_high <= res * 1.015 and range_high >= res * 0.975 for res in htf_resistances) if htf_resistances else True
 
+    # آماده‌سازی ویژگی‌ها برای هوش مصنوعی
+    trend_map = {"BULLISH": 1, "NEUTRAL": 0, "BEARISH": -1}
+    feature_dict = {
+        'rsi': float(rsi),
+        'spread_pct': float(spread_pct),
+        'vol_ratio': float(c_vol / avg_vol_20) if avg_vol_20 > 0 else 1.0,
+        'lower_wick_ratio': float(lower_wick / total_range),
+        'upper_wick_ratio': float(upper_wick / total_range),
+        'trend_code': trend_map.get(trend, 0)
+    }
+
     # ==================== LONG SETUP ====================
     is_green_candle = (c_close > c_open)
     is_valid_size = (total_range >= 0.5 * atr)
@@ -484,6 +536,12 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         if rsi > 68.0:
             return None
 
+        # ارزیابی توسط هوش مصنوعی
+        win_probability = ai_engine.predict_signal_quality(feature_dict)
+        if win_probability < 0.60:
+            LOGGER.info(f"🤖 AI Filter Rejected LONG signal for {symbol} (Score: {win_probability*100:.1f}%)")
+            return None
+
         entry_price = c_close
         price_diff_percent = ((current_live_price - entry_price) / entry_price) * 100
         if price_diff_percent > MAX_SLIPPAGE_PERCENT:
@@ -503,7 +561,23 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                 if is_liquidity_sweep_long:
                     confirmed.append(f"SMC Liquidity Sweep 🎯 ({interval})")
                 strategy_text = " + ".join(confirmed)
+
+                trade_id = f"{symbol}_{int(time.time())}"
+                try:
+                    conn = sqlite3.connect(DB_NAME)
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    ''', (trade_id, symbol, "LONG", feature_dict['rsi'], feature_dict['spread_pct'],
+                          feature_dict['vol_ratio'], feature_dict['lower_wick_ratio'],
+                          feature_dict['upper_wick_ratio'], feature_dict['trend_code']))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    LOGGER.error(f"❌ Error inserting trade feature to DB: {e}")
+
                 return {
+                    "trade_id": trade_id,
                     "strategy": strategy_text,
                     "direction": "LONG 🟢",
                     "entry_price": entry_price,
@@ -514,6 +588,7 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                     "tp3": round(entry_price + (risk * 7), 5),
                     "sma7": round(sma7, 5),
                     "rsi": rsi,
+                    "ai_score": round(win_probability * 100, 1),
                     "trend": trend,
                     "candle_time": closed_klines[-1][0]
                 }
@@ -550,6 +625,12 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         if rsi < 32.0:
             return None
 
+        # ارزیابی توسط هوش مصنوعی
+        win_probability = ai_engine.predict_signal_quality(feature_dict)
+        if win_probability < 0.60:
+            LOGGER.info(f"🤖 AI Filter Rejected SHORT signal for {symbol} (Score: {win_probability*100:.1f}%)")
+            return None
+
         entry_price = c_close
         price_diff_percent = ((entry_price - current_live_price) / entry_price) * 100
         if price_diff_percent > MAX_SLIPPAGE_PERCENT:
@@ -569,7 +650,23 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                 if is_liquidity_sweep_short:
                     confirmed.append(f"SMC Liquidity Sweep 🎯 ({interval})")
                 strategy_text = " + ".join(confirmed)
+
+                trade_id = f"{symbol}_{int(time.time())}"
+                try:
+                    conn = sqlite3.connect(DB_NAME)
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    ''', (trade_id, symbol, "SHORT", feature_dict['rsi'], feature_dict['spread_pct'],
+                          feature_dict['vol_ratio'], feature_dict['lower_wick_ratio'],
+                          feature_dict['upper_wick_ratio'], feature_dict['trend_code']))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    LOGGER.error(f"❌ Error inserting trade feature to DB: {e}")
+
                 return {
+                    "trade_id": trade_id,
                     "strategy": strategy_text,
                     "direction": "SHORT 🔴",
                     "entry_price": entry_price,
@@ -580,15 +677,15 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                     "tp3": round(entry_price - (risk * 7), 5),
                     "sma7": round(sma7, 5),
                     "rsi": rsi,
+                    "ai_score": round(win_probability * 100, 1),
                     "trend": trend,
                     "candle_time": closed_klines[-1][0]
                 }
 
     return None
 
-
 # ---------------------------------------------------------
-# ۹. تعقیب پوزیشن‌ها
+# ۹. تعقیب پوزیشن‌ها و یادگیری از نتیجه
 # ---------------------------------------------------------
 async def track_active_trades(session, bot):
     if not active_trades:
@@ -614,12 +711,14 @@ async def track_active_trades(session, bot):
                     msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["sl_hits"] += 1
+                    update_trade_outcome(trade["db_id"], 0)
                     del active_trades[trade_id]
 
                 elif current_price >= trade["tp3"] and not trade.get("tp3_hit"):
                     msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp3_hits"] += 1
+                    update_trade_outcome(trade["db_id"], 1)
                     del active_trades[trade_id]
 
                 elif current_price >= trade["tp2"] and not trade.get("tp2_hit"):
@@ -639,12 +738,14 @@ async def track_active_trades(session, bot):
                     msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["sl_hits"] += 1
+                    update_trade_outcome(trade["db_id"], 0)
                     del active_trades[trade_id]
 
                 elif current_price <= trade["tp3"] and not trade.get("tp3_hit"):
                     msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp3_hits"] += 1
+                    update_trade_outcome(trade["db_id"], 1)
                     del active_trades[trade_id]
 
                 elif current_price <= trade["tp2"] and not trade.get("tp2_hit"):
@@ -659,7 +760,6 @@ async def track_active_trades(session, bot):
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp1_hits"] += 1
 
-
 # ---------------------------------------------------------
 # ۱۰. ارسال تلگرام و دستورات
 # ---------------------------------------------------------
@@ -673,9 +773,7 @@ async def send_telegram_message(bot, chat_id, text, reply_markup=None, retries=3
                 LOGGER.error(f"Telegram error after {retries} retries: {e}")
                 return False
             wait = 2 ** i
-            LOGGER.warning(f"Telegram send failed (attempt {i+1}/{retries}), retrying in {wait}s...")
             await asyncio.sleep(wait)
-
 
 async def telegram_command_listener(bot):
     last_update_id = 0
@@ -720,15 +818,14 @@ async def telegram_command_listener(bot):
                         global BTC_VOLATILITY_PAUSE_UNTIL
                         BTC_VOLATILITY_PAUSE_UNTIL = 0
                         await send_telegram_message(bot, chat_id, "⏸️ **Volatility pause deactivated.**\n✅ Bot is now active.")
-                        LOGGER.info("🟢 Volatility pause manually deactivated via /pause command")
 
                     elif cmd == "/debug":
                         msg = (
                             "🔍 **Debug Info:**\n\n"
                             f"🌐 BTC Trend: `{GLOBAL_BTC_TREND}`\n"
                             f"⏸️ Volatility Pause: `{'YES' if time.time() < BTC_VOLATILITY_PAUSE_UNTIL else 'NO'}`\n"
+                            f"🤖 AI Model Trained: `{'YES' if ai_engine.is_trained else 'NO (Collecting Data)'}`\n"
                             f"📊 Active Trades: `{len(active_trades)}`\n"
-                            f"📨 Sent Alerts: `{len(sent_alerts)}`\n"
                             f"💾 Cached Symbols: `{len(_symbol_cache['symbols'])}`"
                         )
                         await send_telegram_message(bot, chat_id, msg)
@@ -743,11 +840,9 @@ async def telegram_command_listener(bot):
                             "▫️ `/help` : راهنما"
                         )
                         await send_telegram_message(bot, chat_id, msg)
-
         except Exception as e:
             LOGGER.error(f"Command Listener Error: {e}")
         await asyncio.sleep(2)
-
 
 def cleanup_old_alerts():
     now = time.time()
@@ -755,10 +850,21 @@ def cleanup_old_alerts():
     for k in expired:
         del sent_alerts[k]
 
+# ---------------------------------------------------------
+# ۱۱. اسکنر اصلی و وب‌سرور Render
+# ---------------------------------------------------------
+async def handle_health_check(request):
+    return web.Response(text="Trading Bot AI service is live & active!")
 
-# ---------------------------------------------------------
-# ۱۱. اسکنر اصلی
-# ---------------------------------------------------------
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    LOGGER.info(f"🌐 Web Server listening on port {PORT}")
+
 async def scanner_task():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     try:
@@ -783,12 +889,12 @@ async def scanner_task():
                     btc_counter = 0
 
                 await track_active_trades(session, bot)
+                cleanup_old_alerts()
 
                 for symbol in symbols:
                     if symbol in ["ANTHROPICUSDT", "ANTHRCUSDT"]:
-                        ok, prices = await cross_check_price(session, symbol)
+                        ok, _ = await cross_check_price(session, symbol)
                         if not ok:
-                            LOGGER.error(f"🚫 Skipping {symbol} due to price mismatch")
                             continue
 
                     klines_4h = await fetch_klines_with_failover(session, symbol, "4h")
@@ -800,73 +906,61 @@ async def scanner_task():
                         if not klines:
                             continue
 
-                        signal = analyze_market_signal(
-                            klines=klines,
-                            symbol=symbol,
-                            interval=interval,
-                            htf_supports=htf_supports,
-                            htf_resistances=htf_resistances,
-                            max_sl_percent=MAX_SL_PERCENT
-                        )
-
+                        signal = analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, MAX_SL_PERCENT)
                         if signal:
-                            alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}"
-                            if alert_id not in sent_alerts:
-                                sent_alerts[alert_id] = time.time()
-                                async with active_trades_lock:
-                                    active_trades[alert_id] = {**signal, "symbol": symbol}
-                                STATS["total_signals"] += 1
+                            alert_key = f"{symbol}_{interval}_{signal['candle_time']}"
+                            if alert_key in sent_alerts:
+                                continue
 
-                                tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
-                                keyboard = InlineKeyboardMarkup([
-                                    [InlineKeyboardButton("📊 مشاهده چارت در TradingView", url=tv_url)]
-                                ])
+                            sent_alerts[alert_key] = time.time()
+                            STATS["total_signals"] += 1
 
-                                msg = (
-                                    f"🎯 **High-Precision Signal Detected!**\n\n"
-                                    f"⚙️ **Strategy:** `{signal['strategy']}`\n"
-                                    f"🪙 **Coin:** `#{symbol}` | **Timeframe:** `{interval}`\n"
-                                    f"🚦 **Direction:** {signal['direction']}\n"
-                                    f"📈 **Market Trend:** `{signal['trend']}`\n"
-                                    f"🌐 **BTC Trend:** `{GLOBAL_BTC_TREND}`\n"
-                                    f"📊 **RSI (14):** `{signal['rsi']}`\n\n"
-                                    f"📍 **Entry:** `{signal['entry_price']}`\n"
-                                    f"🛡️ **Stop Loss:** `{signal['stop_loss']}` (`{signal['sl_percent']}% Risk`)\n\n"
-                                    f"🎯 **Take Profit Targets:**\n"
-                                    f"🔹 **TP1 (1:2):** `{signal['tp1']}`\n"
-                                    f"🔹 **TP2 (1:5):** `{signal['tp2']}`\n"
-                                    f"🔹 **TP3 (1:7):** `{signal['tp3']}`\n\n"
-                                    f"📉 **SMA 7:** `{signal['sma7']}`"
-                                )
-                                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg, reply_markup=keyboard)
+                            msg = (
+                                f"🚨 **NEW TRADING SIGNAL** 🚨\n\n"
+                                f"🪙 **Symbol:** `#{symbol}`\n"
+                                f"📊 **Direction:** `{signal['direction']}`\n"
+                                f"🎯 **Strategy:** `{signal['strategy']}`\n"
+                                f"🤖 **AI Score:** `{signal['ai_score']}%` Confidence\n\n"
+                                f"💵 **Entry Price:** `{signal['entry_price']}`\n"
+                                f"🛑 **Stop Loss:** `{signal['stop_loss']}` (-{signal['sl_percent']}%)\n\n"
+                                f"🎯 **TP1:** `{signal['tp1']}`\n"
+                                f"🚀 **TP2:** `{signal['tp2']}`\n"
+                                f"🔥 **TP3:** `{signal['tp3']}`\n\n"
+                                f"📈 **RSI:** `{signal['rsi']}` | Trend: `{signal['trend']}`"
+                            )
 
-                        await asyncio.sleep(0.02)
+                            await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
 
-                cleanup_old_alerts()
-                symbols = await get_all_usdt_symbols_cached(session)
-                await asyncio.sleep(5)
+                            trade_key = f"{symbol}_{interval}"
+                            async with active_trades_lock:
+                                active_trades[trade_key] = {
+                                    "symbol": symbol,
+                                    "direction": signal["direction"],
+                                    "entry_price": signal["entry_price"],
+                                    "stop_loss": signal["stop_loss"],
+                                    "sl_percent": signal["sl_percent"],
+                                    "tp1": signal["tp1"],
+                                    "tp2": signal["tp2"],
+                                    "tp3": signal["tp3"],
+                                    "db_id": signal["trade_id"],
+                                    "tp1_hit": False,
+                                    "tp2_hit": False,
+                                    "tp3_hit": False
+                                }
+
+                        await asyncio.sleep(0.05)
+
+                await asyncio.sleep(10)
 
             except Exception as e:
-                LOGGER.error(f"❌ Main loop error: {e}")
-                await asyncio.sleep(15)
-
-
-async def health_check_handler(request):
-    return web.Response(text="Bot Running Fresh & Fast", status=200)
-
+                LOGGER.error(f"Error in scanner loop: {e}")
+                await asyncio.sleep(5)
 
 async def main():
-    app = web.Application()
-    app.router.add_get("/", health_check_handler)
-    app.router.add_get("/health", health_check_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    asyncio.create_task(scanner_task())
-    await asyncio.Event().wait()
-
+    init_db()
+    ai_engine.retrain_model()
+    await start_web_server()
+    await scanner_task()
 
 if __name__ == "__main__":
     asyncio.run(main())
