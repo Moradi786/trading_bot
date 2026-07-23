@@ -155,50 +155,43 @@ def validate_klines(klines, symbol):
         LOGGER.warning(f"⚠️ [{symbol}] Invalid kline format: {e}")
         return False, "invalid_format"
 
-    # بررسی ناگهانی تغییر قیمت (بیش از 50%)
     if prev_close > 0:
         change = abs(last_close - prev_close) / prev_close
         if change > 0.5:
-            LOGGER.warning(f"⚠️ [{symbol}] Suspicious price jump: {change*100:.1f}% | Last: {last_close}, Prev: {prev_close}")
+            LOGGER.warning(f"⚠️ [{symbol}] Suspicious price jump: {change*100:.1f}%")
             return False, "suspicious_jump"
 
-    # بررسی محدوده قیمت معقول
     if last_close > 1000000 or last_close < 0.000001:
         LOGGER.warning(f"⚠️ [{symbol}] Suspicious price range: {last_close}")
         return False, "suspicious_range"
 
-    # بررسی صفر یا منفی بودن قیمت
     if last_close <= 0:
         LOGGER.warning(f"⚠️ [{symbol}] Zero or negative price: {last_close}")
         return False, "zero_price"
 
-    # بررش تداوم قیمت‌ها (اختلاف زیاد بین کندل‌ها)
     closes = [float(k[4]) for k in klines[-10:] if len(k) >= 5]
     if len(closes) >= 2:
         avg_close = sum(closes) / len(closes)
         max_dev = max(abs(c - avg_close) for c in closes) / avg_close if avg_close > 0 else 0
-        if max_dev > 0.8:  # اگر یک کندل 80% از میانگین فاصله داشت
-            LOGGER.warning(f"⚠️ [{symbol}] High price variance detected: {max_dev*100:.1f}%")
+        if max_dev > 0.8:
+            LOGGER.warning(f"⚠️ [{symbol}] High price variance: {max_dev*100:.1f}%")
             return False, "high_variance"
 
     return True, "ok"
 
 
 async def cross_check_price(session, symbol):
-    """مقایسه قیمت بین Binance و Bybit برای تشخیص داده اشتباه"""
+    """مقایسه قیمت بین Binance و Bybit"""
     prices = {}
-
-    # Binance
     try:
         url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
         async with session.get(url, timeout=5) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 prices["Binance"] = float(data.get("price", 0))
-    except Exception as e:
-        LOGGER.debug(f"[{symbol}] Binance price check failed: {e}")
+    except Exception:
+        pass
 
-    # Bybit
     try:
         url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
         async with session.get(url, timeout=5) as resp:
@@ -208,18 +201,16 @@ async def cross_check_price(session, symbol):
                     tickers = data.get("result", {}).get("list", [])
                     if tickers:
                         prices["Bybit"] = float(tickers[0].get("lastPrice", 0))
-    except Exception as e:
-        LOGGER.debug(f"[{symbol}] Bybit price check failed: {e}")
+    except Exception:
+        pass
 
     if len(prices) >= 2:
         vals = [v for v in prices.values() if v > 0]
         if len(vals) >= 2:
             max_diff = max(vals) / min(vals) - 1
-            if max_diff > 0.05:  # اختلاف بیش از 5%
+            if max_diff > 0.05:
                 LOGGER.error(f"❌ [{symbol}] Price mismatch: {prices} | Diff: {max_diff*100:.1f}%")
                 return False, prices
-            LOGGER.info(f"✅ [{symbol}] Price cross-check OK: {prices}")
-
     return True, prices
 
 
@@ -322,7 +313,6 @@ async def fetch_klines_with_failover(session, symbol, interval):
                     data = await resp.json()
                     klines = ex["parser"](data)
                     if klines and len(klines) >= 50:
-                        # اعتبارسنجی داده‌ها
                         valid, reason = validate_klines(klines, symbol)
                         if valid:
                             return klines
@@ -395,7 +385,7 @@ async def get_all_usdt_symbols_cached(session):
 
 
 # ---------------------------------------------------------
-# ۸. تحلیل تکنیکال با لاگ دقیق
+# ۸. تحلیل تکنیکال — کندل ستاپ اصلاح شده
 # ---------------------------------------------------------
 def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=2.0):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
@@ -457,34 +447,17 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     is_near_htf_support = any(range_low >= supp * 0.985 and range_low <= supp * 1.025 for supp in htf_supports) if htf_supports else True
     is_near_htf_resistance = any(range_high <= res * 1.015 and range_high >= res * 0.975 for res in htf_resistances) if htf_resistances else True
 
-    # ==================== LONG ====================
+    # ==================== LONG SETUP ====================
     is_green_candle = (c_close > c_open)
     is_valid_size = (total_range >= 0.5 * atr)
-    is_strong_lower_wick = (lower_wick >= 1.8 * body) and (lower_wick / total_range >= 0.45)
-    has_minimal_upper_wick = (upper_wick <= 0.25 * total_range)
-    is_sma7_bounce = (c_low <= sma7) and (sma7 < body_bottom)
-
-    # لاگ دقیق برای دیباگ
-    debug_info = {
-        "symbol": symbol,
-        "interval": interval,
-        "price": c_close,
-        "sma7": sma7,
-        "trend": trend,
-        "rsi": rsi,
-        "is_green": is_green_candle,
-        "body": body,
-        "lower_wick": lower_wick,
-        "upper_wick": upper_wick,
-        "total_range": total_range,
-        "atr": atr,
-        "is_sma7_bounce": is_sma7_bounce,
-        "c_low": c_low,
-        "body_bottom": body_bottom,
-        "volume_spike": is_volume_spike,
-        "c_vol": c_vol,
-        "avg_vol": avg_vol_20
-    }
+    # سایه پایین قوی: حداقل ۲ برابر بدنه و حداقل ۵۰٪ محدوده کل
+    is_strong_lower_wick = (lower_wick >= 2.0 * body) and (lower_wick / total_range >= 0.50)
+    # سایه بالا خیلی کوتاه: حداکثر ۲۰٪ محدوده کل
+    has_minimal_upper_wick = (upper_wick <= 0.20 * total_range)
+    # SMA7 در ناحیه سایه پایین (بین Low و body_top)
+    is_sma7_bounce = (c_low <= sma7) and (sma7 <= body_top)
+    # کندل باید از SMA7 برگشته باشد به بالا
+    is_bounce_confirmed = c_close > sma7
 
     is_candle_setup_long = (
         (trend != "BEARISH") and
@@ -493,11 +466,9 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         is_strong_lower_wick and
         has_minimal_upper_wick and
         is_sma7_bounce and
+        is_bounce_confirmed and
         is_volume_spike
     )
-
-    if is_candle_setup_long:
-        LOGGER.info(f"🔍 [DEBUG LONG SETUP] {debug_info}")
 
     is_htf_range_breakout_long = (
         is_in_range and
@@ -547,28 +518,16 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                     "candle_time": closed_klines[-1][0]
                 }
 
-    # ==================== SHORT ====================
+    # ==================== SHORT SETUP ====================
     is_red_candle = (c_close < c_open)
-    is_strong_upper_wick = (upper_wick >= 1.8 * body) and (upper_wick / total_range >= 0.45)
-    has_minimal_lower_wick = (lower_wick <= 0.25 * total_range)
-    is_sma7_rejection = (c_high >= sma7) and (sma7 > body_top)
-
-    debug_info_short = {
-        "symbol": symbol,
-        "interval": interval,
-        "price": c_close,
-        "sma7": sma7,
-        "trend": trend,
-        "rsi": rsi,
-        "is_red": is_red_candle,
-        "body": body,
-        "upper_wick": upper_wick,
-        "lower_wick": lower_wick,
-        "is_sma7_rejection": is_sma7_rejection,
-        "c_high": c_high,
-        "body_top": body_top,
-        "volume_spike": is_volume_spike
-    }
+    # سایه بالا قوی: حداقل ۲ برابر بدنه و حداقل ۵۰٪ محدوده کل
+    is_strong_upper_wick = (upper_wick >= 2.0 * body) and (upper_wick / total_range >= 0.50)
+    # سایه پایین خیلی کوتاه: حداکثر ۲۰٪ محدوده کل
+    has_minimal_lower_wick = (lower_wick <= 0.20 * total_range)
+    # SMA7 در ناحیه سایه بالا (بین body_bottom و High)
+    is_sma7_rejection = (c_high >= sma7) and (sma7 >= body_bottom)
+    # کندل باید از SMA7 برگشته باشد به پایین
+    is_rejection_confirmed = c_close < sma7
 
     is_candle_setup_short = (
         (trend != "BULLISH") and
@@ -577,11 +536,9 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         is_strong_upper_wick and
         has_minimal_lower_wick and
         is_sma7_rejection and
+        is_rejection_confirmed and
         is_volume_spike
     )
-
-    if is_candle_setup_short:
-        LOGGER.info(f"🔍 [DEBUG SHORT SETUP] {debug_info_short}")
 
     is_htf_range_breakout_short = (
         is_in_range and
@@ -764,7 +721,6 @@ async def telegram_command_listener(bot):
                                 await send_telegram_message(bot, chat_id, msg)
 
                     elif cmd == "/debug":
-                        # دستور جدید برای دیباگ
                         msg = (
                             "🔍 **Debug Info:**\n\n"
                             f"🌐 BTC Trend: `{GLOBAL_BTC_TREND}`\n"
@@ -826,7 +782,6 @@ async def scanner_task():
                 await track_active_trades(session, bot)
 
                 for symbol in symbols:
-                    # Cross-check قیمت برای نمادهای مشکوک
                     if symbol in ["ANTHROPICUSDT", "ANTHRCUSDT"]:
                         ok, prices = await cross_check_price(session, symbol)
                         if not ok:
