@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+import random
 import aiohttp
 from aiohttp import web
 from telegram import Bot
@@ -36,13 +37,13 @@ except ValueError:
 
 TIMEFRAMES = ["15m", "1h", "4h"]
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 30.0
+MIN_BTC_VOLUME = 50.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین (تغییر یافت به ۵۰)
 sent_alerts = {}
 ALERT_TTL = 86400
 
 
 # ---------------------------------------------------------
-# ۲. تعریف صرافی‌ها
+# ۲. تعریف صرافی‌ها با Endpoint
 # ---------------------------------------------------------
 EXCHANGES = [
     {
@@ -111,6 +112,9 @@ EXCHANGES = [
 ]
 
 
+# ---------------------------------------------------------
+# ۳. پارسرها
+# ---------------------------------------------------------
 def _parse_bybit(data):
     try:
         if data.get("retCode") != 0:
@@ -176,7 +180,7 @@ def _parse_coinbase(data):
 
 
 # ---------------------------------------------------------
-# ۳. دریافت کندل با Failover
+# ۴. دریافت کندل با Failover
 # ---------------------------------------------------------
 async def fetch_klines_with_failover(session, symbol, interval):
     sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
@@ -196,11 +200,6 @@ async def fetch_klines_with_failover(session, symbol, interval):
                     klines = ex["parser"](data)
                     if klines and len(klines) >= 50:
                         return klines
-                elif resp.status == 429:
-                    LOGGER.warning(f"⏱️ {ex['name']} Rate Limit برای {symbol}")
-
-        except asyncio.TimeoutError:
-            pass
         except Exception:
             pass
 
@@ -210,7 +209,7 @@ async def fetch_klines_with_failover(session, symbol, interval):
 
 
 # ---------------------------------------------------------
-# ۴. دریافت لیست نمادها
+# ۵. دریافت لیست نمادها و فیلتر حجم بالای ۵۰ بیت‌کوین
 # ---------------------------------------------------------
 async def get_all_usdt_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -218,7 +217,7 @@ async def get_all_usdt_symbols(session):
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-
+                
                 btc_price = 60000.0
                 for item in data:
                     if item.get("symbol") == "BTCUSDT":
@@ -235,15 +234,15 @@ async def get_all_usdt_symbols(session):
                     if symbol.endswith("USDT") and quote_volume >= min_usdt_volume:
                         valid_symbols.append(symbol)
 
-                LOGGER.info(f"✅ {len(valid_symbols)} نماد با حجم بالای {MIN_BTC_VOLUME} BTC انتخاب شدند")
+                LOGGER.info(f"✅ {len(valid_symbols)} نماد با حجم بالای 50 BTC انتخاب شدند")
                 return valid_symbols
     except Exception as e:
-        LOGGER.error(f"Error fetching symbols: {e}")
+        LOGGER.error(f"Error fetching symbols & volume filter: {e}")
     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XLMUSDT", "ZECUSDT"]
 
 
 # ---------------------------------------------------------
-# ۵. توابع تئوری داو
+# ۶. توابع تئوری داو و مدیریت حافظه
 # ---------------------------------------------------------
 def find_pivots(highs, lows, left_right=3):
     pivot_highs = []
@@ -285,16 +284,9 @@ def cleanup_old_alerts():
 
 
 # ---------------------------------------------------------
-# ۶. الگوریتم اصلی کندل ستاپ (پین‌بار کلاسیک - سخت‌گیرانه)
+# ۷. تحلیل تکنیکال (کندل ستاپ + استراتژی بریک‌اوت)
 # ---------------------------------------------------------
-def analyze_candle_setup(klines, max_sl_percent=2.0):
-    """
-    تشخیص پین‌بار کلاسیک با فیلترهای بصری سخت‌گیرانه:
-    - بدنه کوچک ولی قابل‌مشاهده (نه دوجی)
-    - فتیله اصلی خیلی بلند و غالب
-    - فتیله مخالف ناچیز
-    - SMA7 داخل فتیله اصلی
-    """
+def analyze_market_signal(klines, max_sl_percent=2.0):
     if len(klines) < 50:
         return None
 
@@ -302,6 +294,7 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     highs = [float(k[2]) for k in klines]
     lows = [float(k[3]) for k in klines]
     closes = [float(k[4]) for k in klines]
+    volumes = [float(k[5]) for k in klines]
 
     sma7 = sum(closes[-8:-1]) / 7
 
@@ -309,10 +302,11 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     c_high = highs[-2]
     c_low = lows[-2]
     c_close = closes[-2]
+    c_vol = volumes[-2]
 
     body_bottom = min(c_open, c_close)
     body_top = max(c_open, c_close)
-    body = body_top - body_bottom
+    body = abs(c_close - c_open)
     total_range = c_high - c_low
 
     if total_range == 0 or body == 0:
@@ -320,18 +314,7 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
 
     upper_wick = c_high - body_top
     lower_wick = body_bottom - c_low
-    body_ratio = body / total_range
 
-    # 🛑 فیلتر ۱: SMA7 نباید داخل بدنه باشه
-    if body_bottom <= sma7 <= body_top:
-        return None
-
-    # 🛑 فیلتر ۲: بدنه باید قابل‌مشاهده باشه ولی کوچک
-    # بین ۱۰٪ تا ۳۰٪ رنج کندل (دوجی‌ها رد می‌شن، بدنه بزرگ هم رد می‌شه)
-    if not (0.10 <= body_ratio <= 0.30):
-        return None
-
-    # محاسبه سطوح حمایت/مقاومت و روند
     pivot_highs, pivot_lows = find_pivots(highs[:-1], lows[:-1])
     trend = check_dow_theory_trend(pivot_highs, pivot_lows)
 
@@ -339,88 +322,119 @@ def analyze_candle_setup(klines, max_sl_percent=2.0):
     latest_support = min([pl[1] for pl in pivot_lows[-5:]]) if pivot_lows else c_low
 
     # ----------------------------------------------------
-    # 🟢 LONG Setup (Bullish Pin Bar)
+    # ۱. تحلیل استراتژی کندل ستاپ (Candle Setup Strategy)
     # ----------------------------------------------------
-    # شرط ۱: فتیله پایینی غالب (حداقل ۶۰٪ کل رنج)
-    wick_dominant = lower_wick / total_range >= 0.60
-    # شرط ۲: فتیله پایینی حداقل ۳ برابر بدنه
-    wick_long = lower_wick >= 3.0 * body
-    # شرط ۳: فتیله بالایی ناچیز (حداکثر ۱۵٪ بدنه)
-    opposite_small = upper_wick <= 0.15 * body
-    # شرط ۴: SMA7 دقیقاً داخل فتیله پایینی
-    sma7_in_wick = c_low <= sma7 < body_bottom
+    is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
+    body_gt_upper = (body >= 3 * upper_wick)
+    sma7_only_in_lower_wick = (c_low <= sma7 < body_bottom)
+    dow_long_valid = (trend == "BULLISH") or (c_close >= latest_resistance)
 
-    if wick_dominant and wick_long and opposite_small and sma7_in_wick:
-        dow_long_valid = (trend == "BULLISH") or (c_close >= latest_resistance)
-        if not dow_long_valid:
-            return None
-
+    if is_long_wick and body_gt_upper and sma7_only_in_lower_wick and dow_long_valid:
         entry_price = c_close
         stop_loss = c_low
         risk = entry_price - stop_loss
 
-        if risk <= 0:
-            return None
+        if risk > 0:
+            sl_percent = (risk / entry_price) * 100
+            if sl_percent <= max_sl_percent:
+                return {
+                    "strategy": "Candle Setup 📌",
+                    "direction": "LONG 🟢",
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "sl_percent": round(sl_percent, 2),
+                    "tp1": round(entry_price + (risk * 2), 5),
+                    "tp2": round(entry_price + (risk * 5), 5),
+                    "tp3": round(entry_price + (risk * 7), 5),
+                    "sma7": round(sma7, 5),
+                    "trend": trend,
+                    "candle_time": klines[-2][0]
+                }
 
-        sl_percent = (risk / entry_price) * 100
-        if sl_percent > max_sl_percent:
-            return None
+    is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
+    body_gt_lower = (body >= 3 * lower_wick)
+    sma7_only_in_upper_wick = (body_top < sma7 <= c_high)
+    dow_short_valid = (trend == "BEARISH") or (c_close <= latest_support)
 
-        return {
-            "direction": "LONG 🟢",
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "sl_percent": round(sl_percent, 2),
-            "tp1": round(entry_price + (risk * 2), 5),
-            "tp2": round(entry_price + (risk * 5), 5),
-            "tp3": round(entry_price + (risk * 7), 5),
-            "sma7": round(sma7, 5),
-            "trend": trend,
-            "candle_time": klines[-2][0]
-        }
-
-    # ----------------------------------------------------
-    # 🔴 SHORT Setup (Bearish Pin Bar)
-    # ----------------------------------------------------
-    wick_dominant = upper_wick / total_range >= 0.60
-    wick_long = upper_wick >= 3.0 * body
-    opposite_small = lower_wick <= 0.15 * body
-    sma7_in_wick = body_top < sma7 <= c_high
-
-    if wick_dominant and wick_long and opposite_small and sma7_in_wick:
-        dow_short_valid = (trend == "BEARISH") or (c_close <= latest_support)
-        if not dow_short_valid:
-            return None
-
+    if is_short_wick and body_gt_lower and sma7_only_in_upper_wick and dow_short_valid:
         entry_price = c_close
         stop_loss = c_high
         risk = stop_loss - entry_price
 
-        if risk <= 0:
-            return None
+        if risk > 0:
+            sl_percent = (risk / entry_price) * 100
+            if sl_percent <= max_sl_percent:
+                return {
+                    "strategy": "Candle Setup 📌",
+                    "direction": "SHORT 🔴",
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "sl_percent": round(sl_percent, 2),
+                    "tp1": round(entry_price - (risk * 2), 5),
+                    "tp2": round(entry_price - (risk * 5), 5),
+                    "tp3": round(entry_price - (risk * 7), 5),
+                    "sma7": round(sma7, 5),
+                    "trend": trend,
+                    "candle_time": klines[-2][0]
+                }
 
-        sl_percent = (risk / entry_price) * 100
-        if sl_percent > max_sl_percent:
-            return None
+    # ----------------------------------------------------
+    # ۲. تحلیل استراتژی بریک‌اوت (Breakout Strategy)
+    # ----------------------------------------------------
+    avg_volume_20 = sum(volumes[-22:-2]) / 20 if len(volumes) >= 22 else 0
+    is_volume_confirmed = (c_vol >= 1.5 * avg_volume_20) if avg_volume_20 > 0 else False
 
-        return {
-            "direction": "SHORT 🔴",
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "sl_percent": round(sl_percent, 2),
-            "tp1": round(entry_price - (risk * 2), 5),
-            "tp2": round(entry_price - (risk * 5), 5),
-            "tp3": round(entry_price - (risk * 7), 5),
-            "sma7": round(sma7, 5),
-            "trend": trend,
-            "candle_time": klines[-2][0]
-        }
+    # بریک‌اوت صعودی (LONG Breakout)
+    if c_close > latest_resistance and c_close > c_open and is_volume_confirmed:
+        entry_price = c_close
+        stop_loss = latest_resistance * 0.995
+        risk = entry_price - stop_loss
+
+        if risk > 0:
+            sl_percent = (risk / entry_price) * 100
+            if sl_percent <= max_sl_percent:
+                return {
+                    "strategy": "Breakout Trading ⚡",
+                    "direction": "LONG 🟢",
+                    "entry_price": entry_price,
+                    "stop_loss": round(stop_loss, 5),
+                    "sl_percent": round(sl_percent, 2),
+                    "tp1": round(entry_price + (risk * 2), 5),
+                    "tp2": round(entry_price + (risk * 5), 5),
+                    "tp3": round(entry_price + (risk * 7), 5),
+                    "sma7": round(sma7, 5),
+                    "trend": trend,
+                    "candle_time": klines[-2][0]
+                }
+
+    # بریک‌اوت نزولی (SHORT Breakout)
+    if c_close < latest_support and c_close < c_open and is_volume_confirmed:
+        entry_price = c_close
+        stop_loss = latest_support * 1.005
+        risk = stop_loss - entry_price
+
+        if risk > 0:
+            sl_percent = (risk / entry_price) * 100
+            if sl_percent <= max_sl_percent:
+                return {
+                    "strategy": "Breakout Trading ⚡",
+                    "direction": "SHORT 🔴",
+                    "entry_price": entry_price,
+                    "stop_loss": round(stop_loss, 5),
+                    "sl_percent": round(sl_percent, 2),
+                    "tp1": round(entry_price - (risk * 2), 5),
+                    "tp2": round(entry_price - (risk * 5), 5),
+                    "tp3": round(entry_price - (risk * 7), 5),
+                    "sma7": round(sma7, 5),
+                    "trend": trend,
+                    "candle_time": klines[-2][0]
+                }
 
     return None
 
 
 # ---------------------------------------------------------
-# ۷. ارسال پیام تلگرام
+# ۸. ارسال پیام تلگرام
 # ---------------------------------------------------------
 async def send_telegram_message(bot, chat_id, text):
     try:
@@ -435,42 +449,32 @@ async def send_telegram_message(bot, chat_id, text):
         err = str(e).lower()
         if "chat not found" in err:
             LOGGER.error(f"❌ Chat not found: {chat_id}")
-            LOGGER.error("   → اگر گروه/کاناله، بوت رو عضو کن")
-            LOGGER.error("   → اگر کاربر خصوصیه، اول /start بزن")
-        elif "can't parse entities" in err or "parse" in err:
-            LOGGER.warning("⚠️ Markdown خراب بود، بدون فرمت ارسال می‌شه")
+        elif "parse" in err:
             try:
                 await bot.send_message(chat_id=chat_id, text=text)
                 return True
             except Exception as e2:
-                LOGGER.error(f"❌ ارسال بدون فرمت هم ناموفق: {e2}")
-        else:
-            LOGGER.error(f"❌ BadRequest: {e}")
+                LOGGER.error(f"❌ Fail without format: {e2}")
         return False
-
-    except Forbidden as e:
-        LOGGER.error(f"🚫 Forbidden: {e} (کاربر بوت رو بلاک کرده)")
-        return False
-
     except Exception as e:
-        LOGGER.error(f"❌ خطای تلگرام: {e}")
+        LOGGER.error(f"❌ Telegram error: {e}")
         return False
 
 
 # ---------------------------------------------------------
-# ۸. چرخه اصلی اسکن
+# ۹. چرخه اصلی اسکن
 # ---------------------------------------------------------
 async def scanner_task():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     try:
         me = await bot.get_me()
-        LOGGER.info(f"🤖 بوت متصل شد: @{me.username}")
+        LOGGER.info(f"🤖 Bot connected: @{me.username}")
     except Exception as e:
-        LOGGER.error(f"❌ خطا در اتصال تلگرام: {e}")
+        LOGGER.error(f"❌ Telegram Auth Error: {e}")
         return
 
-    LOGGER.info("✅ Starting Pin Bar Scanner (Strict Mode)...")
+    LOGGER.info("✅ Starting Multi-Exchange Scanner...")
 
     async with aiohttp.ClientSession() as session:
         symbols = await get_all_usdt_symbols(session)
@@ -483,19 +487,20 @@ async def scanner_task():
                         if not klines:
                             continue
 
-                        signal = analyze_candle_setup(klines, max_sl_percent=MAX_SL_PERCENT)
+                        signal = analyze_market_signal(klines, max_sl_percent=MAX_SL_PERCENT)
                         if signal:
-                            alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}"
+                            alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}_{signal['strategy']}"
                             if alert_id not in sent_alerts:
                                 sent_alerts[alert_id] = time.time()
 
                                 msg = (
-                                    f"🎯 **Pin Bar Setup Found!**\n\n"
+                                    f"🎯 **New Signal Detected!**\n\n"
+                                    f"⚙️ **Strategy:** `{signal['strategy']}`\n"
                                     f"🪙 **Coin:** `#{symbol}` | **Timeframe:** `{interval}`\n"
                                     f"🚦 **Direction:** {signal['direction']}\n"
                                     f"📈 **Dow Market Trend:** `{signal['trend']}`\n\n"
-                                    f"📍 **Entry (Next Candle Open):** `{signal['entry_price']}`\n"
-                                    f"🛡️ **Stop Loss (Behind Wick):** `{signal['stop_loss']}` (`{signal['sl_percent']}% Risk`)\n\n"
+                                    f"📍 **Entry:** `{signal['entry_price']}`\n"
+                                    f"🛡️ **Stop Loss:** `{signal['stop_loss']}` (`{signal['sl_percent']}% Risk`)\n\n"
                                     f"🎯 **Take Profit Targets:**\n"
                                     f"🔹 **TP1 (R:R 1:2):** `{signal['tp1']}`\n"
                                     f"🔹 **TP2 (R:R 1:5):** `{signal['tp2']}`\n"
@@ -511,16 +516,16 @@ async def scanner_task():
                 await asyncio.sleep(15)
 
             except Exception as e:
-                LOGGER.error(f"❌ خطای حلقه اصلی: {e}")
+                LOGGER.error(f"❌ Main loop error: {e}")
                 await asyncio.sleep(30)
 
 
 # ---------------------------------------------------------
-# ۹. وب‌سرور سلامت
+# ۱۰. وب‌سرور سلامت
 # ---------------------------------------------------------
 async def health_check_handler(request):
     return web.Response(
-        text=f"Pin Bar Bot (Strict) running | Alerts: {len(sent_alerts)}",
+        text=f"Multi-Exchange Bot running | Alerts: {len(sent_alerts)}",
         status=200
     )
 
