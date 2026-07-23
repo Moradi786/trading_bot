@@ -2,4 +2,6 @@ python-telegram-bot
 libsql-client
 aiohttp
 python-dotenv
-
+pandas
+xgboost
+scikit-learn
