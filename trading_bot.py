@@ -542,7 +542,7 @@ async def track_active_trades(session, bot):
 
 
 # ---------------------------------------------------------
-# ۸. ارسال تلگرام و شنونده دستورات کاربران (/stats, /active)
+# ۸. ارسال تلگرام و شنونده هوشمند دستورات (پشتیبانی از گروه و پیوی)
 # ---------------------------------------------------------
 async def send_telegram_message(bot, chat_id, text, reply_markup=None):
     try:
@@ -554,7 +554,7 @@ async def send_telegram_message(bot, chat_id, text, reply_markup=None):
 
 
 async def telegram_command_listener(bot):
-    """پاسخگویی خودکار به دستورات کاربران در تلگرام"""
+    """پاسخگویی خودکار به دستورات کاربران در تلگرام (اصلاح شده برای گروه‌ها)"""
     last_update_id = 0
     while True:
         try:
@@ -562,7 +562,9 @@ async def telegram_command_listener(bot):
             for update in updates:
                 last_update_id = update.update_id
                 if update.message and update.message.text:
-                    cmd = update.message.text.strip()
+                    raw_text = update.message.text.strip()
+                    # حذف نام کاربری ربات از انتهای دستورات گروهی (/stats@bot_name -> /stats)
+                    cmd = raw_text.split('@')[0].lower()
                     chat_id = update.message.chat_id
 
                     if cmd == "/stats":
