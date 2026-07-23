@@ -35,18 +35,17 @@ except ValueError:
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 250.0          # حداقل حجم ۲۴ ساعته: بالای ۲۵۰ بیت‌کوین
-MAX_SIGNAL_AGE_SECONDS = 180  # حداکثر زمان مجاز ارسال سیگنال (۳ دقیقه)
-MAX_SLIPPAGE_PERCENT = 0.2    # حداکثر جابه‌جایی مجاز قیمت نسبت به Entry
+MIN_BTC_VOLUME = 250.0
+MAX_SIGNAL_AGE_SECONDS = 180
+MAX_SLIPPAGE_PERCENT = 0.2
 
 sent_alerts = {}
-active_trades = {}  # ذخیره پوزیشن‌های فعال جهت تعقیب TP/SL
-active_trades_lock = asyncio.Lock()  # Lock برای جلوگیری از Race Condition
+active_trades = {}
+active_trades_lock = asyncio.Lock()
 ALERT_TTL = 86400
 GLOBAL_BTC_TREND = "NEUTRAL"
-BTC_VOLATILITY_PAUSE_UNTIL = 0  # زمان توقف در صورت نوسان شدید BTC
+BTC_VOLATILITY_PAUSE_UNTIL = 0
 
-# آمار وین‌ریت
 STATS = {
     "total_signals": 0,
     "tp1_hits": 0,
@@ -55,15 +54,13 @@ STATS = {
     "sl_hits": 0
 }
 
-# کش نمادها
 _symbol_cache = {"symbols": [], "last_update": 0}
 
 
 # ---------------------------------------------------------
-# ۲. سیستم Rate Limiting
+# ۲. Rate Limiting
 # ---------------------------------------------------------
 class RateLimiter:
-    """Token Bucket Rate Limiter برای جلوگیری از Rate Limit API"""
     def __init__(self, rate=10, per=1):
         self.rate = rate
         self.per = per
@@ -84,14 +81,14 @@ class RateLimiter:
             else:
                 self.tokens -= 1
 
-# Rate Limiter برای هر صرافی
-binance_limiter = RateLimiter(rate=20, per=1)    # 20 req/sec
-bybit_limiter = RateLimiter(rate=10, per=1)      # 10 req/sec
-okx_limiter = RateLimiter(rate=10, per=1)        # 10 req/sec
+
+binance_limiter = RateLimiter(rate=20, per=1)
+bybit_limiter = RateLimiter(rate=10, per=1)
+okx_limiter = RateLimiter(rate=10, per=1)
 
 
 # ---------------------------------------------------------
-# ۳. تعریف صرافی‌ها
+# ۳. صرافی‌ها
 # ---------------------------------------------------------
 EXCHANGES = [
     {
@@ -126,11 +123,13 @@ EXCHANGES = [
 # ---------------------------------------------------------
 def _parse_bybit(data):
     try:
-        if data.get("retCode") != 0: return None
+        if data.get("retCode") != 0:
+            return None
         result = data.get("result", {}).get("list", [])
         return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(result)]
     except Exception:
         return None
+
 
 def _parse_okx(data):
     try:
@@ -141,13 +140,11 @@ def _parse_okx(data):
 
 
 # ---------------------------------------------------------
-# ۵. اندیکاتورها و محاسبات تکنیکال
+# ۵. اندیکاتورها
 # ---------------------------------------------------------
 def calculate_rsi(closes, period=14):
-    """RSI با Wilder's Smoothing (EMA) — سازگار با TradingView"""
     if len(closes) < period + 1:
         return 50.0
-
     gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i - 1]
@@ -158,11 +155,9 @@ def calculate_rsi(closes, period=14):
             gains.append(0.0)
             losses.append(abs(diff))
 
-    # میانگین اولیه با SMA
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    # Wilder's Smoothing (EMA)
     alpha = 1.0 / period
     for i in range(period, len(gains)):
         avg_gain = alpha * gains[i] + (1 - alpha) * avg_gain
@@ -185,7 +180,6 @@ def calculate_atr(highs, lows, closes, period=14):
             abs(lows[i] - closes[i - 1])
         )
         tr_list.append(tr)
-
     atr = sum(tr_list[:period]) / period
     for i in range(period, len(tr_list)):
         atr = (atr * (period - 1) + tr_list[i]) / period
@@ -199,11 +193,9 @@ def find_pivots(highs, lows, left_right=3):
         if all(highs[i] > highs[i - j] for j in range(1, left_right + 1)) and \
            all(highs[i] >= highs[i + j] for j in range(1, left_right + 1)):
             pivot_highs.append((i, highs[i]))
-
         if all(lows[i] < lows[i - j] for j in range(1, left_right + 1)) and \
            all(lows[i] <= lows[i + j] for j in range(1, left_right + 1)):
             pivot_lows.append((i, lows[i]))
-
     return pivot_highs, pivot_lows
 
 
@@ -212,7 +204,6 @@ def check_dow_theory_trend(pivot_highs, pivot_lows):
         return "NEUTRAL"
     last_high1, last_high2 = pivot_highs[-1][1], pivot_highs[-2][1]
     last_low1, last_low2 = pivot_lows[-1][1], pivot_lows[-2][1]
-
     if last_high1 > last_high2 and last_low1 > last_low2:
         return "BULLISH"
     elif last_high1 < last_high2 and last_low1 < last_low2:
@@ -233,13 +224,13 @@ def extract_htf_sr_levels(klines_4h, klines_1d):
 
 
 # ---------------------------------------------------------
-# ۶. دریافت داده‌ها و کنترل نوسان بیت‌کوین
+# ۶. دریافت داده‌ها
 # ---------------------------------------------------------
 async def fetch_klines_with_failover(session, symbol, interval):
     sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
     for ex in sorted_exchanges:
         try:
-            await ex["limiter"].acquire()  # Rate Limiting
+            await ex["limiter"].acquire()
             mapped_interval = ex["interval_map"].get(interval, interval)
             url = ex["url"].format(symbol=symbol, interval=mapped_interval)
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), headers={"User-Agent": "TradingBot/1.0"}) as resp:
@@ -269,10 +260,9 @@ async def update_btc_trend_and_volatility(session):
             b_open = float(klines_15m[-2][1])
             b_close = float(klines_15m[-2][4])
             change_pct = abs((b_close - b_open) / b_open) * 100
-            if change_pct >= 1.5:  # نوسان بالای ۱.۵٪ در ۱۵ دقیقه
-                BTC_VOLATILITY_PAUSE_UNTIL = time.time() + 1800  # توقف ۳۰ دقیقه‌ای
+            if change_pct >= 1.5:
+                BTC_VOLATILITY_PAUSE_UNTIL = time.time() + 1800
                 LOGGER.warning(f"⚠️ BTC Volatility Spike ({change_pct:.2f}%). Pausing signals for 30m.")
-
     except Exception as e:
         LOGGER.error(f"Error updating BTC status: {e}")
 
@@ -288,11 +278,9 @@ async def get_all_usdt_symbols(session):
                     if item.get("symbol") == "BTCUSDT":
                         btc_price = float(item.get("lastPrice", 0))
                         break
-
                 if btc_price is None or btc_price <= 0:
                     LOGGER.warning("⚠️ Could not fetch BTC price, using fallback list.")
                     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-
                 min_usdt_volume = MIN_BTC_VOLUME * btc_price
                 valid_symbols = []
                 for item in data:
@@ -300,7 +288,6 @@ async def get_all_usdt_symbols(session):
                     quote_volume = float(item.get("quoteVolume", 0))
                     if symbol.endswith("USDT") and quote_volume >= min_usdt_volume:
                         valid_symbols.append(symbol)
-
                 LOGGER.info(f"✅ {len(valid_symbols)} Symbols Selected (>250 BTC Vol)")
                 return valid_symbols
     except Exception as e:
@@ -309,7 +296,6 @@ async def get_all_usdt_symbols(session):
 
 
 async def get_all_usdt_symbols_cached(session):
-    """کش کردن لیست نمادها — آپدیت هر ۵ دقیقه"""
     global _symbol_cache
     now = time.time()
     if now - _symbol_cache["last_update"] > 300 or not _symbol_cache["symbols"]:
@@ -320,19 +306,17 @@ async def get_all_usdt_symbols_cached(session):
 
 
 # ---------------------------------------------------------
-# ۷. تحلیل تکنیکال با شرط عدم ورود SMA7 به بدنه کندل
+# ۷. تحلیل تکنیکال
 # ---------------------------------------------------------
 def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=2.0):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
         return None
-
     if len(klines) < 50:
         return None
 
     current_time_ms = int(time.time() * 1000)
     current_candle_start_ms = int(klines[-1][0])
     elapsed_seconds = (current_time_ms - current_candle_start_ms) / 1000.0
-
     if elapsed_seconds > MAX_SIGNAL_AGE_SECONDS:
         return None
 
@@ -344,7 +328,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     volumes = [float(k[5]) for k in closed_klines]
 
     current_live_price = float(klines[-1][4])
-
     rsi = calculate_rsi(closes)
     atr = calculate_atr(highs, lows, closes)
     sma7 = sum(closes[-7:]) / 7
@@ -360,17 +343,13 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     upper_wick = c_high - body_top
     lower_wick = body_bottom - c_low
 
-    # فیلتر اسپرد (اختیاری — برای جلوگیری از نمادهای با اسپرد بالا)
     spread_pct = (total_range / c_low) * 100
-    if spread_pct > 2.0:  # اگر اسپرد بیش از ۲٪ باشد
+    if spread_pct > 2.0:
         return None
 
     pivot_highs, pivot_lows = find_pivots(highs, lows)
     trend = check_dow_theory_trend(pivot_highs, pivot_lows)
 
-    # -----------------------------------------------------
-    # ۱. فیلترهای حجمی و شکار نقدینگی (SMC Liquidity Sweep)
-    # -----------------------------------------------------
     avg_vol_20 = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else c_vol
     is_volume_spike = (c_vol >= 1.5 * avg_vol_20)
 
@@ -380,9 +359,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     recent_max_high = max(highs[-6:-1])
     is_liquidity_sweep_short = (c_high > recent_max_high) and (c_close < recent_max_high)
 
-    # -----------------------------------------------------
-    # ۲. تشخیص محدوده رنج (Range Detection)
-    # -----------------------------------------------------
     lookback = 12
     range_high = max(highs[-lookback:-1])
     range_low = min(lows[-lookback:-1])
@@ -392,32 +368,28 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     is_near_htf_support = any(range_low >= supp * 0.985 and range_low <= supp * 1.025 for supp in htf_supports) if htf_supports else True
     is_near_htf_resistance = any(range_high <= res * 1.015 and range_high >= res * 0.975 for res in htf_resistances) if htf_resistances else True
 
-    # -----------------------------------------------------
-    # ۳. قوانین CANDLE SETUP + SMC + RANGE (LONG)
-    # -----------------------------------------------------
+    # LONG
     is_green_candle = (c_close > c_open)
     is_valid_size = (total_range >= 0.5 * atr)
     is_strong_lower_wick = (lower_wick >= 1.8 * body) and (lower_wick / total_range >= 0.45)
     has_minimal_upper_wick = (upper_wick <= 0.25 * total_range)
-
-    # اصلاح مهم: SMA7 نباید به هیچ عنوان وارد بدنه کندل شود (فقط برخورد با سایه پایین)
     is_sma7_bounce = (c_low <= sma7) and (sma7 < body_bottom)
 
     is_candle_setup_long = (
-        (trend != "BEARISH") and 
-        is_green_candle and 
-        is_valid_size and 
-        is_strong_lower_wick and 
-        has_minimal_upper_wick and 
-        is_sma7_bounce and 
+        (trend != "BEARISH") and
+        is_green_candle and
+        is_valid_size and
+        is_strong_lower_wick and
+        has_minimal_upper_wick and
+        is_sma7_bounce and
         is_volume_spike
     )
 
     is_htf_range_breakout_long = (
-        is_in_range and 
-        (c_close > range_high) and 
-        is_green_candle and 
-        is_volume_spike and 
+        is_in_range and
+        (c_close > range_high) and
+        is_green_candle and
+        is_volume_spike and
         (is_near_htf_support or is_near_htf_resistance)
     )
 
@@ -428,7 +400,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
             return None
 
         entry_price = c_close
-
         price_diff_percent = ((current_live_price - entry_price) / entry_price) * 100
         if price_diff_percent > MAX_SLIPPAGE_PERCENT:
             return None
@@ -440,12 +411,13 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 confirmed = []
-                if is_candle_setup_long: confirmed.append(f"Candle Setup 📌 ({interval})")
-                if is_htf_range_breakout_long: confirmed.append(f"Range Breakout 🚀 ({interval})")
-                if is_liquidity_sweep_long: confirmed.append(f"SMC Liquidity Sweep 🎯 ({interval})")
-
+                if is_candle_setup_long:
+                    confirmed.append(f"Candle Setup 📌 ({interval})")
+                if is_htf_range_breakout_long:
+                    confirmed.append(f"Range Breakout 🚀 ({interval})")
+                if is_liquidity_sweep_long:
+                    confirmed.append(f"SMC Liquidity Sweep 🎯 ({interval})")
                 strategy_text = " + ".join(confirmed)
-
                 return {
                     "strategy": strategy_text,
                     "direction": "LONG 🟢",
@@ -461,31 +433,27 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                     "candle_time": closed_klines[-1][0]
                 }
 
-    # -----------------------------------------------------
-    # ۴. قوانین CANDLE SETUP + SMC + RANGE (SHORT)
-    # -----------------------------------------------------
+    # SHORT
     is_red_candle = (c_close < c_open)
     is_strong_upper_wick = (upper_wick >= 1.8 * body) and (upper_wick / total_range >= 0.45)
     has_minimal_lower_wick = (lower_wick <= 0.25 * total_range)
-
-    # اصلاح مهم: SMA7 نباید به هیچ عنوان وارد بدنه کندل شود (فقط برخورد با سایه بالا)
     is_sma7_rejection = (c_high >= sma7) and (sma7 > body_top)
 
     is_candle_setup_short = (
-        (trend != "BULLISH") and 
-        is_red_candle and 
-        is_valid_size and 
-        is_strong_upper_wick and 
-        has_minimal_lower_wick and 
-        is_sma7_rejection and 
+        (trend != "BULLISH") and
+        is_red_candle and
+        is_valid_size and
+        is_strong_upper_wick and
+        has_minimal_lower_wick and
+        is_sma7_rejection and
         is_volume_spike
     )
 
     is_htf_range_breakout_short = (
-        is_in_range and 
-        (c_close < range_low) and 
-        is_red_candle and 
-        is_volume_spike and 
+        is_in_range and
+        (c_close < range_low) and
+        is_red_candle and
+        is_volume_spike and
         (is_near_htf_resistance or is_near_htf_support)
     )
 
@@ -496,7 +464,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
             return None
 
         entry_price = c_close
-
         price_diff_percent = ((entry_price - current_live_price) / entry_price) * 100
         if price_diff_percent > MAX_SLIPPAGE_PERCENT:
             return None
@@ -508,12 +475,13 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 confirmed = []
-                if is_candle_setup_short: confirmed.append(f"Candle Setup 📌 ({interval})")
-                if is_htf_range_breakout_short: confirmed.append(f"Range Breakdown 📉 ({interval})")
-                if is_liquidity_sweep_short: confirmed.append(f"SMC Liquidity Sweep 🎯 ({interval})")
-
+                if is_candle_setup_short:
+                    confirmed.append(f"Candle Setup 📌 ({interval})")
+                if is_htf_range_breakout_short:
+                    confirmed.append(f"Range Breakdown 📉 ({interval})")
+                if is_liquidity_sweep_short:
+                    confirmed.append(f"SMC Liquidity Sweep 🎯 ({interval})")
                 strategy_text = " + ".join(confirmed)
-
                 return {
                     "strategy": strategy_text,
                     "direction": "SHORT 🔴",
@@ -533,10 +501,9 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
 
 # ---------------------------------------------------------
-# ۸. سیستم تعقیب هوشمند پوزیشن‌ها (Auto Signal Tracker)
+# ۸. تعقیب پوزیشن‌ها
 # ---------------------------------------------------------
 async def track_active_trades(session, bot):
-    """تعقیب لحظه‌ای پوزیشن‌ها برای اعلام رسیدن به TP و SL"""
     if not active_trades:
         return
 
@@ -557,60 +524,59 @@ async def track_active_trades(session, bot):
 
             if trade["direction"] == "LONG 🟢":
                 if current_price <= trade["stop_loss"]:
-                    msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)")
+                    msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["sl_hits"] += 1
                     del active_trades[trade_id]
 
                 elif current_price >= trade["tp3"] and not trade.get("tp3_hit"):
-                    msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥")
+                    msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp3_hits"] += 1
                     del active_trades[trade_id]
 
                 elif current_price >= trade["tp2"] and not trade.get("tp2_hit"):
                     active_trades[trade_id]["tp2_hit"] = True
-                    msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`")
+                    msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp2_hits"] += 1
 
                 elif current_price >= trade["tp1"] and not trade.get("tp1_hit"):
                     active_trades[trade_id]["tp1_hit"] = True
-                    msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`")
+                    msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp1_hits"] += 1
 
             elif trade["direction"] == "SHORT 🔴":
                 if current_price >= trade["stop_loss"]:
-                    msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)")
+                    msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["sl_hits"] += 1
                     del active_trades[trade_id]
 
                 elif current_price <= trade["tp3"] and not trade.get("tp3_hit"):
-                    msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥")
+                    msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp3_hits"] += 1
                     del active_trades[trade_id]
 
                 elif current_price <= trade["tp2"] and not trade.get("tp2_hit"):
                     active_trades[trade_id]["tp2_hit"] = True
-                    msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`")
+                    msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp2_hits"] += 1
 
                 elif current_price <= trade["tp1"] and not trade.get("tp1_hit"):
                     active_trades[trade_id]["tp1_hit"] = True
-                    msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`")
+                    msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     STATS["tp1_hits"] += 1
 
 
 # ---------------------------------------------------------
-# ۹. ارسال تلگرام و شنونده هوشمند دستورات
+# ۹. ارسال تلگرام و دستورات
 # ---------------------------------------------------------
 async def send_telegram_message(bot, chat_id, text, reply_markup=None, retries=3):
-    """ارسال پیام با Exponential Backoff"""
     for i in range(retries):
         try:
             await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
@@ -625,7 +591,6 @@ async def send_telegram_message(bot, chat_id, text, reply_markup=None, retries=3
 
 
 async def telegram_command_listener(bot):
-    """پاسخگویی خودکار به دستورات کاربران در تلگرام (گروه و پیوی)"""
     last_update_id = 0
     while True:
         try:
@@ -644,7 +609,6 @@ async def telegram_command_listener(bot):
                         tp3 = STATS["tp3_hits"]
                         sl = STATS["sl_hits"]
                         win_rate = round(((tp1 + tp2 + tp3) / total * 100), 1) if total > 0 else 0.0
-
                         msg = (
                             f"📊 **Bot Performance & Win Rate Stats**\n\n"
                             f"🔢 **Total Signals Sent:** `{total}`\n"
@@ -687,7 +651,7 @@ def cleanup_old_alerts():
 
 
 # ---------------------------------------------------------
-# ۱۰. چرخه اصلی اسکنر بازار (Main Scanner Loop)
+# ۱۰. اسکنر اصلی
 # ---------------------------------------------------------
 async def scanner_task():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -725,11 +689,11 @@ async def scanner_task():
                             continue
 
                         signal = analyze_market_signal(
-                            klines=klines, 
-                            symbol=symbol, 
+                            klines=klines,
+                            symbol=symbol,
                             interval=interval,
-                            htf_supports=htf_supports, 
-                            htf_resistances=htf_resistances, 
+                            htf_supports=htf_supports,
+                            htf_resistances=htf_resistances,
                             max_sl_percent=MAX_SL_PERCENT
                         )
 
