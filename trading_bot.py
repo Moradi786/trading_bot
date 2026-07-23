@@ -35,9 +35,9 @@ try:
 except ValueError:
     pass
 
-TIMEFRAMES = ["15m", "1h", "4h"]
+TIMEFRAMES = ["15m", "1h", "4h", "1d"]  # اضافه شدن تایم‌فریم روزانه
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 50.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین (تغییر یافت به ۵۰)
+MIN_BTC_VOLUME = 50.0  # حداقل حجم ۲۴ ساعته بر حسب بیت‌کوین
 sent_alerts = {}
 ALERT_TTL = 86400
 
@@ -50,63 +50,63 @@ EXCHANGES = [
         "name": "Binance",
         "weight": 10,
         "url": "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100",
-        "interval_map": {"15m": "15m", "1h": "1h", "4h": "4h"},
+        "interval_map": {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"},
         "parser": lambda data: data if isinstance(data, list) else None,
     },
     {
         "name": "Bybit",
         "weight": 8,
         "url": "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit=100",
-        "interval_map": {"15m": "15", "1h": "60", "4h": "240"},
+        "interval_map": {"15m": "15", "1h": "60", "4h": "240", "1d": "D"},
         "parser": lambda data: _parse_bybit(data),
     },
     {
         "name": "OKX",
         "weight": 8,
         "url": "https://www.okx.com/api/v5/market/history-candles?instId={symbol}-SWAP&bar={interval}&limit=100",
-        "interval_map": {"15m": "15m", "1h": "1H", "4h": "4H"},
+        "interval_map": {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"},
         "parser": lambda data: _parse_okx(data),
     },
     {
         "name": "KuCoin",
         "weight": 6,
         "url": "https://api.kucoin.com/api/v1/market/candles?type={interval}&symbol={symbol}&limit=100",
-        "interval_map": {"15m": "15min", "1h": "1hour", "4h": "4hour"},
+        "interval_map": {"15m": "15min", "1h": "1hour", "4h": "4hour", "1d": "1day"},
         "parser": lambda data: _parse_kucoin(data),
     },
     {
         "name": "Gate.io",
         "weight": 6,
         "url": "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract={symbol}&interval={interval}&limit=100",
-        "interval_map": {"15m": "15m", "1h": "1h", "4h": "4h"},
+        "interval_map": {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"},
         "parser": lambda data: _parse_gateio(data),
     },
     {
         "name": "Bitget",
         "weight": 5,
         "url": "https://api.bitget.com/api/v2/mix/market/candles?symbol={symbol}&granularity={interval}&limit=100&productType=USDT-FUTURES",
-        "interval_map": {"15m": "15m", "1h": "1H", "4h": "4H"},
+        "interval_map": {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"},
         "parser": lambda data: _parse_bitget(data),
     },
     {
         "name": "HTX",
         "weight": 4,
         "url": "https://api.hbdm.com/linear-swap-ex/market/history/kline?contract_code={symbol}&period={interval}&size=100",
-        "interval_map": {"15m": "15min", "1h": "60min", "4h": "4hour"},
+        "interval_map": {"15m": "15min", "1h": "60min", "4h": "4hour", "1d": "1day"},
         "parser": lambda data: _parse_htx(data),
     },
     {
         "name": "Kraken",
         "weight": 3,
         "url": "https://futures.kraken.com/api/charts/v1/trade/{symbol}/{interval}?limit=100",
-        "interval_map": {"15m": "1", "1h": "60", "4h": "240"},
+        "interval_map": {"15m": "1", "1h": "60", "4h": "240", "1d": "1440"},
         "parser": lambda data: _parse_kraken(data),
     },
     {
         "name": "Coinbase",
         "weight": 3,
         "url": "https://api.exchange.coinbase.com/products/{symbol}/candles?granularity={interval}&limit=100",
-        "interval_map": {"15m": "900", "1h": "3600", "4h": "14400"},
+        "interval_map": {"15m": "900", "1h": "3600", "4h": "14400", "1d": "86400"},
         "parser": lambda data: _parse_coinbase(data),
     },
 ]
@@ -284,7 +284,7 @@ def cleanup_old_alerts():
 
 
 # ---------------------------------------------------------
-# ۷. تحلیل تکنیکال (کندل ستاپ + استراتژی بریک‌اوت)
+# ۷. تحلیل تکنیکال (فیلتر رنج + کندل ستاپ + شکست محدوده‌ها)
 # ---------------------------------------------------------
 def analyze_market_signal(klines, max_sl_percent=2.0):
     if len(klines) < 50:
@@ -322,69 +322,69 @@ def analyze_market_signal(klines, max_sl_percent=2.0):
     latest_support = min([pl[1] for pl in pivot_lows[-5:]]) if pivot_lows else c_low
 
     # ----------------------------------------------------
-    # ۱. تحلیل استراتژی کندل ستاپ (Candle Setup Strategy)
+    # ۱. استراتژی کندل ستاپ (در بازار رنج NEUTRAL کاملاً غیرفعال است)
     # ----------------------------------------------------
-    is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
-    body_gt_upper = (body >= 3 * upper_wick)
-    sma7_only_in_lower_wick = (c_low <= sma7 < body_bottom)
-    dow_long_valid = (trend == "BULLISH") or (c_close >= latest_resistance)
+    if trend == "BULLISH":
+        is_long_wick = (lower_wick >= 1.5 * body) or (lower_wick / total_range >= 0.45)
+        body_gt_upper = (body >= 3 * upper_wick)
+        sma7_only_in_lower_wick = (c_low <= sma7 < body_bottom)
 
-    if is_long_wick and body_gt_upper and sma7_only_in_lower_wick and dow_long_valid:
-        entry_price = c_close
-        stop_loss = c_low
-        risk = entry_price - stop_loss
+        if is_long_wick and body_gt_upper and sma7_only_in_lower_wick:
+            entry_price = c_close
+            stop_loss = c_low
+            risk = entry_price - stop_loss
 
-        if risk > 0:
-            sl_percent = (risk / entry_price) * 100
-            if sl_percent <= max_sl_percent:
-                return {
-                    "strategy": "Candle Setup 📌",
-                    "direction": "LONG 🟢",
-                    "entry_price": entry_price,
-                    "stop_loss": stop_loss,
-                    "sl_percent": round(sl_percent, 2),
-                    "tp1": round(entry_price + (risk * 2), 5),
-                    "tp2": round(entry_price + (risk * 5), 5),
-                    "tp3": round(entry_price + (risk * 7), 5),
-                    "sma7": round(sma7, 5),
-                    "trend": trend,
-                    "candle_time": klines[-2][0]
-                }
+            if risk > 0:
+                sl_percent = (risk / entry_price) * 100
+                if sl_percent <= max_sl_percent:
+                    return {
+                        "strategy": "Candle Setup 📌",
+                        "direction": "LONG 🟢",
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "sl_percent": round(sl_percent, 2),
+                        "tp1": round(entry_price + (risk * 2), 5),
+                        "tp2": round(entry_price + (risk * 5), 5),
+                        "tp3": round(entry_price + (risk * 7), 5),
+                        "sma7": round(sma7, 5),
+                        "trend": trend,
+                        "candle_time": klines[-2][0]
+                    }
 
-    is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
-    body_gt_lower = (body >= 3 * lower_wick)
-    sma7_only_in_upper_wick = (body_top < sma7 <= c_high)
-    dow_short_valid = (trend == "BEARISH") or (c_close <= latest_support)
+    elif trend == "BEARISH":
+        is_short_wick = (upper_wick >= 1.5 * body) or (upper_wick / total_range >= 0.45)
+        body_gt_lower = (body >= 3 * lower_wick)
+        sma7_only_in_upper_wick = (body_top < sma7 <= c_high)
 
-    if is_short_wick and body_gt_lower and sma7_only_in_upper_wick and dow_short_valid:
-        entry_price = c_close
-        stop_loss = c_high
-        risk = stop_loss - entry_price
+        if is_short_wick and body_gt_lower and sma7_only_in_upper_wick:
+            entry_price = c_close
+            stop_loss = c_high
+            risk = stop_loss - entry_price
 
-        if risk > 0:
-            sl_percent = (risk / entry_price) * 100
-            if sl_percent <= max_sl_percent:
-                return {
-                    "strategy": "Candle Setup 📌",
-                    "direction": "SHORT 🔴",
-                    "entry_price": entry_price,
-                    "stop_loss": stop_loss,
-                    "sl_percent": round(sl_percent, 2),
-                    "tp1": round(entry_price - (risk * 2), 5),
-                    "tp2": round(entry_price - (risk * 5), 5),
-                    "tp3": round(entry_price - (risk * 7), 5),
-                    "sma7": round(sma7, 5),
-                    "trend": trend,
-                    "candle_time": klines[-2][0]
-                }
+            if risk > 0:
+                sl_percent = (risk / entry_price) * 100
+                if sl_percent <= max_sl_percent:
+                    return {
+                        "strategy": "Candle Setup 📌",
+                        "direction": "SHORT 🔴",
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "sl_percent": round(sl_percent, 2),
+                        "tp1": round(entry_price - (risk * 2), 5),
+                        "tp2": round(entry_price - (risk * 5), 5),
+                        "tp3": round(entry_price - (risk * 7), 5),
+                        "sma7": round(sma7, 5),
+                        "trend": trend,
+                        "candle_time": klines[-2][0]
+                    }
 
     # ----------------------------------------------------
-    # ۲. تحلیل استراتژی بریک‌اوت (Breakout Strategy)
+    # ۲. استراتژی شکست محدوده رنج / مقاومت و حمایت (Range Breakout)
     # ----------------------------------------------------
     avg_volume_20 = sum(volumes[-22:-2]) / 20 if len(volumes) >= 22 else 0
     is_volume_confirmed = (c_vol >= 1.5 * avg_volume_20) if avg_volume_20 > 0 else False
 
-    # بریک‌اوت صعودی (LONG Breakout)
+    # شکست مقاومت سقف رنج (Range High Breakout)
     if c_close > latest_resistance and c_close > c_open and is_volume_confirmed:
         entry_price = c_close
         stop_loss = latest_resistance * 0.995
@@ -394,7 +394,7 @@ def analyze_market_signal(klines, max_sl_percent=2.0):
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 return {
-                    "strategy": "Breakout Trading ⚡",
+                    "strategy": "Range Breakout ⚡",
                     "direction": "LONG 🟢",
                     "entry_price": entry_price,
                     "stop_loss": round(stop_loss, 5),
@@ -407,7 +407,7 @@ def analyze_market_signal(klines, max_sl_percent=2.0):
                     "candle_time": klines[-2][0]
                 }
 
-    # بریک‌اوت نزولی (SHORT Breakout)
+    # شکست حمایت کف رنج (Range Low Breakout)
     if c_close < latest_support and c_close < c_open and is_volume_confirmed:
         entry_price = c_close
         stop_loss = latest_support * 1.005
@@ -417,7 +417,7 @@ def analyze_market_signal(klines, max_sl_percent=2.0):
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 return {
-                    "strategy": "Breakout Trading ⚡",
+                    "strategy": "Range Breakout ⚡",
                     "direction": "SHORT 🔴",
                     "entry_price": entry_price,
                     "stop_loss": round(stop_loss, 5),
@@ -498,7 +498,7 @@ async def scanner_task():
                                     f"⚙️ **Strategy:** `{signal['strategy']}`\n"
                                     f"🪙 **Coin:** `#{symbol}` | **Timeframe:** `{interval}`\n"
                                     f"🚦 **Direction:** {signal['direction']}\n"
-                                    f"📈 **Dow Market Trend:** `{signal['trend']}`\n\n"
+                                    f"📈 **Market Trend:** `{signal['trend']}`\n\n"
                                     f"📍 **Entry:** `{signal['entry_price']}`\n"
                                     f"🛡️ **Stop Loss:** `{signal['stop_loss']}` (`{signal['sl_percent']}% Risk`)\n\n"
                                     f"🎯 **Take Profit Targets:**\n"
