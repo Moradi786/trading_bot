@@ -4,11 +4,11 @@ import os
 import time
 import aiohttp
 from aiohttp import web
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 
 # ---------------------------------------------------------
-# ۱. تنظیمات اولیه
+# ۱. تنظیمات اولیه و متغیرهای عمومی
 # ---------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -37,11 +37,22 @@ TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
 MIN_BTC_VOLUME = 250.0          # حداقل حجم ۲۴ ساعته: بالای ۲۵۰ بیت‌کوین
 MAX_SIGNAL_AGE_SECONDS = 180  # حداکثر زمان مجاز ارسال سیگنال (۳ دقیقه)
-MAX_SLIPPAGE_PERCENT = 0.2    # حداکثر جابه‌جایی مجاز قیمت بازار نسبت به Entry
+MAX_SLIPPAGE_PERCENT = 0.2    # حداکثر جابه‌جایی مجاز قیمت نسبت به Entry
 
 sent_alerts = {}
+active_trades = {}  # ذخیره پوزیشن‌های فعال جهت تعقیب TP/SL
 ALERT_TTL = 86400
 GLOBAL_BTC_TREND = "NEUTRAL"
+BTC_VOLATILITY_PAUSE_UNTIL = 0  # زمان توقف در صورت نوسان شدید BTC
+
+# آمار وین‌ریت
+STATS = {
+    "total_signals": 0,
+    "tp1_hits": 0,
+    "tp2_hits": 0,
+    "tp3_hits": 0,
+    "sl_hits": 0
+}
 
 
 # ---------------------------------------------------------
@@ -167,7 +178,6 @@ def check_dow_theory_trend(pivot_highs, pivot_lows):
 
 
 def extract_htf_sr_levels(klines_4h, klines_1d):
-    """استخراج سطوح حمایت و مقاومت تایم‌فریم‌های ۴ ساعته و روزانه"""
     supports, resistances = [], []
     for klines in [klines_4h, klines_1d]:
         if klines and len(klines) >= 30:
@@ -180,7 +190,7 @@ def extract_htf_sr_levels(klines_4h, klines_1d):
 
 
 # ---------------------------------------------------------
-# ۵. دریافت داده‌ها
+# ۵. دریافت داده‌ها و کنترل نوسان بیت‌کوین
 # ---------------------------------------------------------
 async def fetch_klines_with_failover(session, symbol, interval):
     sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
@@ -200,18 +210,27 @@ async def fetch_klines_with_failover(session, symbol, interval):
     return None
 
 
-async def update_btc_trend(session):
-    global GLOBAL_BTC_TREND
+async def update_btc_trend_and_volatility(session):
+    global GLOBAL_BTC_TREND, BTC_VOLATILITY_PAUSE_UNTIL
     try:
-        klines = await fetch_klines_with_failover(session, "BTCUSDT", "4h")
-        if klines:
-            highs = [float(k[2]) for k in klines[:-1]]
-            lows = [float(k[3]) for k in klines[:-1]]
+        klines_4h = await fetch_klines_with_failover(session, "BTCUSDT", "4h")
+        if klines_4h:
+            highs = [float(k[2]) for k in klines_4h[:-1]]
+            lows = [float(k[3]) for k in klines_4h[:-1]]
             ph, pl = find_pivots(highs, lows)
             GLOBAL_BTC_TREND = check_dow_theory_trend(ph, pl)
-            LOGGER.info(f"🌐 BTC 4H Trend Updated: {GLOBAL_BTC_TREND}")
+
+        klines_15m = await fetch_klines_with_failover(session, "BTCUSDT", "15m")
+        if klines_15m and len(klines_15m) >= 2:
+            b_open = float(klines_15m[-2][1])
+            b_close = float(klines_15m[-2][4])
+            change_pct = abs((b_close - b_open) / b_open) * 100
+            if change_pct >= 1.5:  # نوسان بالای ۱.۵٪ در ۱۵ دقیقه
+                BTC_VOLATILITY_PAUSE_UNTIL = time.time() + 1800  # توقف ۳۰ دقیقه‌ای
+                LOGGER.warning(f"⚠️ BTC Volatility Spike ({change_pct:.2f}%). Pausing signals for 30m.")
+
     except Exception as e:
-        LOGGER.error(f"Error updating BTC trend: {e}")
+        LOGGER.error(f"Error updating BTC status: {e}")
 
 
 async def get_all_usdt_symbols(session):
@@ -242,13 +261,15 @@ async def get_all_usdt_symbols(session):
 
 
 # ---------------------------------------------------------
-# ۶. تحلیل تکنیکال (Candle Setup + HTF Range Breakout)
+# ۶. تحلیل تکنیکال حرفه‌ای (SMC Sweep + Vol Spike + Range)
 # ---------------------------------------------------------
 def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_percent=2.0):
+    if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
+        return None
+
     if len(klines) < 50:
         return None
 
-    # ۱. فیلتر زمان تازگی سیگنال (حداکثر ۳ دقیقه پس از بسته شدن)
     current_time_ms = int(time.time() * 1000)
     current_candle_start_ms = int(klines[-1][0])
     elapsed_seconds = (current_time_ms - current_candle_start_ms) / 1000.0
@@ -284,22 +305,33 @@ def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_
     trend = check_dow_theory_trend(pivot_highs, pivot_lows)
 
     # -----------------------------------------------------
-    # ۲. تشخیص محدوده رنج (Consolidation Range Detection)
+    # ۱. فیلترهای حجمی و شکار نقدینگی (SMC Liquidity Sweep)
+    # -----------------------------------------------------
+    avg_vol_20 = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else c_vol
+    is_volume_spike = (c_vol >= 1.5 * avg_vol_20)
+
+    # شکار نقدینگی صعودی: سایه کندل کف ۵ کندل قبل را زده و برگشته
+    recent_min_low = min(lows[-6:-1])
+    is_liquidity_sweep_long = (c_low < recent_min_low) and (c_close > recent_min_low)
+
+    # شکار نقدینگی نزولی: سایه کندل سقف ۵ کندل قبل را زده و برگشته
+    recent_max_high = max(highs[-6:-1])
+    is_liquidity_sweep_short = (c_high > recent_max_high) and (c_close < recent_max_high)
+
+    # -----------------------------------------------------
+    # ۲. تشخیص محدوده رنج (Range Detection)
     # -----------------------------------------------------
     lookback = 12
     range_high = max(highs[-lookback:-1])
     range_low = min(lows[-lookback:-1])
     range_width_pct = ((range_high - range_low) / range_low) * 100 if range_low > 0 else 999.0
-
-    # محدوده رنج زمانی است که نوسان ۱۲ کندل قبلی کمتر از ۳.۵ درصد باشد
     is_in_range = (range_width_pct <= 3.5)
 
-    # بررسی موقعیت محدوده نسبت به سطوح 4H و 1D
     is_near_htf_support = any(range_low >= supp * 0.985 and range_low <= supp * 1.025 for supp in htf_supports) if htf_supports else True
     is_near_htf_resistance = any(range_high <= res * 1.015 and range_high >= res * 0.975 for res in htf_resistances) if htf_resistances else True
 
     # -----------------------------------------------------
-    # ۳. قوانین CANDLE SETUP + RANGE BREAKOUT (LONG)
+    # ۳. قوانین CANDLE SETUP + SMC + RANGE (LONG)
     # -----------------------------------------------------
     is_green_candle = (c_close > c_open)
     is_valid_size = (total_range >= 0.5 * atr)
@@ -307,25 +339,25 @@ def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_
     has_minimal_upper_wick = (upper_wick <= 0.25 * total_range)
     is_sma7_bounce = (c_low <= sma7) and (c_close > sma7)
 
-    # کندل ستاپ استاندارد
-    is_base_candle_setup_long = (
+    is_candle_setup_long = (
         (trend != "BEARISH") and 
         is_green_candle and 
         is_valid_size and 
         is_strong_lower_wick and 
         has_minimal_upper_wick and 
-        is_sma7_bounce
+        is_sma7_bounce and 
+        is_volume_spike
     )
 
-    # شکست محدوده رنج با کندل ستاپ در بالای حمایت یا زیر مقاومت ۴ ساعته/روزانه
     is_htf_range_breakout_long = (
         is_in_range and 
         (c_close > range_high) and 
         is_green_candle and 
+        is_volume_spike and 
         (is_near_htf_support or is_near_htf_resistance)
     )
 
-    if is_base_candle_setup_long or is_htf_range_breakout_long:
+    if is_candle_setup_long or is_htf_range_breakout_long:
         if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BEARISH":
             return None
         if rsi > 68.0:
@@ -333,7 +365,6 @@ def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_
 
         entry_price = c_close
 
-        # فیلتر پرش قیمت لحظه‌ای
         price_diff_percent = ((current_live_price - entry_price) / entry_price) * 100
         if price_diff_percent > MAX_SLIPPAGE_PERCENT:
             return None
@@ -345,8 +376,9 @@ def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 confirmed = []
-                if is_base_candle_setup_long: confirmed.append("Candle Setup 📌")
-                if is_htf_range_breakout_long: confirmed.append("4H/1D Range Breakout 🚀")
+                if is_candle_setup_long: confirmed.append("Candle Setup 📌")
+                if is_htf_range_breakout_long: confirmed.append("Range Breakout 🚀")
+                if is_liquidity_sweep_long: confirmed.append("SMC Liquidity Sweep 🎯")
 
                 strategy_text = " + ".join(confirmed)
 
@@ -366,30 +398,32 @@ def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_
                 }
 
     # -----------------------------------------------------
-    # ۴. قوانین CANDLE SETUP + RANGE BREAKOUT (SHORT)
+    # ۴. قوانین CANDLE SETUP + SMC + RANGE (SHORT)
     # -----------------------------------------------------
     is_red_candle = (c_close < c_open)
     is_strong_upper_wick = (upper_wick >= 1.8 * body) and (upper_wick / total_range >= 0.45)
     has_minimal_lower_wick = (lower_wick <= 0.25 * total_range)
     is_sma7_rejection = (c_high >= sma7) and (c_close < sma7)
 
-    is_base_candle_setup_short = (
+    is_candle_setup_short = (
         (trend != "BULLISH") and 
         is_red_candle and 
         is_valid_size and 
         is_strong_upper_wick and 
         has_minimal_lower_wick and 
-        is_sma7_rejection
+        is_sma7_rejection and 
+        is_volume_spike
     )
 
     is_htf_range_breakout_short = (
         is_in_range and 
         (c_close < range_low) and 
         is_red_candle and 
+        is_volume_spike and 
         (is_near_htf_resistance or is_near_htf_support)
     )
 
-    if is_base_candle_setup_short or is_htf_range_breakout_short:
+    if is_candle_setup_short or is_htf_range_breakout_short:
         if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BULLISH":
             return None
         if rsi < 32.0:
@@ -397,7 +431,6 @@ def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_
 
         entry_price = c_close
 
-        # فیلتر پرش قیمت لحظه‌ای
         price_diff_percent = ((entry_price - current_live_price) / entry_price) * 100
         if price_diff_percent > MAX_SLIPPAGE_PERCENT:
             return None
@@ -409,8 +442,9 @@ def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 confirmed = []
-                if is_base_candle_setup_short: confirmed.append("Candle Setup 📌")
-                if is_htf_range_breakout_short: confirmed.append("4H/1D Range Breakdown 📉")
+                if is_candle_setup_short: confirmed.append("Candle Setup 📌")
+                if is_htf_range_breakout_short: confirmed.append("Range Breakdown 📉")
+                if is_liquidity_sweep_short: confirmed.append("SMC Liquidity Sweep 🎯")
 
                 strategy_text = " + ".join(confirmed)
 
@@ -433,15 +467,143 @@ def analyze_market_signal(klines, symbol, htf_supports, htf_resistances, max_sl_
 
 
 # ---------------------------------------------------------
-# ۷. ارسال تلگرام و چرخه اصلی
+# ۷. سیستم تعقیب هوشمند پوزیشن‌ها (Auto Signal Tracker)
 # ---------------------------------------------------------
-async def send_telegram_message(bot, chat_id, text):
+async def track_active_trades(session, bot):
+    """تعقیب لحظه‌ای پوزیشن‌ها برای اعلام رسیدن به TP و SL"""
+    if not active_trades:
+        return
+
+    for trade_id, trade in list(active_trades.items()):
+        symbol = trade["symbol"]
+        klines = await fetch_klines_with_failover(session, symbol, "15m")
+        if not klines:
+            continue
+
+        current_price = float(klines[-1][4])
+
+        if trade["direction"] == "LONG 🟢":
+            # بررسی حد ضرر
+            if current_price <= trade["stop_loss"]:
+                msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
+                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                STATS["sl_hits"] += 1
+                del active_trades[trade_id]
+
+            # بررسی حد سود ۳
+            elif current_price >= trade["tp3"] and not trade.get("tp3_hit"):
+                msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
+                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                STATS["tp3_hits"] += 1
+                del active_trades[trade_id]
+
+            # بررسی حد سود ۲
+            elif current_price >= trade["tp2"] and not trade.get("tp2_hit"):
+                trade["tp2_hit"] = True
+                msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
+                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                STATS["tp2_hits"] += 1
+
+            # بررسی حد سود ۱
+            elif current_price >= trade["tp1"] and not trade.get("tp1_hit"):
+                trade["tp1_hit"] = True
+                msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
+                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                STATS["tp1_hits"] += 1
+
+        elif trade["direction"] == "SHORT 🔴":
+            # بررسی حد ضرر
+            if current_price >= trade["stop_loss"]:
+                msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
+                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                STATS["sl_hits"] += 1
+                del active_trades[trade_id]
+
+            # بررسی حد سود ۳
+            elif current_price <= trade["tp3"] and not trade.get("tp3_hit"):
+                msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
+                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                STATS["tp3_hits"] += 1
+                del active_trades[trade_id]
+
+            # بررسی حد سود ۲
+            elif current_price <= trade["tp2"] and not trade.get("tp2_hit"):
+                trade["tp2_hit"] = True
+                msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
+                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                STATS["tp2_hits"] += 1
+
+            # بررسی حد سود ۱
+            elif current_price <= trade["tp1"] and not trade.get("tp1_hit"):
+                trade["tp1_hit"] = True
+                msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
+                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                STATS["tp1_hits"] += 1
+
+
+# ---------------------------------------------------------
+# ۸. ارسال تلگرام و شنونده دستورات کاربران (/stats, /active)
+# ---------------------------------------------------------
+async def send_telegram_message(bot, chat_id, text, reply_markup=None):
     try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
         return True
     except Exception as e:
         LOGGER.error(f"Telegram error: {e}")
         return False
+
+
+async def telegram_command_listener(bot):
+    """پاسخگویی خودکار به دستورات کاربران در تلگرام"""
+    last_update_id = 0
+    while True:
+        try:
+            updates = await bot.get_updates(offset=last_update_id + 1, timeout=5)
+            for update in updates:
+                last_update_id = update.update_id
+                if update.message and update.message.text:
+                    cmd = update.message.text.strip()
+                    chat_id = update.message.chat_id
+
+                    if cmd == "/stats":
+                        total = STATS["total_signals"]
+                        tp1 = STATS["tp1_hits"]
+                        tp2 = STATS["tp2_hits"]
+                        tp3 = STATS["tp3_hits"]
+                        sl = STATS["sl_hits"]
+                        win_rate = round(((tp1 + tp2 + tp3) / total * 100), 1) if total > 0 else 0.0
+
+                        msg = (
+                            f"📊 **Bot Performance & Win Rate Stats**\n\n"
+                            f"🔢 **Total Signals Sent:** `{total}`\n"
+                            f"🎯 **TP1 Hits:** `{tp1}`\n"
+                            f"🚀 **TP2 Hits:** `{tp2}`\n"
+                            f"🔥 **TP3 Hits:** `{tp3}`\n"
+                            f"❌ **Stop Loss Hits:** `{sl}`\n\n"
+                            f"🏆 **Current Win Rate:** `{win_rate}%`"
+                        )
+                        await send_telegram_message(bot, chat_id, msg)
+
+                    elif cmd == "/active":
+                        if not active_trades:
+                            await send_telegram_message(bot, chat_id, "ℹ️ هیچ پوزیشن فعالی در حال حاضر وجود ندارد.")
+                        else:
+                            active_list = "\n".join([f"🔹 `#{v['symbol']}` ({v['direction']}) - Entry: `{v['entry_price']}`" for k, v in active_trades.items()])
+                            msg = f"📌 **Active Tracked Trades ({len(active_trades)}):**\n\n{active_list}"
+                            await send_telegram_message(bot, chat_id, msg)
+
+                    elif cmd in ["/start", "/help"]:
+                        msg = (
+                            "🤖 **Trading Bot Control Menu**\n\n"
+                            "▫️ `/stats` : مشاهده آمار وین‌ریت و سیگنال‌ها\n"
+                            "▫️ `/active` : مشاهده لیست سیگنال‌های فعال\n"
+                            "▫️ `/help` : راهنمای ربات"
+                        )
+                        await send_telegram_message(bot, chat_id, msg)
+
+        except Exception as e:
+            LOGGER.error(f"Command Listener Error: {e}")
+        await asyncio.sleep(2)
 
 
 def cleanup_old_alerts():
@@ -451,6 +613,9 @@ def cleanup_old_alerts():
         del sent_alerts[k]
 
 
+# ---------------------------------------------------------
+# ۹. چرخه اصلی اسکنر بازار (Main Scanner Loop)
+# ---------------------------------------------------------
 async def scanner_task():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     try:
@@ -460,8 +625,11 @@ async def scanner_task():
         LOGGER.error(f"❌ Telegram Auth Error: {e}")
         return
 
+    # فعال‌سازی شنونده دستورات تلگرام
+    asyncio.create_task(telegram_command_listener(bot))
+
     async with aiohttp.ClientSession() as session:
-        await update_btc_trend(session)
+        await update_btc_trend_and_volatility(session)
         symbols = await get_all_usdt_symbols(session)
         btc_counter = 0
 
@@ -469,11 +637,13 @@ async def scanner_task():
             try:
                 btc_counter += 1
                 if btc_counter >= 15:
-                    await update_btc_trend(session)
+                    await update_btc_trend_and_volatility(session)
                     btc_counter = 0
 
+                # تعقیب پوزیشن‌های فعال
+                await track_active_trades(session, bot)
+
                 for symbol in symbols:
-                    # دریافت سطوح ۴ ساعته و روزانه برای فیلتر سطوح کلیدی
                     klines_4h = await fetch_klines_with_failover(session, symbol, "4h")
                     klines_1d = await fetch_klines_with_failover(session, symbol, "1d")
                     htf_supports, htf_resistances = extract_htf_sr_levels(klines_4h, klines_1d)
@@ -495,6 +665,14 @@ async def scanner_task():
                             alert_id = f"{symbol}_{interval}_{signal['candle_time']}_{signal['direction']}"
                             if alert_id not in sent_alerts:
                                 sent_alerts[alert_id] = time.time()
+                                active_trades[alert_id] = {**signal, "symbol": symbol}
+                                STATS["total_signals"] += 1
+
+                                # دکمه شیشه‌ای لینک مستقیم به چارت TradingView
+                                tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+                                keyboard = InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("📊 مشاهده چارت در TradingView", url=tv_url)]
+                                ])
 
                                 msg = (
                                     f"🎯 **High-Precision Signal Detected!**\n\n"
@@ -512,7 +690,7 @@ async def scanner_task():
                                     f"🔹 **TP3 (1:7):** `{signal['tp3']}`\n\n"
                                     f"📉 **SMA 7:** `{signal['sma7']}`"
                                 )
-                                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                                await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg, reply_markup=keyboard)
 
                         await asyncio.sleep(0.02)
 
