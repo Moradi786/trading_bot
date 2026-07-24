@@ -7,7 +7,7 @@ import aiohttp
 from aiohttp import web
 import pandas as pd
 from xgboost import XGBClassifier
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 import libsql_client
 
@@ -81,7 +81,6 @@ def execute_db_query(query, params=()):
             LOGGER.error(f"❌ Turso Query Error: {e}")
             client.close()
 
-    # Fallback to local SQLite
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -106,7 +105,6 @@ def fetch_db_df(query):
             LOGGER.error(f"❌ Turso Fetch Error: {e}")
             client.close()
 
-    # Fallback to local SQLite
     try:
         conn = sqlite3.connect(DB_NAME)
         df = pd.read_sql_query(query, conn)
@@ -135,13 +133,13 @@ def init_db():
         LOGGER.info("☁️ Persistent Cloud Database Initialized Successfully.")
 
 # ---------------------------------------------------------
-# ۳. سیستم یادگیری هوش مصنوعی (XGBoost)
+# ۳. سیستم یادگیری سریع هوش مصنوعی (XGBoost)
 # ---------------------------------------------------------
 class SelfLearningAIEngine:
     def __init__(self):
         self.model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05, random_state=42)
         self.is_trained = False
-        self.min_samples_to_train = 15
+        self.min_samples_to_train = 5  # یادگیری سریع فقط با ۵ معامله ثبت شده
 
     def retrain_model(self):
         try:
@@ -154,12 +152,12 @@ class SelfLearningAIEngine:
             y = df['outcome'].astype(int)
 
             if len(y.unique()) < 2:
-                LOGGER.info("🧠 AI Learning: Both Win and Loss samples are required to train.")
+                LOGGER.info("🧠 AI Learning: Both Win (1) and Loss (0) samples are required to train.")
                 return False
 
             self.model.fit(X, y)
             self.is_trained = True
-            LOGGER.info(f"✅ AI Model Retrained on {len(df)} past trades from Turso Cloud!")
+            LOGGER.info(f"✅ AI Model Retrained on {len(df)} trades! AI is now active.")
             return True
         except Exception as e:
             LOGGER.error(f"❌ Error during AI retraining: {e}")
@@ -599,7 +597,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
                 trade_id = f"{symbol}_{int(time.time())}"
                 
-                # ذخیره مستقیم در Turso Cloud Database
                 insert_sql = "INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
                 execute_db_query(insert_sql, (
                     trade_id, symbol, "LONG", feature_dict['rsi'], feature_dict['spread_pct'],
@@ -685,7 +682,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
                 trade_id = f"{symbol}_{int(time.time())}"
                 
-                # ذخیره مستقیم در Turso Cloud Database
                 insert_sql = "INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
                 execute_db_query(insert_sql, (
                     trade_id, symbol, "SHORT", feature_dict['rsi'], feature_dict['spread_pct'],
@@ -781,7 +777,7 @@ async def track_active_trades(session, bot):
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
 
 # ---------------------------------------------------------
-# ۱۰. تلگرام و دستورات (ارسال مستقیم از Turso)
+# ۱۰. شنونده تلگرام و پردازش بازخورد تعاملی (RLHF)
 # ---------------------------------------------------------
 async def send_telegram_message(bot, chat_id, text, reply_markup=None, retries=3):
     for i in range(retries):
@@ -802,13 +798,43 @@ async def telegram_command_listener(bot):
             updates = await bot.get_updates(offset=last_update_id + 1, timeout=5)
             for update in updates:
                 last_update_id = update.update_id
+
+                # ۱. پردازش کلیک روی دکمه‌های زیر پیام سیگنال
+                if update.callback_query:
+                    query = update.callback_query
+                    data = query.data
+                    
+                    if data.startswith("fb_bad_"):
+                        trade_id = data.replace("fb_bad_", "")
+                        update_trade_outcome(trade_id, 0)
+                        await query.answer("❌ این سیگنال به عنوان خطای الگویی ثبت شد و مدل AI بازآموزی گردید.")
+                        try:
+                            await query.edit_message_text(
+                                text=query.message.text + "\n\n⚠️ **بازخورد شما ثبت شد: سیگنال اشتباه (یادگیری AI)**",
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                        except Exception:
+                            pass
+
+                    elif data.startswith("fb_good_"):
+                        trade_id = data.replace("fb_good_", "")
+                        update_trade_outcome(trade_id, 1)
+                        await query.answer("✅ این سیگنال به عنوان الگوی موفق ثبت شد.")
+                        try:
+                            await query.edit_message_text(
+                                text=query.message.text + "\n\n✅ **بازخورد شما ثبت شد: سیگنال موفق (یادگیری AI)**",
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                        except Exception:
+                            pass
+
+                # ۲. پردازش دستورات متنی کاربر
                 if update.message and update.message.text:
                     raw_text = update.message.text.strip()
                     cmd = raw_text.split('@')[0].lower()
                     chat_id = update.message.chat_id
 
                     if cmd == "/stats":
-                        # محاسبه مستقیم و دائمی از Turso Database
                         df_all = fetch_db_df("SELECT * FROM trade_features")
                         total = len(df_all)
                         
@@ -952,7 +978,15 @@ async def scanner_task():
                                 f"📈 **RSI:** `{signal['rsi']}` | Trend: `{signal['trend']}`"
                             )
 
-                            await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
+                            # ایجاد دکمه‌های تعاملی آموزش هوش مصنوعی زیر پیام
+                            keyboard = InlineKeyboardMarkup([
+                                [
+                                    InlineKeyboardButton("❌ سیگنال اشتباه (ثبت خطا)", callback_data=f"fb_bad_{signal['trade_id']}"),
+                                    InlineKeyboardButton("✅ سیگنال خوب", callback_data=f"fb_good_{signal['trade_id']}")
+                                ]
+                            ])
+
+                            await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg, reply_markup=keyboard)
 
                             trade_key = f"{symbol}_{interval}"
                             async with active_trades_lock:
