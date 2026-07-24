@@ -23,11 +23,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT = int(os.getenv("PORT", 8080))
 
-if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+if not TELEGRAM_BOT_TOKEN:
     LOGGER.error("❌ TELEGRAM_BOT_TOKEN تنظیم نشده!")
     raise SystemExit(1)
 
-if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
+if not TELEGRAM_CHAT_ID:
     LOGGER.error("❌ TELEGRAM_CHAT_ID تنظیم نشده!")
     raise SystemExit(1)
 
@@ -430,7 +430,7 @@ async def get_all_usdt_symbols_cached(session):
     return _symbol_cache["symbols"]
 
 # ---------------------------------------------------------
-# ۸. تحلیل تکنیکال و فیلتر هوش مصنوعی
+# ۸. تحلیل تکنیکال و فیلتر هوش مصنوعی (ارتقاء‌یافته)
 # ---------------------------------------------------------
 def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=2.0):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
@@ -492,7 +492,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     is_near_htf_support = any(range_low >= supp * 0.985 and range_low <= supp * 1.025 for supp in htf_supports) if htf_supports else True
     is_near_htf_resistance = any(range_high <= res * 1.015 and range_high >= res * 0.975 for res in htf_resistances) if htf_resistances else True
 
-    # آماده‌سازی ویژگی‌ها برای هوش مصنوعی
     trend_map = {"BULLISH": 1, "NEUTRAL": 0, "BEARISH": -1}
     feature_dict = {
         'rsi': float(rsi),
@@ -531,12 +530,15 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     )
 
     if is_candle_setup_long or is_htf_range_breakout_long:
-        if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BEARISH":
-            return None
-        if rsi > 68.0:
+        # ۱. اگر ستاپ Breakout باشد، شرط هم‌جهتی با بیت‌کوین نادیده گرفته می‌شود (کوین‌های مستقل)
+        if not is_htf_range_breakout_long:
+            if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BEARISH":
+                return None
+
+        # ۲. سقف RSI تا ۸۰ افزایش یافت تا شکست‌های قدرتمند از دست نروند
+        if rsi > 80.0:
             return None
 
-        # ارزیابی توسط هوش مصنوعی
         win_probability = ai_engine.predict_signal_quality(feature_dict)
         if win_probability < 0.60:
             LOGGER.info(f"🤖 AI Filter Rejected LONG signal for {symbol} (Score: {win_probability*100:.1f}%)")
@@ -620,12 +622,15 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     )
 
     if is_candle_setup_short or is_htf_range_breakout_short:
-        if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BULLISH":
-            return None
-        if rsi < 32.0:
+        # ۱. نادیده گرفتن شرط بیت‌کوین در شکست‌های منفی (Breakdown)
+        if not is_htf_range_breakout_short:
+            if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BULLISH":
+                return None
+
+        # ۲. کاهش کف RSI تا ۲۰ برای ریزش‌های شدید
+        if rsi < 20.0:
             return None
 
-        # ارزیابی توسط هوش مصنوعی
         win_probability = ai_engine.predict_signal_quality(feature_dict)
         if win_probability < 0.60:
             LOGGER.info(f"🤖 AI Filter Rejected SHORT signal for {symbol} (Score: {win_probability*100:.1f}%)")
