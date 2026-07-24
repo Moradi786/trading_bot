@@ -7,6 +7,7 @@ import aiohttp
 from aiohttp import web
 import pandas as pd
 from xgboost import XGBClassifier
+from sklearn.preprocessing import StandardScaler
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 import libsql_client
@@ -127,20 +128,41 @@ def init_db():
             lower_wick_ratio REAL,
             upper_wick_ratio REAL,
             trend_code INTEGER,
+            adx REAL,
+            plus_di REAL,
+            minus_di REAL,
+            price_to_sma7_ratio REAL,
+            atr_pct REAL,
             outcome INTEGER
         )
     '''
     if execute_db_query(create_table_sql):
-        LOGGER.info("☁️ Persistent Cloud Database Initialized Successfully.")
+        LOGGER.info("☁️ Persistent Cloud Database Initialized with 11 Advanced Features.")
 
 # ---------------------------------------------------------
-# ۳. سیستم یادگیری سریع هوش مصنوعی (XGBoost)
+# ۳. سیستم یادگیری هوش مصنوعی پیشرفته (Advanced XGBoost Engine)
 # ---------------------------------------------------------
-class SelfLearningAIEngine:
+class AdvancedSelfLearningAIEngine:
     def __init__(self):
-        self.model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05, random_state=42)
+        self.model = XGBClassifier(
+            n_estimators=150,
+            max_depth=4,
+            learning_rate=0.03,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.15,
+            reg_lambda=1.2,
+            eval_metric='logloss',
+            random_state=42
+        )
+        self.scaler = StandardScaler()
         self.is_trained = False
-        self.min_samples_to_train = 5
+        self.min_samples_to_train = 8
+        self.feature_columns = [
+            'rsi', 'spread_pct', 'vol_ratio', 'lower_wick_ratio',
+            'upper_wick_ratio', 'trend_code', 'adx', 'plus_di',
+            'minus_di', 'price_to_sma7_ratio', 'atr_pct'
+        ]
 
     def retrain_model(self):
         try:
@@ -149,16 +171,32 @@ class SelfLearningAIEngine:
                 LOGGER.info(f"🧠 AI Learning: Need at least {self.min_samples_to_train} closed trades. Currently in DB: {len(df)}")
                 return False
 
-            X = df[['rsi', 'spread_pct', 'vol_ratio', 'lower_wick_ratio', 'upper_wick_ratio', 'trend_code']]
+            for col in self.feature_columns:
+                if col not in df.columns:
+                    df[col] = 0.0
+
+            X = df[self.feature_columns].astype(float)
             y = df['outcome'].astype(int)
 
             if len(y.unique()) < 2:
                 LOGGER.info("🧠 AI Learning: Both Win (1) and Loss (0) samples are required to train.")
                 return False
 
-            self.model.fit(X, y)
+            num_pos = (y == 1).sum()
+            num_neg = (y == 0).sum()
+            scale_pos_weight = float(num_neg / num_pos) if num_pos > 0 else 1.0
+            self.model.set_params(scale_pos_weight=scale_pos_weight)
+
+            X_scaled = self.scaler.fit_transform(X)
+            self.model.fit(X_scaled, y)
             self.is_trained = True
-            LOGGER.info(f"✅ AI Model Retrained on {len(df)} trades! AI is now active.")
+
+            importances = self.model.feature_importances_
+            top_features = sorted(zip(self.feature_columns, importances), key=lambda x: x[1], reverse=True)[:3]
+            top_str = ", ".join([f"{f}: {imp*100:.1f}%" for f, imp in top_features])
+
+            LOGGER.info(f"✅ Advanced AI Model Retrained on {len(df)} trades!")
+            LOGGER.info(f"🔥 Most Important Indicators: {top_str}")
             return True
         except Exception as e:
             LOGGER.error(f"❌ Error during AI retraining: {e}")
@@ -168,14 +206,16 @@ class SelfLearningAIEngine:
         if not self.is_trained:
             return 0.80
         try:
-            X_input = pd.DataFrame([feature_dict])
-            prob = self.model.predict_proba(X_input)[0][1]
+            input_data = {col: feature_dict.get(col, 0.0) for col in self.feature_columns}
+            X_input = pd.DataFrame([input_data])[self.feature_columns].astype(float)
+            X_scaled = self.scaler.transform(X_input)
+            prob = self.model.predict_proba(X_scaled)[0][1]
             return float(prob)
         except Exception as e:
             LOGGER.error(f"❌ Error during AI prediction: {e}")
             return 0.80
 
-ai_engine = SelfLearningAIEngine()
+ai_engine = AdvancedSelfLearningAIEngine()
 
 def update_trade_outcome(trade_id, outcome):
     query = "UPDATE trade_features SET outcome = ? WHERE id = ?"
@@ -509,7 +549,7 @@ async def get_all_usdt_symbols_cached(session):
     return _symbol_cache["symbols"]
 
 # ---------------------------------------------------------
-# ۸. تحلیل تکنیکال و فیلتر هوشمند
+# ۸. تحلیل تکنیکال و فیلتر هوشمند با ۱۱ ویژگی AI
 # ---------------------------------------------------------
 def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=5.0):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
@@ -574,14 +614,24 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     is_near_htf_support = any(range_low >= supp * 0.985 and range_low <= supp * 1.025 for supp in htf_supports) if htf_supports else True
     is_near_htf_resistance = any(range_high <= res * 1.015 and range_high >= res * 0.975 for res in htf_resistances) if htf_resistances else True
 
+    price_to_sma7_ratio = (c_close / sma7) if sma7 > 0 else 1.0
+    atr_pct = (atr / c_close) * 100 if c_close > 0 else 0.0
+
     trend_map = {"BULLISH": 1, "NEUTRAL": 0, "BEARISH": -1}
+    
+    # 🧠 ۱۱ ویژگی کامل هوش مصنوعی
     feature_dict = {
         'rsi': float(rsi),
         'spread_pct': float(spread_pct),
         'vol_ratio': float(c_vol / avg_vol_20) if avg_vol_20 > 0 else 1.0,
         'lower_wick_ratio': float(lower_wick / total_range),
         'upper_wick_ratio': float(upper_wick / total_range),
-        'trend_code': trend_map.get(trend, 0)
+        'trend_code': trend_map.get(trend, 0),
+        'adx': float(adx),
+        'plus_di': float(plus_di),
+        'minus_di': float(minus_di),
+        'price_to_sma7_ratio': float(price_to_sma7_ratio),
+        'atr_pct': float(atr_pct)
     }
 
     # ==================== STRATEGY 1: RSI + DMI ====================
@@ -664,11 +714,13 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
                 trade_id = f"{symbol}_{int(time.time())}"
                 
-                insert_sql = "INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+                insert_sql = "INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
                 execute_db_query(insert_sql, (
                     trade_id, symbol, "LONG", feature_dict['rsi'], feature_dict['spread_pct'],
                     feature_dict['vol_ratio'], feature_dict['lower_wick_ratio'],
-                    feature_dict['upper_wick_ratio'], feature_dict['trend_code']
+                    feature_dict['upper_wick_ratio'], feature_dict['trend_code'],
+                    feature_dict['adx'], feature_dict['plus_di'], feature_dict['minus_di'],
+                    feature_dict['price_to_sma7_ratio'], feature_dict['atr_pct']
                 ))
 
                 return {
@@ -746,11 +798,13 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
                 trade_id = f"{symbol}_{int(time.time())}"
                 
-                insert_sql = "INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+                insert_sql = "INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
                 execute_db_query(insert_sql, (
                     trade_id, symbol, "SHORT", feature_dict['rsi'], feature_dict['spread_pct'],
                     feature_dict['vol_ratio'], feature_dict['lower_wick_ratio'],
-                    feature_dict['upper_wick_ratio'], feature_dict['trend_code']
+                    feature_dict['upper_wick_ratio'], feature_dict['trend_code'],
+                    feature_dict['adx'], feature_dict['plus_di'], feature_dict['minus_di'],
+                    feature_dict['price_to_sma7_ratio'], feature_dict['atr_pct']
                 ))
 
                 return {
@@ -1074,7 +1128,6 @@ async def scanner_task():
         symbols = await get_all_usdt_symbols_cached(session)
         btc_counter = 0
 
-        # محدودکننده اسکن هم‌زمان (۱۰ ارز به‌صورت موازی)
         semaphore = asyncio.Semaphore(CONCURRENT_SCAN_LIMIT)
 
         while True:
@@ -1087,7 +1140,6 @@ async def scanner_task():
                 await track_active_trades(session, bot)
                 cleanup_old_alerts()
 
-                # اجرای موازی اسکن برای تمام ارزها
                 tasks = [process_single_symbol(symbol, session, bot, semaphore) for symbol in symbols]
                 await asyncio.gather(*tasks)
 
