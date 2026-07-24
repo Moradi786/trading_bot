@@ -139,7 +139,7 @@ class SelfLearningAIEngine:
     def __init__(self):
         self.model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05, random_state=42)
         self.is_trained = False
-        self.min_samples_to_train = 5  # یادگیری سریع فقط با ۵ معامله ثبت شده
+        self.min_samples_to_train = 5
 
     def retrain_model(self):
         try:
@@ -334,6 +334,52 @@ def calculate_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
+def calculate_dmi(highs, lows, closes, period=14):
+    """محاسبه DMI (+DI, -DI) و ADX برای سنجش قدرت روند و خروج از بازار رنج"""
+    if len(highs) < period * 2:
+        return 0.0, 0.0, 0.0
+
+    tr_list, plus_dm, minus_dm = [], [], []
+    for i in range(1, len(highs)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+
+        p_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        m_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        tr_list.append(tr)
+        plus_dm.append(p_dm)
+        minus_dm.append(m_dm)
+
+    if len(tr_list) < period:
+        return 0.0, 0.0, 0.0
+
+    smooth_tr = sum(tr_list[:period])
+    smooth_p_dm = sum(plus_dm[:period])
+    smooth_m_dm = sum(minus_dm[:period])
+
+    dx_list = []
+    for i in range(period, len(tr_list)):
+        smooth_tr = smooth_tr - (smooth_tr / period) + tr_list[i]
+        smooth_p_dm = smooth_p_dm - (smooth_p_dm / period) + plus_dm[i]
+        smooth_m_dm = smooth_m_dm - (smooth_m_dm / period) + minus_dm[i]
+
+        p_di = (smooth_p_dm / smooth_tr * 100) if smooth_tr > 0 else 0
+        m_di = (smooth_m_dm / smooth_tr * 100) if smooth_tr > 0 else 0
+
+        di_sum = p_di + m_di
+        dx = (abs(p_di - m_di) / di_sum * 100) if di_sum > 0 else 0
+        dx_list.append((p_di, m_di, dx))
+
+    if not dx_list:
+        return 0.0, 0.0, 0.0
+
+    last_p_di, last_m_di, _ = dx_list[-1]
+    adx = sum(x[2] for x in dx_list[-period:]) / period if len(dx_list) >= period else dx_list[-1][2]
+
+    return round(last_p_di, 2), round(last_m_di, 2), round(adx, 2)
+
 def calculate_atr(highs, lows, closes, period=14):
     if len(highs) < period + 1:
         return 0.0
@@ -486,6 +532,9 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
     current_live_price = float(klines[-1][4])
     rsi = calculate_rsi(closes)
+    rsi_prev = calculate_rsi(closes[:-1]) if len(closes) > 1 else rsi
+    plus_di, minus_di, adx = calculate_dmi(highs, lows, closes)
+
     atr = calculate_atr(highs, lows, closes)
     sma7 = sum(closes[-7:]) / 7
 
@@ -535,6 +584,28 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         'trend_code': trend_map.get(trend, 0)
     }
 
+    # ==================== STRATEGY 1: RSI + DMI (نوسانی) ====================
+    is_trending_market = adx >= 25.0
+    strong_buyers = (plus_di - minus_di) >= 5.0
+    strong_sellers = (minus_di - plus_di) >= 5.0
+
+    rsi_bullish_trigger = (rsi > rsi_prev) and (55.0 <= rsi <= 72.0)
+    rsi_bearish_trigger = (rsi < rsi_prev) and (28.0 <= rsi <= 45.0)
+
+    is_rsi_dmi_long = (
+        is_trending_market and
+        strong_buyers and
+        rsi_bullish_trigger and
+        is_volume_spike
+    )
+
+    is_rsi_dmi_short = (
+        is_trending_market and
+        strong_sellers and
+        rsi_bearish_trigger and
+        is_volume_spike
+    )
+
     # ==================== LONG SETUP ====================
     is_green_candle = (c_close > c_open)
     is_valid_size = (total_range >= 0.5 * atr)
@@ -562,8 +633,8 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         (is_near_htf_support or is_near_htf_resistance)
     )
 
-    if is_candle_setup_long or is_htf_range_breakout_long:
-        if not is_htf_range_breakout_long:
+    if is_candle_setup_long or is_htf_range_breakout_long or is_rsi_dmi_long:
+        if not is_htf_range_breakout_long and not is_rsi_dmi_long:
             if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BEARISH":
                 return None
 
@@ -587,6 +658,8 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 confirmed = []
+                if is_rsi_dmi_long:
+                    confirmed.append(f"🔥 RSI + DMI Momentum ({interval})")
                 if is_candle_setup_long:
                     confirmed.append(f"Candle Setup 📌 ({interval})")
                 if is_htf_range_breakout_long:
@@ -647,8 +720,8 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         (is_near_htf_resistance or is_near_htf_support)
     )
 
-    if is_candle_setup_short or is_htf_range_breakout_short:
-        if not is_htf_range_breakout_short:
+    if is_candle_setup_short or is_htf_range_breakout_short or is_rsi_dmi_short:
+        if not is_htf_range_breakout_short and not is_rsi_dmi_short:
             if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BULLISH":
                 return None
 
@@ -672,6 +745,8 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
             sl_percent = (risk / entry_price) * 100
             if sl_percent <= max_sl_percent:
                 confirmed = []
+                if is_rsi_dmi_short:
+                    confirmed.append(f"🔻 RSI + DMI Breakdown ({interval})")
                 if is_candle_setup_short:
                     confirmed.append(f"Candle Setup 📌 ({interval})")
                 if is_htf_range_breakout_short:
@@ -799,7 +874,6 @@ async def telegram_command_listener(bot):
             for update in updates:
                 last_update_id = update.update_id
 
-                # ۱. پردازش کلیک روی دکمه‌های زیر پیام سیگنال
                 if update.callback_query:
                     query = update.callback_query
                     data = query.data
@@ -828,7 +902,6 @@ async def telegram_command_listener(bot):
                         except Exception:
                             pass
 
-                # ۲. پردازش دستورات متنی کاربر
                 if update.message and update.message.text:
                     raw_text = update.message.text.strip()
                     cmd = raw_text.split('@')[0].lower()
@@ -978,7 +1051,6 @@ async def scanner_task():
                                 f"📈 **RSI:** `{signal['rsi']}` | Trend: `{signal['trend']}`"
                             )
 
-                            # ایجاد دکمه‌های تعاملی آموزش هوش مصنوعی زیر پیام
                             keyboard = InlineKeyboardMarkup([
                                 [
                                     InlineKeyboardButton("❌ سیگنال اشتباه (ثبت خطا)", callback_data=f"fb_bad_{signal['trade_id']}"),
