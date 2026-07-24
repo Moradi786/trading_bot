@@ -9,9 +9,10 @@ import pandas as pd
 from xgboost import XGBClassifier
 from telegram import Bot
 from telegram.constants import ParseMode
+import libsql_client
 
 # ---------------------------------------------------------
-# ۱. تنظیمات اولیه و متغیرهای عمومی
+# ۱. تنظیمات اولیه و متغیرهای محیطی
 # ---------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -22,6 +23,9 @@ LOGGER = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT = int(os.getenv("PORT", 8080))
+
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 
 if not TELEGRAM_BOT_TOKEN:
     LOGGER.error("❌ TELEGRAM_BOT_TOKEN تنظیم نشده!")
@@ -52,44 +56,87 @@ ALERT_TTL = 86400
 GLOBAL_BTC_TREND = "NEUTRAL"
 BTC_VOLATILITY_PAUSE_UNTIL = 0
 
-STATS = {
-    "total_signals": 0,
-    "tp1_hits": 0,
-    "tp2_hits": 0,
-    "tp3_hits": 0,
-    "sl_hits": 0
-}
-
 _symbol_cache = {"symbols": [], "last_update": 0}
 DB_NAME = "trading_ai_dataset.db"
 
 # ---------------------------------------------------------
-# ۲. دیتابیس SQLite و موتور یادگیری هوش مصنوعی
+# ۲. مدیریت دیتابیس ابری Turso + SQLite Fallback
 # ---------------------------------------------------------
-def init_db():
+def get_turso_client():
+    if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
+        try:
+            return libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+        except Exception as e:
+            LOGGER.error(f"❌ Error connecting to Turso DB: {e}")
+    return None
+
+def execute_db_query(query, params=()):
+    client = get_turso_client()
+    if client:
+        try:
+            client.execute(query, list(params))
+            client.close()
+            return True
+        except Exception as e:
+            LOGGER.error(f"❌ Turso Query Error: {e}")
+            client.close()
+
+    # Fallback to local SQLite
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trade_features (
-                id TEXT PRIMARY KEY,
-                symbol TEXT,
-                direction TEXT,
-                rsi REAL,
-                spread_pct REAL,
-                vol_ratio REAL,
-                lower_wick_ratio REAL,
-                upper_wick_ratio REAL,
-                trend_code INTEGER,
-                outcome INTEGER
-            )
-        ''')
+        cursor.execute(query, params)
         conn.commit()
         conn.close()
-        LOGGER.info("💾 SQLite Database initialized successfully.")
+        return True
     except Exception as e:
-        LOGGER.error(f"❌ Database initialization error: {e}")
+        LOGGER.error(f"❌ SQLite Query Error: {e}")
+        return False
 
+def fetch_db_df(query):
+    client = get_turso_client()
+    if client:
+        try:
+            res = client.execute(query)
+            cols = res.columns
+            rows = [list(r) for r in res.rows]
+            client.close()
+            return pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            LOGGER.error(f"❌ Turso Fetch Error: {e}")
+            client.close()
+
+    # Fallback to local SQLite
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        LOGGER.error(f"❌ SQLite Fetch Error: {e}")
+        return pd.DataFrame()
+
+def init_db():
+    create_table_sql = '''
+        CREATE TABLE IF NOT EXISTS trade_features (
+            id TEXT PRIMARY KEY,
+            symbol TEXT,
+            direction TEXT,
+            rsi REAL,
+            spread_pct REAL,
+            vol_ratio REAL,
+            lower_wick_ratio REAL,
+            upper_wick_ratio REAL,
+            trend_code INTEGER,
+            outcome INTEGER
+        )
+    '''
+    if execute_db_query(create_table_sql):
+        LOGGER.info("☁️ Persistent Cloud Database Initialized Successfully.")
+
+# ---------------------------------------------------------
+# ۳. سیستم یادگیری هوش مصنوعی (XGBoost)
+# ---------------------------------------------------------
 class SelfLearningAIEngine:
     def __init__(self):
         self.model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05, random_state=42)
@@ -98,16 +145,13 @@ class SelfLearningAIEngine:
 
     def retrain_model(self):
         try:
-            conn = sqlite3.connect(DB_NAME)
-            df = pd.read_sql_query("SELECT * FROM trade_features WHERE outcome IS NOT NULL", conn)
-            conn.close()
-
-            if len(df) < self.min_samples_to_train:
-                LOGGER.info(f"🧠 AI Learning: Need at least {self.min_samples_to_train} closed trades. Currently: {len(df)}")
+            df = fetch_db_df("SELECT * FROM trade_features WHERE outcome IS NOT NULL")
+            if df.empty or len(df) < self.min_samples_to_train:
+                LOGGER.info(f"🧠 AI Learning: Need at least {self.min_samples_to_train} closed trades. Currently in DB: {len(df)}")
                 return False
 
             X = df[['rsi', 'spread_pct', 'vol_ratio', 'lower_wick_ratio', 'upper_wick_ratio', 'trend_code']]
-            y = df['outcome']
+            y = df['outcome'].astype(int)
 
             if len(y.unique()) < 2:
                 LOGGER.info("🧠 AI Learning: Both Win and Loss samples are required to train.")
@@ -115,7 +159,7 @@ class SelfLearningAIEngine:
 
             self.model.fit(X, y)
             self.is_trained = True
-            LOGGER.info(f"✅ AI Model Successfully Retrained on {len(df)} past trades!")
+            LOGGER.info(f"✅ AI Model Retrained on {len(df)} past trades from Turso Cloud!")
             return True
         except Exception as e:
             LOGGER.error(f"❌ Error during AI retraining: {e}")
@@ -135,18 +179,12 @@ class SelfLearningAIEngine:
 ai_engine = SelfLearningAIEngine()
 
 def update_trade_outcome(trade_id, outcome):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE trade_features SET outcome = ? WHERE id = ?", (outcome, trade_id))
-        conn.commit()
-        conn.close()
-        ai_engine.retrain_model()
-    except Exception as e:
-        LOGGER.error(f"❌ Error updating trade outcome: {e}")
+    query = "UPDATE trade_features SET outcome = ? WHERE id = ?"
+    execute_db_query(query, (outcome, trade_id))
+    ai_engine.retrain_model()
 
 # ---------------------------------------------------------
-# ۳. Rate Limiting
+# ۴. Rate Limiter صرافی‌ها
 # ---------------------------------------------------------
 class RateLimiter:
     def __init__(self, rate=10, per=1):
@@ -173,9 +211,6 @@ binance_limiter = RateLimiter(rate=20, per=1)
 bybit_limiter = RateLimiter(rate=10, per=1)
 okx_limiter = RateLimiter(rate=10, per=1)
 
-# ---------------------------------------------------------
-# ۴. صرافی‌ها و پارسرها
-# ---------------------------------------------------------
 def _parse_bybit(data):
     try:
         if data.get("retCode") != 0:
@@ -273,7 +308,7 @@ async def cross_check_price(session, symbol):
     return True, prices
 
 # ---------------------------------------------------------
-# ۶. اندیکاتورها
+# ۶. اندیکاتورها و فرمول‌های تحلیل
 # ---------------------------------------------------------
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -352,7 +387,7 @@ def extract_htf_sr_levels(klines_4h, klines_1d):
     return supports, resistances
 
 # ---------------------------------------------------------
-# ۷. دریافت داده‌ها
+# ۷. دریافت کندل‌ها و لیست ارزها
 # ---------------------------------------------------------
 async def fetch_klines_with_failover(session, symbol, interval):
     sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
@@ -430,7 +465,7 @@ async def get_all_usdt_symbols_cached(session):
     return _symbol_cache["symbols"]
 
 # ---------------------------------------------------------
-# ۸. تحلیل تکنیکال و فیلتر هوش مصنوعی (ارتقاء‌یافته)
+# ۸. تحلیل تکنیکال و فیلتر هوشمند
 # ---------------------------------------------------------
 def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=2.0):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
@@ -530,12 +565,10 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     )
 
     if is_candle_setup_long or is_htf_range_breakout_long:
-        # ۱. اگر ستاپ Breakout باشد، شرط هم‌جهتی با بیت‌کوین نادیده گرفته می‌شود (کوین‌های مستقل)
         if not is_htf_range_breakout_long:
             if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BEARISH":
                 return None
 
-        # ۲. سقف RSI تا ۸۰ افزایش یافت تا شکست‌های قدرتمند از دست نروند
         if rsi > 80.0:
             return None
 
@@ -565,18 +598,14 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                 strategy_text = " + ".join(confirmed)
 
                 trade_id = f"{symbol}_{int(time.time())}"
-                try:
-                    conn = sqlite3.connect(DB_NAME)
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                    ''', (trade_id, symbol, "LONG", feature_dict['rsi'], feature_dict['spread_pct'],
-                          feature_dict['vol_ratio'], feature_dict['lower_wick_ratio'],
-                          feature_dict['upper_wick_ratio'], feature_dict['trend_code']))
-                    conn.commit()
-                    conn.close()
-                except Exception as e:
-                    LOGGER.error(f"❌ Error inserting trade feature to DB: {e}")
+                
+                # ذخیره مستقیم در Turso Cloud Database
+                insert_sql = "INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+                execute_db_query(insert_sql, (
+                    trade_id, symbol, "LONG", feature_dict['rsi'], feature_dict['spread_pct'],
+                    feature_dict['vol_ratio'], feature_dict['lower_wick_ratio'],
+                    feature_dict['upper_wick_ratio'], feature_dict['trend_code']
+                ))
 
                 return {
                     "trade_id": trade_id,
@@ -622,12 +651,10 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     )
 
     if is_candle_setup_short or is_htf_range_breakout_short:
-        # ۱. نادیده گرفتن شرط بیت‌کوین در شکست‌های منفی (Breakdown)
         if not is_htf_range_breakout_short:
             if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BULLISH":
                 return None
 
-        # ۲. کاهش کف RSI تا ۲۰ برای ریزش‌های شدید
         if rsi < 20.0:
             return None
 
@@ -657,18 +684,14 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                 strategy_text = " + ".join(confirmed)
 
                 trade_id = f"{symbol}_{int(time.time())}"
-                try:
-                    conn = sqlite3.connect(DB_NAME)
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                    ''', (trade_id, symbol, "SHORT", feature_dict['rsi'], feature_dict['spread_pct'],
-                          feature_dict['vol_ratio'], feature_dict['lower_wick_ratio'],
-                          feature_dict['upper_wick_ratio'], feature_dict['trend_code']))
-                    conn.commit()
-                    conn.close()
-                except Exception as e:
-                    LOGGER.error(f"❌ Error inserting trade feature to DB: {e}")
+                
+                # ذخیره مستقیم در Turso Cloud Database
+                insert_sql = "INSERT INTO trade_features VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+                execute_db_query(insert_sql, (
+                    trade_id, symbol, "SHORT", feature_dict['rsi'], feature_dict['spread_pct'],
+                    feature_dict['vol_ratio'], feature_dict['lower_wick_ratio'],
+                    feature_dict['upper_wick_ratio'], feature_dict['trend_code']
+                ))
 
                 return {
                     "trade_id": trade_id,
@@ -690,7 +713,7 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     return None
 
 # ---------------------------------------------------------
-# ۹. تعقیب پوزیشن‌ها و یادگیری از نتیجه
+# ۹. تعقیب معاملات و به روزرسانی دیتابیس ابری
 # ---------------------------------------------------------
 async def track_active_trades(session, bot):
     if not active_trades:
@@ -715,14 +738,12 @@ async def track_active_trades(session, bot):
                 if current_price <= trade["stop_loss"]:
                     msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                    STATS["sl_hits"] += 1
                     update_trade_outcome(trade["db_id"], 0)
                     del active_trades[trade_id]
 
                 elif current_price >= trade["tp3"] and not trade.get("tp3_hit"):
                     msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                    STATS["tp3_hits"] += 1
                     update_trade_outcome(trade["db_id"], 1)
                     del active_trades[trade_id]
 
@@ -730,26 +751,22 @@ async def track_active_trades(session, bot):
                     active_trades[trade_id]["tp2_hit"] = True
                     msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                    STATS["tp2_hits"] += 1
 
                 elif current_price >= trade["tp1"] and not trade.get("tp1_hit"):
                     active_trades[trade_id]["tp1_hit"] = True
                     msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                    STATS["tp1_hits"] += 1
 
             elif trade["direction"] == "SHORT 🔴":
                 if current_price >= trade["stop_loss"]:
                     msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                    STATS["sl_hits"] += 1
                     update_trade_outcome(trade["db_id"], 0)
                     del active_trades[trade_id]
 
                 elif current_price <= trade["tp3"] and not trade.get("tp3_hit"):
                     msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                    STATS["tp3_hits"] += 1
                     update_trade_outcome(trade["db_id"], 1)
                     del active_trades[trade_id]
 
@@ -757,16 +774,14 @@ async def track_active_trades(session, bot):
                     active_trades[trade_id]["tp2_hit"] = True
                     msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                    STATS["tp2_hits"] += 1
 
                 elif current_price <= trade["tp1"] and not trade.get("tp1_hit"):
                     active_trades[trade_id]["tp1_hit"] = True
                     msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
-                    STATS["tp1_hits"] += 1
 
 # ---------------------------------------------------------
-# ۱۰. ارسال تلگرام و دستورات
+# ۱۰. تلگرام و دستورات (ارسال مستقیم از Turso)
 # ---------------------------------------------------------
 async def send_telegram_message(bot, chat_id, text, reply_markup=None, retries=3):
     for i in range(retries):
@@ -793,18 +808,20 @@ async def telegram_command_listener(bot):
                     chat_id = update.message.chat_id
 
                     if cmd == "/stats":
-                        total = STATS["total_signals"]
-                        tp1 = STATS["tp1_hits"]
-                        tp2 = STATS["tp2_hits"]
-                        tp3 = STATS["tp3_hits"]
-                        sl = STATS["sl_hits"]
-                        win_rate = round(((tp1 + tp2 + tp3) / total * 100), 1) if total > 0 else 0.0
+                        # محاسبه مستقیم و دائمی از Turso Database
+                        df_all = fetch_db_df("SELECT * FROM trade_features")
+                        total = len(df_all)
+                        
+                        df_closed = df_all[df_all['outcome'].notnull()] if not df_all.empty else pd.DataFrame()
+                        wins = len(df_closed[df_closed['outcome'] == 1]) if not df_closed.empty else 0
+                        sl = len(df_closed[df_closed['outcome'] == 0]) if not df_closed.empty else 0
+                        
+                        win_rate = round((wins / len(df_closed) * 100), 1) if not df_closed.empty and len(df_closed) > 0 else 0.0
+                        
                         msg = (
-                            f"📊 **Bot Performance & Win Rate Stats**\n\n"
-                            f"🔢 **Total Signals Sent:** `{total}`\n"
-                            f"🎯 **TP1 Hits:** `{tp1}`\n"
-                            f"🚀 **TP2 Hits:** `{tp2}`\n"
-                            f"🔥 **TP3 Hits:** `{tp3}`\n"
+                            f"📊 **Bot Performance & Win Rate Stats (Turso Cloud)**\n\n"
+                            f"🔢 **Total Signals Saved:** `{total}`\n"
+                            f"🎯 **Successful Trades (Wins):** `{wins}`\n"
                             f"❌ **Stop Loss Hits:** `{sl}`\n\n"
                             f"🏆 **Current Win Rate:** `{win_rate}%`"
                         )
@@ -825,11 +842,13 @@ async def telegram_command_listener(bot):
                         await send_telegram_message(bot, chat_id, "⏸️ **Volatility pause deactivated.**\n✅ Bot is now active.")
 
                     elif cmd == "/debug":
+                        df_all = fetch_db_df("SELECT * FROM trade_features")
                         msg = (
                             "🔍 **Debug Info:**\n\n"
                             f"🌐 BTC Trend: `{GLOBAL_BTC_TREND}`\n"
                             f"⏸️ Volatility Pause: `{'YES' if time.time() < BTC_VOLATILITY_PAUSE_UNTIL else 'NO'}`\n"
                             f"🤖 AI Model Trained: `{'YES' if ai_engine.is_trained else 'NO (Collecting Data)'}`\n"
+                            f"☁️ Cloud DB Saved Signals: `{len(df_all)}`\n"
                             f"📊 Active Trades: `{len(active_trades)}`\n"
                             f"💾 Cached Symbols: `{len(_symbol_cache['symbols'])}`"
                         )
@@ -838,10 +857,10 @@ async def telegram_command_listener(bot):
                     elif cmd in ["/start", "/help"]:
                         msg = (
                             "🤖 **Trading Bot Control Menu**\n\n"
-                            "▫️ `/stats` : مشاهده آمار\n"
+                            "▫️ `/stats` : آمار ابدی دیتابیس ابری\n"
                             "▫️ `/active` : پوزیشن‌های فعال\n"
-                            "▫️ `/pause` : غیرفعال کردن Volatility Pause\n"
-                            "▫️ `/debug` : اطلاعات دیباگ\n"
+                            "▫️ `/pause` : لغو غیرفعال بودن نوسان\n"
+                            "▫️ `/debug` : اطلاعات دیباگ و دیتابیس\n"
                             "▫️ `/help` : راهنما"
                         )
                         await send_telegram_message(bot, chat_id, msg)
@@ -856,7 +875,7 @@ def cleanup_old_alerts():
         del sent_alerts[k]
 
 # ---------------------------------------------------------
-# ۱۱. اسکنر اصلی و وب‌سرور Render
+# ۱۱. اجرای اصلی و وب‌سرور Render
 # ---------------------------------------------------------
 async def handle_health_check(request):
     return web.Response(text="Trading Bot AI service is live & active!")
@@ -918,7 +937,6 @@ async def scanner_task():
                                 continue
 
                             sent_alerts[alert_key] = time.time()
-                            STATS["total_signals"] += 1
 
                             msg = (
                                 f"🚨 **NEW TRADING SIGNAL** 🚨\n\n"
