@@ -41,10 +41,10 @@ except ValueError:
     pass
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
-MAX_SL_PERCENT = 2.0
+MAX_SL_PERCENT = 5.0  # تغییر حد زیان تا ۵ درصد
 MIN_BTC_VOLUME = 250.0
 MAX_SIGNAL_AGE_SECONDS = 180
-MAX_SLIPPAGE_PERCENT = 0.2
+SLIPPAGE_WARNING_THRESHOLD = 0.3  # آستانه هشدار لغزش ۰.۳ درصد
 
 VOLATILITY_PAUSE_MINUTES = 15
 VOLATILITY_THRESHOLD_PERCENT = 2.5
@@ -335,7 +335,6 @@ def calculate_rsi(closes, period=14):
     return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
 def calculate_dmi(highs, lows, closes, period=14):
-    """محاسبه DMI (+DI, -DI) و ADX برای سنجش قدرت روند و خروج از بازار رنج"""
     if len(highs) < period * 2:
         return 0.0, 0.0, 0.0
 
@@ -511,7 +510,7 @@ async def get_all_usdt_symbols_cached(session):
 # ---------------------------------------------------------
 # ۸. تحلیل تکنیکال و فیلتر هوشمند
 # ---------------------------------------------------------
-def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=2.0):
+def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=5.0):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
         return None
     if len(klines) < 50:
@@ -584,7 +583,7 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         'trend_code': trend_map.get(trend, 0)
     }
 
-    # ==================== STRATEGY 1: RSI + DMI (نوسانی) ====================
+    # ==================== STRATEGY 1: RSI + DMI ====================
     is_trending_market = adx >= 25.0
     strong_buyers = (plus_di - minus_di) >= 5.0
     strong_sellers = (minus_di - plus_di) >= 5.0
@@ -633,30 +632,25 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         (is_near_htf_support or is_near_htf_resistance)
     )
 
-    if is_candle_setup_long or is_htf_range_breakout_long or is_rsi_dmi_long:
-        if not is_htf_range_breakout_long and not is_rsi_dmi_long:
-            if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BEARISH":
-                return None
+    is_smc_long = (is_liquidity_sweep_long and is_volume_spike)
 
+    if is_candle_setup_long or is_htf_range_breakout_long or is_rsi_dmi_long or is_smc_long:
         if rsi > 80.0:
             return None
 
+        # پیش‌بینی هوش مصنوعی (بدون رد کردن سیگنال)
         win_probability = ai_engine.predict_signal_quality(feature_dict)
-        if win_probability < 0.60:
-            LOGGER.info(f"🤖 AI Filter Rejected LONG signal for {symbol} (Score: {win_probability*100:.1f}%)")
-            return None
+        ai_score = round(win_probability * 100, 1)
 
         entry_price = c_close
-        price_diff_percent = ((current_live_price - entry_price) / entry_price) * 100
-        if price_diff_percent > MAX_SLIPPAGE_PERCENT:
-            return None
+        price_diff_percent = abs((current_live_price - entry_price) / entry_price) * 100
 
         stop_loss = max(c_low, entry_price - (1.5 * atr))
         risk = entry_price - stop_loss
 
         if risk > 0:
             sl_percent = (risk / entry_price) * 100
-            if sl_percent <= max_sl_percent:
+            if sl_percent <= max_sl_percent:  # حد زیان حداکثر ۵٪
                 confirmed = []
                 if is_rsi_dmi_long:
                     confirmed.append(f"🔥 RSI + DMI Momentum ({interval})")
@@ -664,7 +658,7 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                     confirmed.append(f"Candle Setup 📌 ({interval})")
                 if is_htf_range_breakout_long:
                     confirmed.append(f"Range Breakout 🚀 ({interval})")
-                if is_liquidity_sweep_long:
+                if is_smc_long:
                     confirmed.append(f"SMC Liquidity Sweep 🎯 ({interval})")
                 strategy_text = " + ".join(confirmed)
 
@@ -689,7 +683,8 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                     "tp3": round(entry_price + (risk * 7), 5),
                     "sma7": round(sma7, 5),
                     "rsi": rsi,
-                    "ai_score": round(win_probability * 100, 1),
+                    "ai_score": ai_score,
+                    "price_diff_percent": round(price_diff_percent, 2),
                     "trend": trend,
                     "candle_time": closed_klines[-1][0]
                 }
@@ -720,30 +715,25 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         (is_near_htf_resistance or is_near_htf_support)
     )
 
-    if is_candle_setup_short or is_htf_range_breakout_short or is_rsi_dmi_short:
-        if not is_htf_range_breakout_short and not is_rsi_dmi_short:
-            if symbol != "BTCUSDT" and GLOBAL_BTC_TREND == "BULLISH":
-                return None
+    is_smc_short = (is_liquidity_sweep_short and is_volume_spike)
 
+    if is_candle_setup_short or is_htf_range_breakout_short or is_rsi_dmi_short or is_smc_short:
         if rsi < 20.0:
             return None
 
+        # پیش‌بینی هوش مصنوعی (بدون رد کردن سیگنال)
         win_probability = ai_engine.predict_signal_quality(feature_dict)
-        if win_probability < 0.60:
-            LOGGER.info(f"🤖 AI Filter Rejected SHORT signal for {symbol} (Score: {win_probability*100:.1f}%)")
-            return None
+        ai_score = round(win_probability * 100, 1)
 
         entry_price = c_close
-        price_diff_percent = ((entry_price - current_live_price) / entry_price) * 100
-        if price_diff_percent > MAX_SLIPPAGE_PERCENT:
-            return None
+        price_diff_percent = abs((entry_price - current_live_price) / entry_price) * 100
 
         stop_loss = min(c_high, entry_price + (1.5 * atr))
         risk = stop_loss - entry_price
 
         if risk > 0:
             sl_percent = (risk / entry_price) * 100
-            if sl_percent <= max_sl_percent:
+            if sl_percent <= max_sl_percent:  # حد زیان حداکثر ۵٪
                 confirmed = []
                 if is_rsi_dmi_short:
                     confirmed.append(f"🔻 RSI + DMI Breakdown ({interval})")
@@ -751,7 +741,7 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                     confirmed.append(f"Candle Setup 📌 ({interval})")
                 if is_htf_range_breakout_short:
                     confirmed.append(f"Range Breakdown 📉 ({interval})")
-                if is_liquidity_sweep_short:
+                if is_smc_short:
                     confirmed.append(f"SMC Liquidity Sweep 🎯 ({interval})")
                 strategy_text = " + ".join(confirmed)
 
@@ -776,7 +766,8 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
                     "tp3": round(entry_price - (risk * 7), 5),
                     "sma7": round(sma7, 5),
                     "rsi": rsi,
-                    "ai_score": round(win_probability * 100, 1),
+                    "ai_score": ai_score,
+                    "price_diff_percent": round(price_diff_percent, 2),
                     "trend": trend,
                     "candle_time": closed_klines[-1][0]
                 }
@@ -1037,12 +1028,24 @@ async def scanner_task():
 
                             sent_alerts[alert_key] = time.time()
 
+                            # ساخت هشدار AI در صورت اطمینان زیر ۶۰٪
+                            ai_warning_text = ""
+                            if signal['ai_score'] < 60.0:
+                                ai_warning_text = "\n⚠️ **تذکر AI:** درصد اطمینان زیر ۶۰٪ است. معامله پیشنهاد نمی‌شود (ارسال جهت آموزش و یادگیری AI)."
+
+                            # ساخت هشدار حرکت قیمت در صورت لغزش بالای ۰.۳٪
+                            slippage_warning_text = ""
+                            if signal['price_diff_percent'] > SLIPPAGE_WARNING_THRESHOLD:
+                                slippage_warning_text = f"\n⚠️ **هشدار حرکت قیمت:** قیمت به میزان `{signal['price_diff_percent']}%` حرکت کرده است."
+
                             msg = (
                                 f"🚨 **NEW TRADING SIGNAL** 🚨\n\n"
                                 f"🪙 **Symbol:** `#{symbol}`\n"
                                 f"📊 **Direction:** `{signal['direction']}`\n"
                                 f"🎯 **Strategy:** `{signal['strategy']}`\n"
-                                f"🤖 **AI Score:** `{signal['ai_score']}%` Confidence\n\n"
+                                f"🤖 **AI Score:** `{signal['ai_score']}%` Confidence"
+                                f"{ai_warning_text}"
+                                f"{slippage_warning_text}\n\n"
                                 f"💵 **Entry Price:** `{signal['entry_price']}`\n"
                                 f"🛑 **Stop Loss:** `{signal['stop_loss']}` (-{signal['sl_percent']}%)\n\n"
                                 f"🎯 **TP1:** `{signal['tp1']}`\n"
