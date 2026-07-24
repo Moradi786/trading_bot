@@ -41,10 +41,11 @@ except ValueError:
     pass
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
-MAX_SL_PERCENT = 5.0  # تغییر حد زیان تا ۵ درصد
+MAX_SL_PERCENT = 5.0  # حد زیان حداکثر ۵ درصد
 MIN_BTC_VOLUME = 250.0
 MAX_SIGNAL_AGE_SECONDS = 180
 SLIPPAGE_WARNING_THRESHOLD = 0.3  # آستانه هشدار لغزش ۰.۳ درصد
+CONCURRENT_SCAN_LIMIT = 10        # تعداد اسکن هم‌زمان ایمن (۱۰ ارز با هم)
 
 VOLATILITY_PAUSE_MINUTES = 15
 VOLATILITY_THRESHOLD_PERCENT = 2.5
@@ -449,7 +450,7 @@ async def fetch_klines_with_failover(session, symbol, interval):
                             return klines
         except Exception:
             pass
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.02)
     return None
 
 async def update_btc_trend_and_volatility(session):
@@ -638,7 +639,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         if rsi > 80.0:
             return None
 
-        # پیش‌بینی هوش مصنوعی (بدون رد کردن سیگنال)
         win_probability = ai_engine.predict_signal_quality(feature_dict)
         ai_score = round(win_probability * 100, 1)
 
@@ -650,7 +650,7 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
         if risk > 0:
             sl_percent = (risk / entry_price) * 100
-            if sl_percent <= max_sl_percent:  # حد زیان حداکثر ۵٪
+            if sl_percent <= max_sl_percent:
                 confirmed = []
                 if is_rsi_dmi_long:
                     confirmed.append(f"🔥 RSI + DMI Momentum ({interval})")
@@ -721,7 +721,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         if rsi < 20.0:
             return None
 
-        # پیش‌بینی هوش مصنوعی (بدون رد کردن سیگنال)
         win_probability = ai_engine.predict_signal_quality(feature_dict)
         ai_score = round(win_probability * 100, 1)
 
@@ -733,7 +732,7 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
         if risk > 0:
             sl_percent = (risk / entry_price) * 100
-            if sl_percent <= max_sl_percent:  # حد زیان حداکثر ۵٪
+            if sl_percent <= max_sl_percent:
                 confirmed = []
                 if is_rsi_dmi_short:
                     confirmed.append(f"🔻 RSI + DMI Breakdown ({interval})")
@@ -965,7 +964,87 @@ def cleanup_old_alerts():
         del sent_alerts[k]
 
 # ---------------------------------------------------------
-# ۱۱. اجرای اصلی و وب‌سرور Render
+# ۱۱. پردازش موازی ارزها با Semaphore (اسکن هم‌زمان ۱۰ تایی)
+# ---------------------------------------------------------
+async def process_single_symbol(symbol, session, bot, semaphore):
+    async with semaphore:
+        try:
+            if symbol in ["ANTHROPICUSDT", "ANTHRCUSDT"]:
+                ok, _ = await cross_check_price(session, symbol)
+                if not ok:
+                    return
+
+            klines_4h = await fetch_klines_with_failover(session, symbol, "4h")
+            klines_1d = await fetch_klines_with_failover(session, symbol, "1d")
+            htf_supports, htf_resistances = extract_htf_sr_levels(klines_4h, klines_1d)
+
+            for interval in TIMEFRAMES:
+                klines = await fetch_klines_with_failover(session, symbol, interval)
+                if not klines:
+                    continue
+
+                signal = analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, MAX_SL_PERCENT)
+                if signal:
+                    alert_key = f"{symbol}_{interval}_{signal['candle_time']}"
+                    if alert_key in sent_alerts:
+                        continue
+
+                    sent_alerts[alert_key] = time.time()
+
+                    ai_warning_text = ""
+                    if signal['ai_score'] < 60.0:
+                        ai_warning_text = "\n⚠️ **تذکر AI:** درصد اطمینان زیر ۶۰٪ است. معامله پیشنهاد نمی‌شود (ارسال جهت آموزش و یادگیری AI)."
+
+                    slippage_warning_text = ""
+                    if signal['price_diff_percent'] > SLIPPAGE_WARNING_THRESHOLD:
+                        slippage_warning_text = f"\n⚠️ **هشدار حرکت قیمت:** قیمت به میزان `{signal['price_diff_percent']}%` حرکت کرده است."
+
+                    msg = (
+                        f"🚨 **NEW TRADING SIGNAL** 🚨\n\n"
+                        f"🪙 **Symbol:** `#{symbol}`\n"
+                        f"📊 **Direction:** `{signal['direction']}`\n"
+                        f"🎯 **Strategy:** `{signal['strategy']}`\n"
+                        f"🤖 **AI Score:** `{signal['ai_score']}%` Confidence"
+                        f"{ai_warning_text}"
+                        f"{slippage_warning_text}\n\n"
+                        f"💵 **Entry Price:** `{signal['entry_price']}`\n"
+                        f"🛑 **Stop Loss:** `{signal['stop_loss']}` (-{signal['sl_percent']}%)\n\n"
+                        f"🎯 **TP1:** `{signal['tp1']}`\n"
+                        f"🚀 **TP2:** `{signal['tp2']}`\n"
+                        f"🔥 **TP3:** `{signal['tp3']}`\n\n"
+                        f"📈 **RSI:** `{signal['rsi']}` | Trend: `{signal['trend']}`"
+                    )
+
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("❌ سیگنال اشتباه (ثبت خطا)", callback_data=f"fb_bad_{signal['trade_id']}"),
+                            InlineKeyboardButton("✅ سیگنال خوب", callback_data=f"fb_good_{signal['trade_id']}")
+                        ]
+                    ])
+
+                    await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg, reply_markup=keyboard)
+
+                    trade_key = f"{symbol}_{interval}"
+                    async with active_trades_lock:
+                        active_trades[trade_key] = {
+                            "symbol": symbol,
+                            "direction": signal["direction"],
+                            "entry_price": signal["entry_price"],
+                            "stop_loss": signal["stop_loss"],
+                            "sl_percent": signal["sl_percent"],
+                            "tp1": signal["tp1"],
+                            "tp2": signal["tp2"],
+                            "tp3": signal["tp3"],
+                            "db_id": signal["trade_id"],
+                            "tp1_hit": False,
+                            "tp2_hit": False,
+                            "tp3_hit": False
+                        }
+        except Exception as e:
+            LOGGER.error(f"Error processing {symbol}: {e}")
+
+# ---------------------------------------------------------
+# ۱۲. اجرای اصلی و وب‌سرور Render
 # ---------------------------------------------------------
 async def handle_health_check(request):
     return web.Response(text="Trading Bot AI service is live & active!")
@@ -995,6 +1074,9 @@ async def scanner_task():
         symbols = await get_all_usdt_symbols_cached(session)
         btc_counter = 0
 
+        # محدودکننده اسکن هم‌زمان (۱۰ ارز به‌صورت موازی)
+        semaphore = asyncio.Semaphore(CONCURRENT_SCAN_LIMIT)
+
         while True:
             try:
                 btc_counter += 1
@@ -1005,84 +1087,11 @@ async def scanner_task():
                 await track_active_trades(session, bot)
                 cleanup_old_alerts()
 
-                for symbol in symbols:
-                    if symbol in ["ANTHROPICUSDT", "ANTHRCUSDT"]:
-                        ok, _ = await cross_check_price(session, symbol)
-                        if not ok:
-                            continue
+                # اجرای موازی اسکن برای تمام ارزها
+                tasks = [process_single_symbol(symbol, session, bot, semaphore) for symbol in symbols]
+                await asyncio.gather(*tasks)
 
-                    klines_4h = await fetch_klines_with_failover(session, symbol, "4h")
-                    klines_1d = await fetch_klines_with_failover(session, symbol, "1d")
-                    htf_supports, htf_resistances = extract_htf_sr_levels(klines_4h, klines_1d)
-
-                    for interval in TIMEFRAMES:
-                        klines = await fetch_klines_with_failover(session, symbol, interval)
-                        if not klines:
-                            continue
-
-                        signal = analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, MAX_SL_PERCENT)
-                        if signal:
-                            alert_key = f"{symbol}_{interval}_{signal['candle_time']}"
-                            if alert_key in sent_alerts:
-                                continue
-
-                            sent_alerts[alert_key] = time.time()
-
-                            # ساخت هشدار AI در صورت اطمینان زیر ۶۰٪
-                            ai_warning_text = ""
-                            if signal['ai_score'] < 60.0:
-                                ai_warning_text = "\n⚠️ **تذکر AI:** درصد اطمینان زیر ۶۰٪ است. معامله پیشنهاد نمی‌شود (ارسال جهت آموزش و یادگیری AI)."
-
-                            # ساخت هشدار حرکت قیمت در صورت لغزش بالای ۰.۳٪
-                            slippage_warning_text = ""
-                            if signal['price_diff_percent'] > SLIPPAGE_WARNING_THRESHOLD:
-                                slippage_warning_text = f"\n⚠️ **هشدار حرکت قیمت:** قیمت به میزان `{signal['price_diff_percent']}%` حرکت کرده است."
-
-                            msg = (
-                                f"🚨 **NEW TRADING SIGNAL** 🚨\n\n"
-                                f"🪙 **Symbol:** `#{symbol}`\n"
-                                f"📊 **Direction:** `{signal['direction']}`\n"
-                                f"🎯 **Strategy:** `{signal['strategy']}`\n"
-                                f"🤖 **AI Score:** `{signal['ai_score']}%` Confidence"
-                                f"{ai_warning_text}"
-                                f"{slippage_warning_text}\n\n"
-                                f"💵 **Entry Price:** `{signal['entry_price']}`\n"
-                                f"🛑 **Stop Loss:** `{signal['stop_loss']}` (-{signal['sl_percent']}%)\n\n"
-                                f"🎯 **TP1:** `{signal['tp1']}`\n"
-                                f"🚀 **TP2:** `{signal['tp2']}`\n"
-                                f"🔥 **TP3:** `{signal['tp3']}`\n\n"
-                                f"📈 **RSI:** `{signal['rsi']}` | Trend: `{signal['trend']}`"
-                            )
-
-                            keyboard = InlineKeyboardMarkup([
-                                [
-                                    InlineKeyboardButton("❌ سیگنال اشتباه (ثبت خطا)", callback_data=f"fb_bad_{signal['trade_id']}"),
-                                    InlineKeyboardButton("✅ سیگنال خوب", callback_data=f"fb_good_{signal['trade_id']}")
-                                ]
-                            ])
-
-                            await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg, reply_markup=keyboard)
-
-                            trade_key = f"{symbol}_{interval}"
-                            async with active_trades_lock:
-                                active_trades[trade_key] = {
-                                    "symbol": symbol,
-                                    "direction": signal["direction"],
-                                    "entry_price": signal["entry_price"],
-                                    "stop_loss": signal["stop_loss"],
-                                    "sl_percent": signal["sl_percent"],
-                                    "tp1": signal["tp1"],
-                                    "tp2": signal["tp2"],
-                                    "tp3": signal["tp3"],
-                                    "db_id": signal["trade_id"],
-                                    "tp1_hit": False,
-                                    "tp2_hit": False,
-                                    "tp3_hit": False
-                                }
-
-                        await asyncio.sleep(0.05)
-
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
 
             except Exception as e:
                 LOGGER.error(f"Error in scanner loop: {e}")
