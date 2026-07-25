@@ -46,7 +46,7 @@ MAX_SL_PERCENT = 5.0  # حد زیان حداکثر ۵ درصد
 MIN_BTC_VOLUME = 250.0
 MAX_SIGNAL_AGE_SECONDS = 180
 SLIPPAGE_WARNING_THRESHOLD = 0.3  # آستانه هشدار لغزش ۰.۳ درصد
-CONCURRENT_SCAN_LIMIT = 10        # تعداد اسکن هم‌زمان ایمن (۱۰ ارز با هم)
+CONCURRENT_SCAN_LIMIT = 10        # اسکن هم‌زمان ۱۰ ارز با هم
 
 VOLATILITY_PAUSE_MINUTES = 15
 VOLATILITY_THRESHOLD_PERCENT = 2.5
@@ -619,7 +619,6 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
 
     trend_map = {"BULLISH": 1, "NEUTRAL": 0, "BEARISH": -1}
     
-    # 🧠 ۱۱ ویژگی کامل هوش مصنوعی
     feature_dict = {
         'rsi': float(rsi),
         'spread_pct': float(spread_pct),
@@ -837,7 +836,7 @@ async def track_active_trades(session, bot):
     async with active_trades_lock:
         trades = list(active_trades.items())
 
-    for trade_id, trade in trades:
+    for trade_key, trade in trades:
         symbol = trade["symbol"]
         klines = await fetch_klines_with_failover(session, symbol, "15m")
         if not klines:
@@ -846,7 +845,7 @@ async def track_active_trades(session, bot):
         current_price = float(klines[-1][4])
 
         async with active_trades_lock:
-            if trade_id not in active_trades:
+            if trade_key not in active_trades:
                 continue
 
             if trade["direction"] == "LONG 🟢":
@@ -854,21 +853,21 @@ async def track_active_trades(session, bot):
                     msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     update_trade_outcome(trade["db_id"], 0)
-                    del active_trades[trade_id]
+                    del active_trades[trade_key]
 
                 elif current_price >= trade["tp3"] and not trade.get("tp3_hit"):
                     msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     update_trade_outcome(trade["db_id"], 1)
-                    del active_trades[trade_id]
+                    del active_trades[trade_key]
 
                 elif current_price >= trade["tp2"] and not trade.get("tp2_hit"):
-                    active_trades[trade_id]["tp2_hit"] = True
+                    active_trades[trade_key]["tp2_hit"] = True
                     msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
 
                 elif current_price >= trade["tp1"] and not trade.get("tp1_hit"):
-                    active_trades[trade_id]["tp1_hit"] = True
+                    active_trades[trade_key]["tp1_hit"] = True
                     msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
 
@@ -877,21 +876,21 @@ async def track_active_trades(session, bot):
                     msg = f"❌ **Stop Loss Hit!**\n🪙 `#{symbol}` | SL: `{trade['stop_loss']}` (-{trade['sl_percent']}%)"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     update_trade_outcome(trade["db_id"], 0)
-                    del active_trades[trade_id]
+                    del active_trades[trade_key]
 
                 elif current_price <= trade["tp3"] and not trade.get("tp3_hit"):
                     msg = f"🎯🎯🎯 **ALL TARGETS HIT (TP3)!**\n🪙 `#{symbol}` | Final Price: `{current_price}` 🔥"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
                     update_trade_outcome(trade["db_id"], 1)
-                    del active_trades[trade_id]
+                    del active_trades[trade_key]
 
                 elif current_price <= trade["tp2"] and not trade.get("tp2_hit"):
-                    active_trades[trade_id]["tp2_hit"] = True
+                    active_trades[trade_key]["tp2_hit"] = True
                     msg = f"🚀 **Target 2 Hit (TP2)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
 
                 elif current_price <= trade["tp1"] and not trade.get("tp1_hit"):
-                    active_trades[trade_id]["tp1_hit"] = True
+                    active_trades[trade_key]["tp1_hit"] = True
                     msg = f"✅ **Target 1 Hit (TP1)!**\n🪙 `#{symbol}` | Price: `{current_price}`"
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
 
@@ -1018,11 +1017,17 @@ def cleanup_old_alerts():
         del sent_alerts[k]
 
 # ---------------------------------------------------------
-# ۱۱. پردازش موازی ارزها با Semaphore (اسکن هم‌زمان ۱۰ تایی)
+# ۱۱. پردازش موازی ارزها (اسکن هوشمند بدون سیگنال تکراری)
 # ---------------------------------------------------------
 async def process_single_symbol(symbol, session, bot, semaphore):
     async with semaphore:
         try:
+            # ⛔ ۱. اگر این ارز در حال حاضر پوزیشن فعال دارد، تایم‌فریم‌های دیگر را اسکن نکن
+            async with active_trades_lock:
+                has_active_trade = any(v["symbol"] == symbol for v in active_trades.values())
+            if has_active_trade:
+                return
+
             if symbol in ["ANTHROPICUSDT", "ANTHRCUSDT"]:
                 ok, _ = await cross_check_price(session, symbol)
                 if not ok:
@@ -1039,15 +1044,15 @@ async def process_single_symbol(symbol, session, bot, semaphore):
 
                 signal = analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, MAX_SL_PERCENT)
                 if signal:
+                    # ⛔ ۲. فیلتر سیگنال‌های ضعیف (ارسال فقط در صورت اطمینان AI بالای ۵۰٪)
+                    if signal['ai_score'] < 50.0:
+                        continue
+
                     alert_key = f"{symbol}_{interval}_{signal['candle_time']}"
                     if alert_key in sent_alerts:
                         continue
 
                     sent_alerts[alert_key] = time.time()
-
-                    ai_warning_text = ""
-                    if signal['ai_score'] < 60.0:
-                        ai_warning_text = "\n⚠️ **تذکر AI:** درصد اطمینان زیر ۶۰٪ است. معامله پیشنهاد نمی‌شود (ارسال جهت آموزش و یادگیری AI)."
 
                     slippage_warning_text = ""
                     if signal['price_diff_percent'] > SLIPPAGE_WARNING_THRESHOLD:
@@ -1058,9 +1063,8 @@ async def process_single_symbol(symbol, session, bot, semaphore):
                         f"🪙 **Symbol:** `#{symbol}`\n"
                         f"📊 **Direction:** `{signal['direction']}`\n"
                         f"🎯 **Strategy:** `{signal['strategy']}`\n"
-                        f"🤖 **AI Score:** `{signal['ai_score']}%` Confidence"
-                        f"{ai_warning_text}"
-                        f"{slippage_warning_text}\n\n"
+                        f"🤖 **AI Score:** `{signal['ai_score']}%` Confidence\n"
+                        f"{slippage_warning_text}\n"
                         f"💵 **Entry Price:** `{signal['entry_price']}`\n"
                         f"🛑 **Stop Loss:** `{signal['stop_loss']}` (-{signal['sl_percent']}%)\n\n"
                         f"🎯 **TP1:** `{signal['tp1']}`\n"
@@ -1094,6 +1098,10 @@ async def process_single_symbol(symbol, session, bot, semaphore):
                             "tp2_hit": False,
                             "tp3_hit": False
                         }
+                    
+                    # پس از صادر شدن یک سیگنال معتبر روی این ارز، بقیه تایم‌فریم‌ها را نادیده بگیر
+                    break
+
         except Exception as e:
             LOGGER.error(f"Error processing {symbol}: {e}")
 
