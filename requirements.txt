@@ -5,3 +5,5 @@ python-dotenv
 pandas
 xgboost
 scikit-learn
+joblib
+numpy
