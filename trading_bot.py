@@ -14,18 +14,14 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 import joblib
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from aiohttp import web
 
 # ==========================================================
-# ۰. تنظیمات و کانفیگ
+# 0. Config
 # ==========================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("UnifiedBot")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -44,12 +40,12 @@ SCALER_PATH = "ai_scaler.joblib"
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
 MIN_BTC_VOLUME = 250.0
-MAX_SIGNAL_AGE = 600       # ↑ از 180 به 600
-MAX_SLIPPAGE = 1.0         # ↑ از 0.2 به 1.0
+MAX_SIGNAL_AGE = 600
+MAX_SLIPPAGE = 1.0
 ALERT_TTL = 86400
 
 # ==========================================================
-# ۱. دیتابیس Async
+# 1. Async Database
 # ==========================================================
 def _sync_execute(query: str, params: tuple = ()):
     with sqlite3.connect(DB_NAME) as conn:
@@ -98,10 +94,10 @@ async def init_database():
         await db_execute(q)
     for k in ["total_signals","tp1_hits","tp2_hits","tp3_hits","sl_hits","ai_trades","feedback_good","feedback_bad"]:
         await db_execute("INSERT OR IGNORE INTO bot_stats (key, value) VALUES (?, 0)", (k,))
-    LOGGER.info("✅ دیتابیس یکپارچه مقداردهی شد.")
+    LOGGER.info("Database initialized.")
 
 # ==========================================================
-# ۲. Rate Limiting
+# 2. Rate Limiting
 # ==========================================================
 class RateLimiter:
     def __init__(self, rate=10, per=1):
@@ -129,7 +125,7 @@ bybit_limiter = RateLimiter(rate=10, per=1)
 okx_limiter = RateLimiter(rate=10, per=1)
 
 # ==========================================================
-# ۳. صرافی‌ها و دیتا
+# 3. Exchanges
 # ==========================================================
 EXCHANGES = [
     {"name":"Binance","weight":10,"limiter":binance_limiter,
@@ -200,7 +196,7 @@ async def fetch_order_book(session, symbol, limit=50):
     return [], []
 
 # ==========================================================
-# ۴. اندیکاتورها
+# 4. Indicators
 # ==========================================================
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1: return 50.0
@@ -283,47 +279,36 @@ def htf_sr(k4h, k1d):
     return s, r
 
 # ==========================================================
-# ۵. Order Book Microstructure (پیشرفته)
+# 5. Order Book Microstructure
 # ==========================================================
 class OrderBookAnalyzer:
     @staticmethod
     def analyze(bids, asks, entry_price=0.0, sl_price=0.0):
         if not bids or not asks:
-            return {
-                "imbalance": 0.0, "spread_pct": 0.0, "slippage": 0.0,
-                "stop_hunt_risk": 0.0, "iceberg_bids": 0, "iceberg_asks": 0
-            }
-
-        # Basic volumes
+            return {"imbalance": 0.0, "spread_pct": 0.0, "slippage": 0.0,
+                    "stop_hunt_risk": 0.0, "iceberg_bids": 0, "iceberg_asks": 0}
         bv10 = sum(float(b[1]) for b in bids[:10])
         av10 = sum(float(a[1]) for a in asks[:10])
         tv10 = bv10 + av10 + 1e-9
         imbalance = (bv10 - av10) / tv10
-
         bb = float(bids[0][0])
         ba = float(asks[0][0])
         spread_pct = ((ba - bb) / bb) * 100 if bb > 0 else 0.0
         slippage = spread_pct
-
-        # Iceberg detection: orders with size > 3x average of top 10
         avg_bid_size = bv10 / 10 if bids else 0
         avg_ask_size = av10 / 10 if asks else 0
         iceberg_bids = sum(1 for b in bids[:20] if float(b[1]) > avg_bid_size * 3)
         iceberg_asks = sum(1 for a in asks[:20] if float(a[1]) > avg_ask_size * 3)
-
-        # Stop Hunt Risk: how close SL is to clustered liquidity (pivot-like levels in orderbook)
         stop_hunt_risk = 0.0
         if sl_price > 0 and entry_price > 0:
-            # Check if there is a large wall near SL
             bid_prices = [float(b[0]) for b in bids[:20]]
             ask_prices = [float(a[0]) for a in asks[:20]]
             all_prices = bid_prices + ask_prices
             sl_distances = [abs(p - sl_price) / sl_price * 100 for p in all_prices if p > 0]
             if sl_distances:
                 min_dist = min(sl_distances)
-                if min_dist < 0.1:  # Within 0.1% of SL
+                if min_dist < 0.1:
                     stop_hunt_risk = round(1.0 - (min_dist / 0.1), 2)
-
         return {
             "imbalance": round(float(imbalance), 4),
             "spread_pct": round(float(spread_pct), 4),
@@ -334,7 +319,7 @@ class OrderBookAnalyzer:
         }
 
 # ==========================================================
-# ۶. موتور AI
+# 6. AI Engine
 # ==========================================================
 class AIEngine:
     FEATURE_COLS = [
@@ -356,9 +341,9 @@ class AIEngine:
         try:
             joblib.dump(self.model, MODEL_PATH)
             joblib.dump(self.scaler, SCALER_PATH)
-            LOGGER.info("💾 مدل AI ذخیره شد.")
+            LOGGER.info("AI model saved.")
         except Exception as e:
-            LOGGER.error(f"❌ خطا در ذخیره مدل: {e}")
+            LOGGER.error(f"Save error: {e}")
 
     def load(self):
         if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
@@ -366,9 +351,9 @@ class AIEngine:
                 self.model = joblib.load(MODEL_PATH)
                 self.scaler = joblib.load(SCALER_PATH)
                 self.is_trained = True
-                LOGGER.info("🧠 مدل AI بارگذاری شد.")
+                LOGGER.info("AI model loaded.")
             except Exception as e:
-                LOGGER.error(f"❌ خطا در بارگذاری: {e}")
+                LOGGER.error(f"Load error: {e}")
 
     async def predict(self, features: Dict[str, float]) -> float:
         if not self.is_trained: return 0.50
@@ -379,10 +364,10 @@ class AIEngine:
         return await asyncio.to_thread(_pred)
 
     def confidence_label(self, prob: float) -> str:
-        if prob >= 0.75: return "🔥 Very High"
-        if prob >= 0.60: return "✅ High"
-        if prob >= 0.55: return "⚠️ Moderate"
-        return "❓ Low"
+        if prob >= 0.75: return "Very High"
+        if prob >= 0.60: return "High"
+        if prob >= 0.55: return "Moderate"
+        return "Low"
 
     async def retrain(self):
         if self._training: return False
@@ -390,7 +375,7 @@ class AIEngine:
         try:
             df = await db_fetch_df("SELECT * FROM trade_features WHERE outcome IS NOT NULL")
             if len(df) < self.min_samples or len(df["outcome"].unique()) < 2:
-                LOGGER.info(f"🧠 داده کافی برای آموزش نیست ({len(df)}).")
+                LOGGER.info(f"Not enough data for training ({len(df)}).")
                 return False
             def _train():
                 for c in self.FEATURE_COLS:
@@ -405,15 +390,15 @@ class AIEngine:
                 self.is_trained = True
                 self.save()
             await asyncio.to_thread(_train)
-            LOGGER.info(f"✅ AI بازآموز شد روی {len(df)} معامله.")
+            LOGGER.info(f"AI retrained on {len(df)} trades.")
             return True
         except Exception as e:
-            LOGGER.error(f"❌ خطا در بازآموزی: {e}"); return False
+            LOGGER.error(f"Retrain error: {e}"); return False
         finally:
             self._training = False
 
 # ==========================================================
-# ۷. تحلیل سیگنال
+# 7. Signal Analysis
 # ==========================================================
 def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     if len(klines) < 50: return None
@@ -425,7 +410,6 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     V = [float(k[5]) for k in closed]
     live = float(klines[-1][4])
 
-    # Age check (relaxed)
     current_time_ms = int(time.time() * 1000)
     candle_start_ms = int(klines[-1][0])
     elapsed = (current_time_ms - candle_start_ms) / 1000.0
@@ -443,15 +427,13 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     if rng == 0 or body == 0 or atr == 0: return None
     uw = ch - bt; lw = bb - cl
     spread_pct = (rng / cl) * 100
-    if spread_pct > 5.0:  # ↑ relaxed from 2.0
-        return None
+    if spread_pct > 5.0: return None
 
     ph, pl = find_pivots(H, L)
     trend = dow_trend(ph, pl)
     avg_v20 = sum(V[-21:-1]) / 20 if len(V) >= 21 else cv
-    vol_spike = cv >= 1.2 * avg_v20  # ↑ relaxed from 1.5
+    vol_spike = cv >= 1.2 * avg_v20
 
-    # Strategies
     recent_low = min(L[-6:-1])
     sweep_long = (cl < recent_low) and (cc > recent_low) and vol_spike
     recent_high = max(H[-6:-1])
@@ -476,15 +458,15 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     dmi_short = (32 <= rsi <= 48) and (mdi > pdi) and (adx >= 20) and red and vol_spike
 
     longs, shorts = [], []
-    if dmi_long: longs.append(f"🔥 RSI + DMI Momentum")
-    if setup_long: longs.append(f"📌 Candle Setup")
-    if breakout_long: longs.append(f"🚀 Range Breakout")
-    if sweep_long: longs.append(f"🎯 SMC Liquidity Sweep")
+    if dmi_long: longs.append("RSI+DMI Momentum")
+    if setup_long: longs.append("Candle Setup")
+    if breakout_long: longs.append("Range Breakout")
+    if sweep_long: longs.append("SMC Liquidity Sweep")
 
-    if dmi_short: shorts.append(f"🔥 RSI + DMI Momentum")
-    if setup_short: shorts.append(f"📌 Candle Setup")
-    if breakout_short: shorts.append(f"📉 Range Breakdown")
-    if sweep_short: shorts.append(f"🎯 SMC Liquidity Sweep")
+    if dmi_short: shorts.append("RSI+DMI Momentum")
+    if setup_short: shorts.append("Candle Setup")
+    if breakout_short: shorts.append("Range Breakdown")
+    if sweep_short: shorts.append("SMC Liquidity Sweep")
 
     def build(direction, strategies, entry, sl, risk):
         sl_pct = (risk / entry) * 100 if entry > 0 else 999
@@ -506,19 +488,19 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     if longs:
         sl = max(cl, cc - 1.5 * atr)
         risk = cc - sl
-        res = build("LONG 🟢", longs, cc, sl, risk)
+        res = build("LONG", longs, cc, sl, risk)
         if res and abs((live - cc) / cc) * 100 <= MAX_SLIPPAGE:
             return res
     if shorts:
         sl = min(ch, cc + 1.5 * atr)
         risk = sl - cc
-        res = build("SHORT 🔴", shorts, cc, sl, risk)
+        res = build("SHORT", shorts, cc, sl, risk)
         if res and abs((cc - live) / cc) * 100 <= MAX_SLIPPAGE:
             return res
     return None
 
 # ==========================================================
-# ۸. Risk Manager & Position Sizing
+# 8. Risk Manager
 # ==========================================================
 class RiskManager:
     def __init__(self, risk_percent=RISK_PER_TRADE, leverage=LEVERAGE):
@@ -534,7 +516,7 @@ class RiskManager:
         return round(notional, 2), round(margin, 2)
 
 # ==========================================================
-# ۹. Binance Futures Trader
+# 9. Binance Trader
 # ==========================================================
 class BinanceTrader:
     BASE = "https://fapi.binance.com"
@@ -582,7 +564,7 @@ class BinanceTrader:
 
     async def place_market_order(self, symbol: str, side: str, quantity: float, leverage: int = 3):
         if self.paper:
-            LOGGER.info(f"📄 PAPER ORDER | {side} {quantity} {symbol} @ x{leverage}")
+            LOGGER.info(f"PAPER ORDER | {side} {quantity} {symbol} @ x{leverage}")
             return {"orderId": f"PAPER_{int(time.time()*1000)}", "status": "FILLED"}
         await self._request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage, "timestamp": int(time.time()*1000)}, signed=True)
         ts = int(time.time() * 1000)
@@ -590,7 +572,7 @@ class BinanceTrader:
         return await self._request("POST", "/fapi/v1/order", params, signed=True)
 
 # ==========================================================
-# ۱۰. Telegram Manager (نسخه پیشرفته با فرمت قدیمی)
+# 10. Telegram Manager
 # ==========================================================
 class TelegramManager:
     def __init__(self, token, chat_id):
@@ -608,101 +590,61 @@ class TelegramManager:
                 await asyncio.sleep(2 ** i)
 
     async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id):
-        """فرمت سیگنال مشابه اسکرین‌شات قدیمی"""
         tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
-        dir_emoji = "🟢" if "LONG" in signal["direction"] else "🔴"
-        dir_text = "LONG" if "LONG" in signal["direction"] else "SHORT"
-
-        # Confidence color
-        conf_emoji = "🧠"
-        if ai_prob >= 0.75: conf_emoji = "🔥"
-        elif ai_prob >= 0.60: conf_emoji = "✅"
-        elif ai_prob >= 0.55: conf_emoji = "⚠️"
+        dir_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
+        conf_emoji = "🔥" if ai_prob >= 0.75 else ("✅" if ai_prob >= 0.60 else ("⚠️" if ai_prob >= 0.55 else "❓"))
 
         msg = (
-            f"🚨 **NEW TRADING SIGNAL** 🚨
-
-"
-            f"🪙 **Symbol:** `#{symbol}`
-"
-            f"📊 **Direction:** {dir_text} {dir_emoji}
-"
-            f"🎯 **Strategy:** {signal['strategy']} ({interval})
-"
-            f"{conf_emoji} **AI Score:** `{ai_prob:.1%}` Confidence
-"
-            f"⏱️ **Timeframe:** {interval}
-
-"
-            f"💵 **Entry Price:** `{signal['entry_price']}`
-"
-            f"🛡️ **Stop Loss:** `{signal['stop_loss']}` (`{signal['sl_percent']}%`)
-
-"
-            f"🎯 **Take Profit Targets:**
-"
-            f"🔹 **TP1:** `{signal['tp1']}`
-"
-            f"🔹 **TP2:** `{signal['tp2']}`
-"
-            f"🔹 **TP3:** `{signal['tp3']}`
-
-"
-            f"📉 **RSI:** `{signal['rsi']}` | **Trend:** `{signal['trend']}`
-"
-            f"🌐 **BTC Trend:** `{btc_trend}`
-
-"
-            f"📖 **Order Book Microstructure:**
-"
-            f"• Imbalance Ratio: `{ob_data['imbalance']:.2f}`
-"
-            f"• Slippage: `{ob_data['slippage']:.2f}%`
-"
-            f"• Stop Hunt Risk: `{ob_data['stop_hunt_risk']}`
-"
+            f"🚨 *NEW TRADING SIGNAL* 🚨\n\n"
+            f"🪙 *Symbol:* `#{symbol}`\n"
+            f"📊 *Direction:* {signal['direction']} {dir_emoji}\n"
+            f"🎯 *Strategy:* {signal['strategy']} ({interval})\n"
+            f"{conf_emoji} *AI Score:* `{ai_prob:.1%}` Confidence\n"
+            f"⏱️ *Timeframe:* {interval}\n\n"
+            f"💵 *Entry Price:* `{signal['entry_price']}`\n"
+            f"🛡️ *Stop Loss:* `{signal['stop_loss']}` (`{signal['sl_percent']}%`)\n\n"
+            f"🎯 *Take Profit Targets:*\n"
+            f"🔹 *TP1:* `{signal['tp1']}`\n"
+            f"🔹 *TP2:* `{signal['tp2']}`\n"
+            f"🔹 *TP3:* `{signal['tp3']}`\n\n"
+            f"📉 *RSI:* `{signal['rsi']}` | *Trend:* `{signal['trend']}`\n"
+            f"🌐 *BTC Trend:* `{btc_trend}`\n\n"
+            f"📖 *Order Book Microstructure:*\n"
+            f"• Imbalance Ratio: `{ob_data['imbalance']:.2f}`\n"
+            f"• Slippage: `{ob_data['slippage']:.2f}%`\n"
+            f"• Stop Hunt Risk: `{ob_data['stop_hunt_risk']}`\n"
             f"• Iceberg Bids/Asks: `{ob_data['iceberg_bids']}` / `{ob_data['iceberg_asks']}`"
         )
 
-        # Feedback buttons
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 مشاهده چارت TradingView", url=tv)],
+            [InlineKeyboardButton("📊 TradingView", url=tv)],
             [
-                InlineKeyboardButton("✅ سیگنال خوب", callback_data=f"good|{alert_id}"),
-                InlineKeyboardButton("❌ ثبت خطا", callback_data=f"bad|{alert_id}")
+                InlineKeyboardButton("✅ Good Signal", callback_data=f"good|{alert_id}"),
+                InlineKeyboardButton("❌ Bad Signal", callback_data=f"bad|{alert_id}")
             ]
         ])
-
         await self.send(msg, reply_markup=kb)
 
     async def notify_fill(self, symbol, direction, entry, size, sl, tp1, tp2, tp3, paper):
         p = "📄 PAPER" if paper else "💰 REAL"
-        dir_emoji = "🟢" if "LONG" in direction else "🔴"
+        de = "🟢" if direction == "LONG" else "🔴"
         await self.send(
-            f"({p} 📄) **معامله باز شد** ✅
-
-"
-            f"🪙 `#{symbol}` | {direction} {dir_emoji}
-"
-            f"📍 Entry: `{entry}`
-"
-            f"📊 Size: `{size}` USDT
-"
-            f"🛡️ SL: `{sl}`
-"
+            f"({p}) *Trade Opened* ✅\n\n"
+            f"🪙 `#{symbol}` | {direction} {de}\n"
+            f"📍 Entry: `{entry}`\n"
+            f"📊 Size: `{size}` USDT\n"
+            f"🛡️ SL: `{sl}`\n"
             f"🎯 TP1: `{tp1}` | TP2: `{tp2}` | TP3: `{tp3}`"
         )
 
     async def notify_close(self, symbol, outcome, pnl_pct=0):
         icon = "💰" if outcome == 1 else "❌"
-        text = "سود" if outcome == 1 else "ضرر"
-        await self.send(f"{icon} **معامله بسته شد ({text})**
-
-🪙 `#{symbol}` | PnL: `{pnl_pct:.2f}%`")
+        text = "Profit" if outcome == 1 else "Loss"
+        await self.send(f"{icon} *Trade Closed ({text})*\n\n🪙 `#{symbol}` | PnL: `{pnl_pct:.2f}%`")
 
     async def notify_feedback(self, alert_id, feedback_type):
-        label = "سیگنال موفق (با دگیره AI) ✅" if feedback_type == "good" else "ثبت خطا ❌"
-        await self.send(f"بازخورد شما ثبت شد: {label}")
+        label = "Good signal (AI learning) ✅" if feedback_type == "good" else "Error logged ❌"
+        await self.send(f"Feedback recorded: {label}")
 
     async def command_listener(self):
         last_id = 0
@@ -720,45 +662,29 @@ class TelegramManager:
                             total = stats.get("total_signals", 0)
                             wr = round((stats.get("tp1_hits",0)+stats.get("tp2_hits",0)+stats.get("tp3_hits",0))/total*100,1) if total else 0
                             await self.send(
-                                f"📊 **آمار ربات**
-
-"
-                                f"🔢 کل سیگنال‌ها: `{total}`
-"
-                                f"🎯 TP1: `{stats.get('tp1_hits',0)}` | TP2: `{stats.get('tp2_hits',0)}` | TP3: `{stats.get('tp3_hits',0)}`
-"
-                                f"❌ SL: `{stats.get('sl_hits',0)}`
-"
-                                f"🧠 AI Trades: `{stats.get('ai_trades',0)}`
-"
-                                f"👍 فیدبک خوب: `{stats.get('feedback_good',0)}`
-"
-                                f"👎 فیدبک بد: `{stats.get('feedback_bad',0)}`
-"
+                                f"📊 *Bot Statistics*\n\n"
+                                f"🔢 Total Signals: `{total}`\n"
+                                f"🎯 TP1: `{stats.get('tp1_hits',0)}` | TP2: `{stats.get('tp2_hits',0)}` | TP3: `{stats.get('tp3_hits',0)}`\n"
+                                f"❌ SL: `{stats.get('sl_hits',0)}`\n"
+                                f"🧠 AI Trades: `{stats.get('ai_trades',0)}`\n"
+                                f"👍 Good Feedback: `{stats.get('feedback_good',0)}`\n"
+                                f"👎 Bad Feedback: `{stats.get('feedback_bad',0)}`\n"
                                 f"🏆 Win Rate: `{wr}%`", chat_id=cid
                             )
                         elif cmd == "/active":
                             df = await db_fetch_df("SELECT * FROM active_trades")
                             if df.empty:
-                                await self.send("ℹ️ هیچ پوزیشن فعالی وجود ندارد.", chat_id=cid)
+                                await self.send("ℹ️ No active positions.", chat_id=cid)
                             else:
-                                lines = "
-".join([f"🔹 `{r['symbol']}` ({r['direction']}) @ `{r['entry_price']}`" for _, r in df.iterrows()])
-                                await self.send(f"📌 **پوزیشن‌های فعال ({len(df)}):**
-
-{lines}", chat_id=cid)
+                                lines = "\n".join([f"🔹 `{r['symbol']}` ({r['direction']}) @ `{r['entry_price']}`" for _, r in df.iterrows()])
+                                await self.send(f"📌 *Active Trades ({len(df)}):*\n\n{lines}", chat_id=cid)
                         elif cmd == "/help":
                             await self.send(
-                                "🤖 **منوی کنترل**
-
-"
-                                "▫️ `/stats` — آمار
-"
-                                "▫️ `/active` — پوزیشن‌ها
-"
-                                "▫️ `/help` — راهنما", chat_id=cid
+                                f"🤖 *Control Menu*\n\n"
+                                f"▫️ `/stats` — Statistics\n"
+                                f"▫️ `/active` — Active positions\n"
+                                f"▫️ `/help` — Help", chat_id=cid
                             )
-                    # Handle callback queries (feedback buttons)
                     if u.callback_query:
                         cq = u.callback_query
                         data = cq.data or ""
@@ -766,13 +692,8 @@ class TelegramManager:
                         if len(parts) == 2:
                             fb_type, alert_id = parts[0], parts[1]
                             if fb_type in ("good", "bad"):
-                                await db_execute(
-                                    "UPDATE signal_history SET feedback = ? WHERE alert_id = ?",
-                                    (fb_type, alert_id)
-                                )
-                                await db_execute(
-                                    f"UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{fb_type}'"
-                                )
+                                await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb_type, alert_id))
+                                await db_execute(f"UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{fb_type}'")
                                 await self.notify_feedback(alert_id, fb_type)
                                 try:
                                     await self.bot.answer_callback_query(cq.id)
@@ -782,7 +703,7 @@ class TelegramManager:
             await asyncio.sleep(2)
 
 # ==========================================================
-# ۱۱. موتور اصلی یکپارچه
+# 11. Main Unified Bot
 # ==========================================================
 class UnifiedTradingBot:
     def __init__(self):
@@ -793,14 +714,13 @@ class UnifiedTradingBot:
         self.btc_trend = "NEUTRAL"
         self.btc_pause_until = 0
         self.symbol_cache = {"symbols": [], "last_update": 0}
-        self.lock = asyncio.Lock()
 
     async def start(self):
         await init_database()
         await self.trader.start()
         asyncio.create_task(self.tg.command_listener())
         asyncio.create_task(self.position_tracker())
-        LOGGER.info("🚀 ربات یکپارچه (AI + Signal + Execution + OB Microstructure) آماده است.")
+        LOGGER.info("Unified Bot (AI + Signal + Execution) ready.")
 
     async def get_symbols(self, session):
         now = time.time()
@@ -814,7 +734,7 @@ class UnifiedTradingBot:
                         min_vol = MIN_BTC_VOLUME * btc_p
                         syms = [x["symbol"] for x in data if x["symbol"].endswith("USDT") and float(x.get("quoteVolume",0)) >= min_vol]
                         self.symbol_cache = {"symbols": syms, "last_update": now}
-                        LOGGER.info(f"✅ {len(syms)} symbol loaded.")
+                        LOGGER.info(f"{len(syms)} symbols loaded.")
             except Exception as e:
                 LOGGER.error(f"Symbol fetch: {e}")
                 self.symbol_cache["symbols"] = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
@@ -833,16 +753,14 @@ class UnifiedTradingBot:
                 change = abs(float(k15[-2][4]) - float(k15[-2][1])) / float(k15[-2][1]) * 100
                 if change >= 1.5:
                     self.btc_pause_until = time.time() + 1800
-                    LOGGER.warning(f"⚠️ BTC Volatility Spike {change:.1f}% — 30m pause.")
+                    LOGGER.warning(f"BTC Volatility Spike {change:.1f}% — 30m pause.")
         except Exception as e:
             LOGGER.error(f"BTC update: {e}")
 
     async def execute_signal(self, session, symbol, interval, signal):
-        # 1. Order Book
         bids, asks = await fetch_order_book(session, symbol)
         ob = OrderBookAnalyzer.analyze(bids, asks, signal["entry_price"], signal["stop_loss"])
 
-        # 2. Prepare AI features
         features = {
             "rsi": signal["rsi"], "spread_pct": ob["spread_pct"],
             "vol_ratio": signal["vol_ratio"], "lower_wick_ratio": signal["lower_wick_ratio"],
@@ -852,31 +770,27 @@ class UnifiedTradingBot:
             "orderbook_imbalance": ob["imbalance"]
         }
 
-        # 3. AI Filter
         prob = await self.ai.predict(features)
         conf_label = self.ai.confidence_label(prob)
         if prob < 0.55 and self.ai.is_trained:
-            LOGGER.info(f"🧠 AI rejected {symbol} ({prob:.2f} — {conf_label})")
+            LOGGER.info(f"AI rejected {symbol} ({prob:.2f} — {conf_label})")
             return
 
-        # 4. Send Signal FIRST (like old bot)
         alert_id = f"{symbol}_{interval}_{int(time.time())}"
         await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id)
 
-        # 5. Check balance & sizing
         balance = await self.trader.get_balance()
         if balance <= 0:
-            LOGGER.warning("⚠️ Balance zero.")
+            LOGGER.warning("Balance zero.")
             return
 
         entry = signal["entry_price"]
         sl = signal["stop_loss"]
         notional, margin = self.risk.size(balance, entry, sl)
         if notional <= 0:
-            LOGGER.warning("⚠️ Position size zero.")
+            LOGGER.warning("Position size zero.")
             return
 
-        # 6. Record features
         cols = "symbol, rsi, spread_pct, vol_ratio, lower_wick_ratio, upper_wick_ratio, trend_code, adx, plus_di, minus_di, price_to_sma7_ratio, atr_pct, orderbook_imbalance"
         vals = (symbol, features["rsi"], features["spread_pct"], features["vol_ratio"], features["lower_wick_ratio"],
                 features["upper_wick_ratio"], features["trend_code"], features["adx"], features["plus_di"],
@@ -884,8 +798,7 @@ class UnifiedTradingBot:
         await db_execute(f"INSERT INTO trade_features ({cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
         feat_id = (await db_execute("SELECT last_insert_rowid()"))[0][0]
 
-        # 7. Execute trade
-        side = "BUY" if "LONG" in signal["direction"] else "SELL"
+        side = "BUY" if signal["direction"] == "LONG" else "SELL"
         qty = round(notional / entry, 4)
         res = await self.trader.place_market_order(symbol, side, qty, LEVERAGE)
 
@@ -897,13 +810,12 @@ class UnifiedTradingBot:
                 (trade_id, symbol, signal["direction"], entry, sl, tp3, entry, time.time(), feat_id, notional, LEVERAGE, 1 if PAPER_TRADING else 0)
             )
             await db_execute("INSERT OR REPLACE INTO bot_stats (key, value) VALUES ('ai_trades', COALESCE((SELECT value FROM bot_stats WHERE key='ai_trades'), 0) + 1)")
-            # Update signal_history with execution
             await db_execute(
                 "UPDATE signal_history SET executed = 1, ai_prob = ?, ai_confidence = ?, ob_imbalance = ?, ob_slippage = ?, ob_stop_hunt = ?, ob_iceberg_bids = ?, ob_iceberg_asks = ? WHERE alert_id = ?",
                 (prob, conf_label, ob["imbalance"], ob["slippage"], ob["stop_hunt_risk"], ob["iceberg_bids"], ob["iceberg_asks"], alert_id)
             )
             await self.tg.notify_fill(symbol, signal["direction"], entry, notional, sl, tp1, tp2, tp3, PAPER_TRADING)
-            LOGGER.info(f"✅ Trade opened: {symbol} | AI: {prob:.1%} | Size: {notional}")
+            LOGGER.info(f"Trade opened: {symbol} | AI: {prob:.1%} | Size: {notional}")
 
     async def position_tracker(self):
         while True:
@@ -927,15 +839,15 @@ class UnifiedTradingBot:
 
                         if price > highest:
                             await db_execute("UPDATE active_trades SET highest_price = ? WHERE trade_id = ?", (price, tid))
-                            if (price - entry) / entry >= 0.02 and "LONG" in direction:
+                            if (price - entry) / entry >= 0.02 and direction == "LONG":
                                 new_sl = max(sl, entry)
                                 await db_execute("UPDATE active_trades SET stop_loss = ? WHERE trade_id = ?", (new_sl, tid))
-                            elif (entry - price) / entry >= 0.02 and "SHORT" in direction:
+                            elif (entry - price) / entry >= 0.02 and direction == "SHORT":
                                 new_sl = min(sl, entry)
                                 await db_execute("UPDATE active_trades SET stop_loss = ? WHERE trade_id = ?", (new_sl, tid))
 
                         closed = False; outcome = None
-                        if "LONG" in direction:
+                        if direction == "LONG":
                             if price >= tp:
                                 closed = True; outcome = 1
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'tp3_hits'")
@@ -953,7 +865,7 @@ class UnifiedTradingBot:
                         if closed:
                             await db_execute("UPDATE trade_features SET outcome = ? WHERE id = ?", (outcome, fid))
                             await db_execute("DELETE FROM active_trades WHERE trade_id = ?", (tid,))
-                            pnl = ((price - entry) / entry * 100) if "LONG" in direction else ((entry - price) / entry * 100)
+                            pnl = ((price - entry) / entry * 100) if direction == "LONG" else ((entry - price) / entry * 100)
                             await self.tg.notify_close(sym, outcome, pnl)
                             asyncio.create_task(self.ai.retrain())
             except Exception as e:
@@ -988,21 +900,18 @@ class UnifiedTradingBot:
                             if not sig: continue
 
                             if symbol != "BTCUSDT":
-                                if "LONG" in sig["direction"] and self.btc_trend == "BEARISH": continue
-                                if "SHORT" in sig["direction"] and self.btc_trend == "BULLISH": continue
+                                if sig["direction"] == "LONG" and self.btc_trend == "BEARISH": continue
+                                if sig["direction"] == "SHORT" and self.btc_trend == "BULLISH": continue
 
                             alert_id = f"{symbol}_{interval}_{int(klines[-2][0])}_{sig['direction']}"
                             exists = await db_execute("SELECT 1 FROM signal_history WHERE alert_id = ?", (alert_id,))
                             if exists: continue
 
-                            # Save signal history first
                             await db_execute(
                                 "INSERT INTO signal_history (alert_id, symbol, interval, direction, strategy, entry_price, stop_loss, tp1, tp2, tp3, sl_percent, rsi, adx, trend) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (alert_id, symbol, interval, sig["direction"], sig["strategy"], sig["entry_price"], sig["stop_loss"], sig["tp1"], sig["tp2"], sig["tp3"], sig["sl_percent"], sig["rsi"], sig["adx"], sig["trend"])
                             )
                             await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'total_signals'")
-
-                            # Execute (signal -> order book -> AI -> trade)
                             await self.execute_signal(session, symbol, interval, sig)
                             await asyncio.sleep(0.02)
 
@@ -1013,7 +922,7 @@ class UnifiedTradingBot:
                     await asyncio.sleep(15)
 
 # ==========================================================
-# ۱۲. Web Server & Main
+# 12. Web & Entry
 # ==========================================================
 async def health(request):
     return web.Response(text="Unified Bot Running", status=200)
