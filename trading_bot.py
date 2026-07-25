@@ -45,8 +45,8 @@ TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 5.0  # حد زیان حداکثر ۵ درصد
 MIN_BTC_VOLUME = 250.0
 MAX_SIGNAL_AGE_SECONDS = 180
-SLIPPAGE_WARNING_THRESHOLD = 0.3  # آستانه هشدار لغزش ۰.۳ درصد
-CONCURRENT_SCAN_LIMIT = 10        # اسکن هم‌زمان ۱۰ ارز با هم
+SLIPPAGE_WARNING_THRESHOLD = 0.3
+CONCURRENT_SCAN_LIMIT = 10        # اسکن هم‌زمان ۱۰ ارز
 
 VOLATILITY_PAUSE_MINUTES = 15
 VOLATILITY_THRESHOLD_PERCENT = 2.5
@@ -67,26 +67,39 @@ DB_NAME = "trading_ai_dataset.db"
 def get_turso_client():
     if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
         try:
-            return libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+            url = TURSO_DATABASE_URL.strip()
+            if url.startswith("https://"):
+                url = url.replace("https://", "libsql://")
+            return libsql_client.create_client_sync(url=url, auth_token=TURSO_AUTH_TOKEN.strip())
         except Exception as e:
             LOGGER.error(f"❌ Error connecting to Turso DB: {e}")
     return None
 
 def execute_db_query(query, params=()):
+    clean_params = []
+    for p in params:
+        if isinstance(p, (float, int, str)) or p is None:
+            clean_params.append(p)
+        else:
+            clean_params.append(float(p))
+
     client = get_turso_client()
     if client:
         try:
-            client.execute(query, list(params))
+            client.execute(query, clean_params)
             client.close()
             return True
         except Exception as e:
             LOGGER.error(f"❌ Turso Query Error: {e}")
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                pass
 
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        cursor.execute(query, clean_params)
         conn.commit()
         conn.close()
         return True
@@ -105,7 +118,10 @@ def fetch_db_df(query):
             return pd.DataFrame(rows, columns=cols)
         except Exception as e:
             LOGGER.error(f"❌ Turso Fetch Error: {e}")
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                pass
 
     try:
         conn = sqlite3.connect(DB_NAME)
@@ -137,10 +153,10 @@ def init_db():
         )
     '''
     if execute_db_query(create_table_sql):
-        LOGGER.info("☁️ Persistent Cloud Database Initialized with 11 Advanced Features.")
+        LOGGER.info("☁️ Cloud Database Initialized with Advanced Features.")
 
 # ---------------------------------------------------------
-# ۳. سیستم یادگیری هوش مصنوعی پیشرفته (Advanced XGBoost Engine)
+# ۳. سیستم یادگیری هوش مصنوعی پیشرفته (Advanced XGBoost)
 # ---------------------------------------------------------
 class AdvancedSelfLearningAIEngine:
     def __init__(self):
@@ -196,7 +212,7 @@ class AdvancedSelfLearningAIEngine:
             top_str = ", ".join([f"{f}: {imp*100:.1f}%" for f, imp in top_features])
 
             LOGGER.info(f"✅ Advanced AI Model Retrained on {len(df)} trades!")
-            LOGGER.info(f"🔥 Most Important Indicators: {top_str}")
+            LOGGER.info(f"🔥 Top Features: {top_str}")
             return True
         except Exception as e:
             LOGGER.error(f"❌ Error during AI retraining: {e}")
@@ -294,7 +310,49 @@ EXCHANGES = [
 ]
 
 # ---------------------------------------------------------
-# ۵. اعتبارسنجی داده‌ها
+# ۵. دریافت اطلاعات دفتر سفارشات (Order Book Depth)
+# ---------------------------------------------------------
+async def fetch_order_book_metrics(session, symbol, depth_limit=50):
+    url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit={depth_limit}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+
+                if not bids or not asks:
+                    return None
+
+                tot_bid_vol = sum(float(b[1]) for b in bids)
+                tot_ask_vol = sum(float(a[1]) for a in asks)
+                total_vol = tot_bid_vol + tot_ask_vol
+
+                if total_vol == 0:
+                    return None
+
+                ob_imbalance = tot_bid_vol / total_vol
+
+                avg_bid_vol = tot_bid_vol / len(bids)
+                avg_ask_vol = tot_ask_vol / len(asks)
+
+                max_bid_wall = max(float(b[1]) for b in bids)
+                max_ask_wall = max(float(a[1]) for a in asks)
+
+                bid_wall_ratio = max_bid_wall / avg_bid_vol if avg_bid_vol > 0 else 1.0
+                ask_wall_ratio = max_ask_wall / avg_ask_vol if avg_ask_vol > 0 else 1.0
+
+                return {
+                    "ob_imbalance": round(ob_imbalance, 3),
+                    "bid_wall_ratio": round(bid_wall_ratio, 2),
+                    "ask_wall_ratio": round(ask_wall_ratio, 2)
+                }
+    except Exception as e:
+        LOGGER.error(f"Order book fetch error for {symbol}: {e}")
+    return None
+
+# ---------------------------------------------------------
+# ۶. اعتبارسنجی داده‌ها
 # ---------------------------------------------------------
 def validate_klines(klines, symbol):
     if not klines or len(klines) < 10:
@@ -347,7 +405,7 @@ async def cross_check_price(session, symbol):
     return True, prices
 
 # ---------------------------------------------------------
-# ۶. اندیکاتورها و فرمول‌های تحلیل
+# ۷. اندیکاتورها و محاسبات تکنیکال
 # ---------------------------------------------------------
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -471,7 +529,7 @@ def extract_htf_sr_levels(klines_4h, klines_1d):
     return supports, resistances
 
 # ---------------------------------------------------------
-# ۷. دریافت کندل‌ها و لیست ارزها
+# ۸. دریافت کندل‌ها و اسکن نمادها
 # ---------------------------------------------------------
 async def fetch_klines_with_failover(session, symbol, interval):
     sorted_exchanges = sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True)
@@ -549,9 +607,9 @@ async def get_all_usdt_symbols_cached(session):
     return _symbol_cache["symbols"]
 
 # ---------------------------------------------------------
-# ۸. تحلیل تکنیکال و فیلتر هوشمند با ۱۱ ویژگی AI
+# ۹. تحلیل هوشمند سیگنال + فیلتر Order Book
 # ---------------------------------------------------------
-def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=5.0):
+def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, max_sl_percent=5.0, ob_data=None):
     if time.time() < BTC_VOLATILITY_PAUSE_UNTIL:
         return None
     if len(klines) < 50:
@@ -641,19 +699,8 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     rsi_bullish_trigger = (rsi > rsi_prev) and (55.0 <= rsi <= 72.0)
     rsi_bearish_trigger = (rsi < rsi_prev) and (28.0 <= rsi <= 45.0)
 
-    is_rsi_dmi_long = (
-        is_trending_market and
-        strong_buyers and
-        rsi_bullish_trigger and
-        is_volume_spike
-    )
-
-    is_rsi_dmi_short = (
-        is_trending_market and
-        strong_sellers and
-        rsi_bearish_trigger and
-        is_volume_spike
-    )
+    is_rsi_dmi_long = (is_trending_market and strong_buyers and rsi_bullish_trigger and is_volume_spike)
+    is_rsi_dmi_short = (is_trending_market and strong_sellers and rsi_bearish_trigger and is_volume_spike)
 
     # ==================== LONG SETUP ====================
     is_green_candle = (c_close > c_open)
@@ -687,6 +734,15 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     if is_candle_setup_long or is_htf_range_breakout_long or is_rsi_dmi_long or is_smc_long:
         if rsi > 80.0:
             return None
+
+        # 📊 فیلتر Order Book برای LONG
+        if ob_data:
+            if ob_data["ob_imbalance"] < 0.40:
+                LOGGER.info(f"⛔ LONG Rejected for {symbol}: Orderbook dominated by sellers ({ob_data['ob_imbalance']*100}% Bids)")
+                return None
+            if ob_data["ask_wall_ratio"] > 4.0:
+                LOGGER.info(f"⛔ LONG Rejected for {symbol}: Massive Sell Wall in Order Book ({ob_data['ask_wall_ratio']}x avg)")
+                return None
 
         win_probability = ai_engine.predict_signal_quality(feature_dict)
         ai_score = round(win_probability * 100, 1)
@@ -772,6 +828,15 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
         if rsi < 20.0:
             return None
 
+        # 📊 فیلتر Order Book برای SHORT
+        if ob_data:
+            if ob_data["ob_imbalance"] > 0.60:
+                LOGGER.info(f"⛔ SHORT Rejected for {symbol}: Orderbook dominated by buyers ({ob_data['ob_imbalance']*100}% Bids)")
+                return None
+            if ob_data["bid_wall_ratio"] > 4.0:
+                LOGGER.info(f"⛔ SHORT Rejected for {symbol}: Massive Buy Wall in Order Book ({ob_data['bid_wall_ratio']}x avg)")
+                return None
+
         win_probability = ai_engine.predict_signal_quality(feature_dict)
         ai_score = round(win_probability * 100, 1)
 
@@ -827,7 +892,7 @@ def analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistance
     return None
 
 # ---------------------------------------------------------
-# ۹. تعقیب معاملات و به روزرسانی دیتابیس ابری
+# ۱۰. تعقیب معاملات و به روزرسانی دیتابیس ابری
 # ---------------------------------------------------------
 async def track_active_trades(session, bot):
     if not active_trades:
@@ -836,10 +901,24 @@ async def track_active_trades(session, bot):
     async with active_trades_lock:
         trades = list(active_trades.items())
 
+    now = time.time()
+
     for trade_key, trade in trades:
         symbol = trade["symbol"]
+        
+        trade_age = now - trade.get("created_at", now)
+        if trade_age > 172800: # ۴۸ ساعت
+            async with active_trades_lock:
+                if trade_key in active_trades:
+                    del active_trades[trade_key]
+            continue
+
         klines = await fetch_klines_with_failover(session, symbol, "15m")
         if not klines:
+            if trade_age > 86400:
+                async with active_trades_lock:
+                    if trade_key in active_trades:
+                        del active_trades[trade_key]
             continue
 
         current_price = float(klines[-1][4])
@@ -895,7 +974,7 @@ async def track_active_trades(session, bot):
                     await send_telegram_message(bot, TELEGRAM_CHAT_ID, msg)
 
 # ---------------------------------------------------------
-# ۱۰. شنونده تلگرام و پردازش بازخورد تعاملی (RLHF)
+# ۱۱. مدیریت دستورات تلگرام و بازخورد کاربر
 # ---------------------------------------------------------
 async def send_telegram_message(bot, chat_id, text, reply_markup=None, retries=3):
     for i in range(retries):
@@ -999,7 +1078,7 @@ async def telegram_command_listener(bot):
                     elif cmd in ["/start", "/help"]:
                         msg = (
                             "🤖 **Trading Bot Control Menu**\n\n"
-                            "▫️ `/stats` : آمار ابدی دیتابیس ابری\n"
+                            "▫️ `/stats` : آمار دیتابیس ابری\n"
                             "▫️ `/active` : پوزیشن‌های فعال\n"
                             "▫️ `/pause` : لغو غیرفعال بودن نوسان\n"
                             "▫️ `/debug` : اطلاعات دیباگ و دیتابیس\n"
@@ -1017,12 +1096,12 @@ def cleanup_old_alerts():
         del sent_alerts[k]
 
 # ---------------------------------------------------------
-# ۱۱. پردازش موازی ارزها (اسکن هوشمند بدون سیگنال تکراری)
+# ۱۲. اسکن موازی نمادها
 # ---------------------------------------------------------
 async def process_single_symbol(symbol, session, bot, semaphore):
     async with semaphore:
         try:
-            # ⛔ ۱. اگر این ارز در حال حاضر پوزیشن فعال دارد، تایم‌فریم‌های دیگر را اسکن نکن
+            # ⛔ عدم اسکن تکراری برای ارزی که معامله فعال دارد
             async with active_trades_lock:
                 has_active_trade = any(v["symbol"] == symbol for v in active_trades.values())
             if has_active_trade:
@@ -1037,14 +1116,17 @@ async def process_single_symbol(symbol, session, bot, semaphore):
             klines_1d = await fetch_klines_with_failover(session, symbol, "1d")
             htf_supports, htf_resistances = extract_htf_sr_levels(klines_4h, klines_1d)
 
+            # 📊 دریافت دیتای Order Book صرافی
+            ob_data = await fetch_order_book_metrics(session, symbol)
+
             for interval in TIMEFRAMES:
                 klines = await fetch_klines_with_failover(session, symbol, interval)
                 if not klines:
                     continue
 
-                signal = analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, MAX_SL_PERCENT)
+                signal = analyze_market_signal(klines, symbol, interval, htf_supports, htf_resistances, MAX_SL_PERCENT, ob_data=ob_data)
                 if signal:
-                    # ⛔ ۲. فیلتر سیگنال‌های ضعیف (ارسال فقط در صورت اطمینان AI بالای ۵۰٪)
+                    # ⛔ فیلتر سیگنال‌های ضعیف (ارسال فقط بالای ۵۰٪)
                     if signal['ai_score'] < 50.0:
                         continue
 
@@ -1096,17 +1178,17 @@ async def process_single_symbol(symbol, session, bot, semaphore):
                             "db_id": signal["trade_id"],
                             "tp1_hit": False,
                             "tp2_hit": False,
-                            "tp3_hit": False
+                            "tp3_hit": False,
+                            "created_at": time.time()
                         }
                     
-                    # پس از صادر شدن یک سیگنال معتبر روی این ارز، بقیه تایم‌فریم‌ها را نادیده بگیر
                     break
 
         except Exception as e:
             LOGGER.error(f"Error processing {symbol}: {e}")
 
 # ---------------------------------------------------------
-# ۱۲. اجرای اصلی و وب‌سرور Render
+# ۱۳. اجرای اصلی و وب‌سرور Render
 # ---------------------------------------------------------
 async def handle_health_check(request):
     return web.Response(text="Trading Bot AI service is live & active!")
