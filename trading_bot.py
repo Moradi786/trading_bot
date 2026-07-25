@@ -580,10 +580,11 @@ class TelegramManager:
         self.chat_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
         self.sent_alerts = {}
 
-    async def send(self, text, reply_markup=None, retries=3):
+    async def send(self, text, reply_markup=None, retries=3, chat_id=None):
+        target = chat_id if chat_id is not None else self.chat_id
         for i in range(retries):
             try:
-                await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+                await self.bot.send_message(chat_id=target, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
                 return True
             except Exception as e:
                 if i == retries - 1: LOGGER.error(f"TG error: {e}"); return False
@@ -651,55 +652,64 @@ class TelegramManager:
         while True:
             try:
                 updates = await self.bot.get_updates(offset=last_id + 1, timeout=5)
-                for u in updates:
-                    last_id = u.update_id
-                    if u.message and u.message.text:
-                        cmd = u.message.text.strip().split("@")[0].lower()
-                        cid = u.message.chat_id
-                        if cmd == "/stats":
-                            rows = await db_execute("SELECT key, value FROM bot_stats")
-                            stats = {r[0]: r[1] for r in rows}
-                            total = stats.get("total_signals", 0)
-                            wr = round((stats.get("tp1_hits",0)+stats.get("tp2_hits",0)+stats.get("tp3_hits",0))/total*100,1) if total else 0
-                            await self.send(
-                                f"📊 *Bot Statistics*\n\n"
-                                f"🔢 Total Signals: `{total}`\n"
-                                f"🎯 TP1: `{stats.get('tp1_hits',0)}` | TP2: `{stats.get('tp2_hits',0)}` | TP3: `{stats.get('tp3_hits',0)}`\n"
-                                f"❌ SL: `{stats.get('sl_hits',0)}`\n"
-                                f"🧠 AI Trades: `{stats.get('ai_trades',0)}`\n"
-                                f"👍 Good Feedback: `{stats.get('feedback_good',0)}`\n"
-                                f"👎 Bad Feedback: `{stats.get('feedback_bad',0)}`\n"
-                                f"🏆 Win Rate: `{wr}%`", chat_id=cid
-                            )
-                        elif cmd == "/active":
-                            df = await db_fetch_df("SELECT * FROM active_trades")
-                            if df.empty:
-                                await self.send("ℹ️ No active positions.", chat_id=cid)
-                            else:
-                                lines = "\n".join([f"🔹 `{r['symbol']}` ({r['direction']}) @ `{r['entry_price']}`" for _, r in df.iterrows()])
-                                await self.send(f"📌 *Active Trades ({len(df)}):*\n\n{lines}", chat_id=cid)
-                        elif cmd == "/help":
-                            await self.send(
-                                f"🤖 *Control Menu*\n\n"
-                                f"▫️ `/stats` — Statistics\n"
-                                f"▫️ `/active` — Active positions\n"
-                                f"▫️ `/help` — Help", chat_id=cid
-                            )
-                    if u.callback_query:
-                        cq = u.callback_query
-                        data = cq.data or ""
-                        parts = data.split("|")
-                        if len(parts) == 2:
-                            fb_type, alert_id = parts[0], parts[1]
-                            if fb_type in ("good", "bad"):
-                                await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb_type, alert_id))
-                                await db_execute(f"UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{fb_type}'")
-                                await self.notify_feedback(alert_id, fb_type)
-                                try:
-                                    await self.bot.answer_callback_query(cq.id)
-                                except: pass
             except Exception as e:
-                LOGGER.error(f"Command listener: {e}")
+                err_str = str(e)
+                if "Conflict" in err_str or "terminated by other getUpdates" in err_str:
+                    LOGGER.warning("Telegram Conflict detected. Retrying in 10s...")
+                    await asyncio.sleep(10)
+                    continue
+                LOGGER.error(f"get_updates error: {e}")
+                await asyncio.sleep(5)
+                continue
+            for u in updates:
+                last_id = u.update_id
+                if u.message and u.message.text:
+                    cmd = u.message.text.strip().split("@")[0].lower()
+                    cid = u.message.chat_id
+                    if cmd == "/stats":
+                        rows = await db_execute("SELECT key, value FROM bot_stats")
+                        stats = {r[0]: r[1] for r in rows}
+                        total = stats.get("total_signals", 0)
+                        wr = round((stats.get("tp1_hits",0)+stats.get("tp2_hits",0)+stats.get("tp3_hits",0))/total*100,1) if total else 0
+                        await self.send(
+                            f"📊 *Bot Statistics*\n\n"
+                            f"🔢 Total Signals: `{total}`\n"
+                            f"🎯 TP1: `{stats.get('tp1_hits',0)}` | TP2: `{stats.get('tp2_hits',0)}` | TP3: `{stats.get('tp3_hits',0)}`\n"
+                            f"❌ SL: `{stats.get('sl_hits',0)}`\n"
+                            f"🧠 AI Trades: `{stats.get('ai_trades',0)}`\n"
+                            f"👍 Good Feedback: `{stats.get('feedback_good',0)}`\n"
+                            f"👎 Bad Feedback: `{stats.get('feedback_bad',0)}`\n"
+                            f"🏆 Win Rate: `{wr}%`",
+                            chat_id=cid
+                        )
+                    elif cmd == "/active":
+                        df = await db_fetch_df("SELECT * FROM active_trades")
+                        if df.empty:
+                            await self.send("ℹ️ No active positions.", chat_id=cid)
+                        else:
+                            lines = "\n".join([f"🔹 `#{r['symbol']}` ({r['direction']}) @ `{r['entry_price']}`" for _, r in df.iterrows()])
+                            await self.send(f"📌 *Active Trades ({len(df)}):*\n\n{lines}", chat_id=cid)
+                    elif cmd == "/help":
+                        await self.send(
+                            f"🤖 *Control Menu*\n\n"
+                            f"▫️ `/stats` — Statistics\n"
+                            f"▫️ `/active` — Active positions\n"
+                            f"▫️ `/help` — Help",
+                            chat_id=cid
+                        )
+                if u.callback_query:
+                    cq = u.callback_query
+                    data = cq.data or ""
+                    parts = data.split("|")
+                    if len(parts) == 2:
+                        fb_type, alert_id = parts[0], parts[1]
+                        if fb_type in ("good", "bad"):
+                            await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb_type, alert_id))
+                            await db_execute(f"UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{fb_type}'")
+                            await self.notify_feedback(alert_id, fb_type)
+                            try:
+                                await self.bot.answer_callback_query(cq.id)
+                            except: pass
             await asyncio.sleep(2)
 
 # ==========================================================
