@@ -496,8 +496,8 @@ class TelegramNotifier:
 
     async def send_message(self, session: aiohttp.ClientSession, text: str):
         if not self.bot_token or not self.chat_id:
-            LOGGER.info(f"[Telegram Alert Simulation]:
-{text}")
+            LOGGER.info(f"[Telegram Alert Simulation]: {text}")
+
             return
         
         url = f"{self.base_url}/sendMessage"
