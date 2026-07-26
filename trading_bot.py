@@ -2,6 +2,8 @@ import asyncio
 import sqlite3
 import math
 import logging
+import base64
+import json
 from decimal import Decimal, ROUND_DOWN
 import aiohttp
 import numpy as np
@@ -15,6 +17,7 @@ DB_NAME = "trading_bot.db"
 RISK_PER_TRADE = 0.02  # 2% Risk per trade
 LEVERAGE = 10
 AI_MIN_SAMPLES = 50
+OPENAI_API_KEY = "YOUR_OPENAI_API_KEY_HERE"  # کلید API خود را اینجا قرار دهید
 
 EXCHANGES = {
     "binance": {
@@ -119,7 +122,6 @@ class ExchangeManager:
 
     async def fetch_klines(self, session: aiohttp.ClientSession, symbol: str, interval: str = "15m"):
         """دریافت کندل‌ها با قابلیت پشتیبانی از چند صرافی (Failover)"""
-        # 1. تلاش در بایننس
         url = EXCHANGES["binance"]["url"].format(symbol=symbol, interval=interval)
         try:
             async with session.get(url, timeout=5) as resp:
@@ -131,7 +133,7 @@ class ExchangeManager:
         except Exception:
             pass
 
-        # 2. رزرو (Fallback) روی OKX در صورت قطعی بایننس
+        # رزرو (Fallback) روی OKX با فرمت صحیح نماد
         okx_sym = f"{symbol[:-4]}-{symbol[-4:]}" if symbol.endswith("USDT") else symbol
         url_okx = EXCHANGES["okx"]["url"].format(okx_symbol=okx_sym, interval=interval)
         try:
@@ -147,7 +149,7 @@ class ExchangeManager:
         return None
 
 # ==========================================
-# 4. ADVANCED TECHNICAL & ORDERBOOK ANALYZER
+# 4. TECHNICAL & ORDERBOOK ANALYZER
 # ==========================================
 class TechnicalAnalyzer:
     @staticmethod
@@ -178,7 +180,7 @@ class TechnicalAnalyzer:
         dx = 100 * (df['plus_di'] - df['minus_di']).abs() / (df['plus_di'] + df['minus_di'] + 1e-9)
         df['adx'] = dx.rolling(14).mean()
 
-        # SMA & Volume Profile
+        # SMA & Volume
         df['sma7'] = df['close'].rolling(7).mean()
         df['vol_ma20'] = df['volume'].rolling(20).mean()
         return df
@@ -186,7 +188,6 @@ class TechnicalAnalyzer:
 class OrderBookAnalyzer:
     @staticmethod
     async def get_depth_imbalance(session: aiohttp.ClientSession, symbol: str) -> float:
-        """تحلیل پیشرفته دفتر سفارشات و محاسبه نسبت عدم تعادل عمق (Depth Imbalance)"""
         url = EXCHANGES["binance"]["depth_url"].format(symbol=symbol)
         try:
             async with session.get(url, timeout=3) as resp:
@@ -198,22 +199,70 @@ class OrderBookAnalyzer:
                     ask_vol = sum([float(a[1]) for a in asks[:20]])
                     if bid_vol + ask_vol == 0:
                         return 0.0
-                    return (bid_vol - ask_vol) / (bid_vol + ask_vol)  # بین 1.0- تا 1.0+
+                    return (bid_vol - ask_vol) / (bid_vol + ask_vol)
         except Exception:
             pass
         return 0.0
 
 # ==========================================
-# 5. AI ENGINE (XGBOOST WITH FEATURE ENG)
+# 5. CHART IMAGE ANALYZER (VISION AI)
+# ==========================================
+class ChartImageAnalyzer:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def encode_image(self, image_path: str) -> str:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+
+    async def analyze_chart_image(self, session: aiohttp.ClientSession, image_path: str) -> dict:
+        """تحلیل تصویر چارت با استفاده از GPT-4o Vision API"""
+        if not self.api_key or self.api_key == "YOUR_OPENAI_API_KEY_HERE":
+            return None
+
+        try:
+            base64_image = self.encode_image(image_path)
+            prompt = """
+            تو یک معامله‌گر حرفه‌ای هستی. این تصویر چارت را تحلیل کن و پاسخ را دقیقاً به فرمت JSON زیر بده:
+            {
+                "pattern_detected": "نام الگو یا هیچکدام",
+                "signal": "LONG یا SHORT یا NEUTRAL",
+                "confidence_score": عدد بین 0 تا 100
+            }
+            """
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            payload = {
+                "model": "gpt-4o",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]
+                    }
+                ],
+                "response_format": {"type": "json_object"},
+                "max_tokens": 200
+            }
+            async with session.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=10) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    return json.loads(result['choices'][0]['message']['content'])
+        except Exception as e:
+            logging.error(f"خطا در تحلیل چارت تصویری: {e}")
+        return None
+
+# ==========================================
+# 6. AI ENGINE (XGBOOST FILTER)
 # ==========================================
 class AdvancedAIEngine:
     def __init__(self):
         self.model = XGBClassifier(
-            n_estimators=100,
-            max_depth=4,
-            learning_rate=0.03,
-            subsample=0.8,
-            random_state=42
+            n_estimators=100, max_depth=4, learning_rate=0.03, subsample=0.8, random_state=42
         )
         self.is_trained = False
 
@@ -225,42 +274,39 @@ class AdvancedAIEngine:
         df = pd.DataFrame(rows, columns=['rsi', 'adx', 'atr', 'imbalance', 'win'])
         X = df[['rsi', 'adx', 'atr', 'imbalance']]
         y = df['win']
-        
         self.model.fit(X, y)
         self.is_trained = True
-        logging.info(f"مدل هوش مصنوعی با موفقیت روی {len(df)} داده آموزش داده شد.")
+        logging.info(f"مدل هوش مصنوعی با {len(df)} داده آموزش داده شد.")
 
     def predict_win_probability(self, rsi: float, adx: float, atr: float, imbalance: float) -> float:
         if not self.is_trained:
-            return 0.60  # مقدار پیش‌فرض در صورت عدم وجود داده کافی
+            return 0.60
         features = np.array([[rsi, adx, atr, imbalance]])
-        prob = self.model.predict_proba(features)[0][1]
-        return float(prob)
+        return float(self.model.predict_proba(features)[0][1])
 
 # ==========================================
-# 6. CORE STRATEGY ENGINE & SIGNAL GENERATION
+# 7. STRATEGY ENGINE
 # ==========================================
 class StrategyEngine:
     @staticmethod
-    def analyze_signal(df: pd.DataFrame, imbalance: float) -> dict:
+    def analyze_signal(df: pd.DataFrame, imbalance: float, chart_signal: str = None) -> dict:
         if df is None or len(df) < 30:
             return None
 
         curr = df.iloc[-1]
-        prev = df.iloc[-2]
         atr = curr['atr']
         price = curr['close']
 
         confirmations_long = 0
         confirmations_short = 0
 
-        # 1. استراتژی مومنتوم RSI + DMI
+        # ۱. استراتژی RSI+DMI Momentum
         if curr['rsi'] > 52 and curr['adx'] > 22 and curr['plus_di'] > curr['minus_di']:
             confirmations_long += 1
         elif curr['rsi'] < 48 and curr['adx'] > 22 and curr['minus_di'] > curr['plus_di']:
             confirmations_short += 1
 
-        # 2. استراتژی کندل استیک و اکشن (Pinbar + Volume Spike)
+        # ۲. استراتژی Pinbar + Volume Spike
         body = abs(curr['close'] - curr['open'])
         lower_wick = min(curr['open'], curr['close']) - curr['low']
         upper_wick = curr['high'] - max(curr['open'], curr['close'])
@@ -270,13 +316,19 @@ class StrategyEngine:
         elif upper_wick > body * 2.5 and curr['volume'] > curr['vol_ma20'] * 1.3:
             confirmations_short += 1
 
-        # 3. استراتژی SMC & Order Book Imbalance
+        # ۳. تحلیل دفتر سفارشات (Depth Imbalance)
         if imbalance > 0.25:
             confirmations_long += 1
         elif imbalance < -0.25:
             confirmations_short += 1
 
-        # شرط ورود: حداقل ۲ تاییدیه همزمان از استراتژی‌های مختلف
+        # ۴. افزودن تاییدیه تصویر چارت (در صورت وجود)
+        if chart_signal == "LONG":
+            confirmations_long += 1
+        elif chart_signal == "SHORT":
+            confirmations_short += 1
+
+        # شرط ورود: حداقل ۲ تاییدیه همزمان
         direction = None
         if confirmations_long >= 2:
             direction = "LONG"
@@ -286,19 +338,15 @@ class StrategyEngine:
         if not direction:
             return None
 
-        # تعیین حد ضرر و تارگت‌های ۳گانه پله‌ای بر اساس ATR
+        # حد ضرر و تارگت‌های ۳گانه
         if direction == "LONG":
             sl = price - (atr * 1.5)
             risk = price - sl
-            tp1 = price + (risk * 2.0)
-            tp2 = price + (risk * 4.0)
-            tp3 = price + (risk * 6.0)
+            tp1, tp2, tp3 = price + (risk * 2.0), price + (risk * 4.0), price + (risk * 6.0)
         else:
             sl = price + (atr * 1.5)
             risk = sl - price
-            tp1 = price - (risk * 2.0)
-            tp2 = price - (risk * 4.0)
-            tp3 = price - (risk * 6.0)
+            tp1, tp2, tp3 = price - (risk * 2.0), price - (risk * 4.0), price - (risk * 6.0)
 
         return {
             "direction": direction,
@@ -314,7 +362,7 @@ class StrategyEngine:
         }
 
 # ==========================================
-# 7. POSITION TRACKER & SCALING EXITS
+# 8. TRADE MANAGER & EXITS
 # ==========================================
 class TradeManager:
     def __init__(self, ex_manager: ExchangeManager, ai_engine: AdvancedAIEngine):
@@ -322,7 +370,6 @@ class TradeManager:
         self.ai_engine = ai_engine
 
     async def execute_trade(self, symbol: str, signal: dict, account_balance: float):
-        """محاسبه دقیق حجم معامله و ثبت پوزیشن با مدیریت اعشار"""
         entry = signal['entry']
         risk_dist = abs(entry - signal['sl'])
         risk_amount = account_balance * RISK_PER_TRADE
@@ -340,10 +387,9 @@ class TradeManager:
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (trade_id, symbol, signal['direction'], entry, signal['sl'], signal['tp1'], signal['tp2'], signal['tp3'], formatted_qty, formatted_qty))
 
-        logging.info(f"🚀 معامله جدید باز شد: {symbol} | جهت: {signal['direction']} | قیمت ورود: {entry} | حجم: {formatted_qty}")
+        logging.info(f"🚀 معامله باز شد: {symbol} | جهت: {signal['direction']} | قیمت: {entry} | حجم: {formatted_qty}")
 
     async def track_active_positions(self, session: aiohttp.ClientSession):
-        """مدیریت پوزیشن‌های فعال، خروج پله‌ای (TP1/TP2) و ریسک‌فری کردن اتوماتیک"""
         while True:
             trades = await db_execute("SELECT id, symbol, direction, entry_price, stop_loss, tp1, tp2, tp3, quantity, remaining_qty, tp1_hit, tp2_hit FROM active_trades")
             
@@ -357,37 +403,30 @@ class TradeManager:
                 close_reason = None
                 pnl = 0
 
-                # 1. بررسی حد ضرر (Stop Loss)
+                # ۱. بررسی Stop Loss
                 if (direction == "LONG" and curr_price <= sl) or (direction == "SHORT" and curr_price >= sl):
                     close_reason = "STOP_LOSS"
                     pnl = (sl - entry) * rem_qty if direction == "LONG" else (entry - sl) * rem_qty
 
-                # 2. بررسی TP1: خروج 50% حجم + ریسک‌فری کردن معامله (انتقال SL به نقطه ورود)
+                # ۲. بررسی TP1: خروج ۵۰٪ + ریسک‌فری
                 elif not tp1_hit and ((direction == "LONG" and curr_price >= tp1) or (direction == "SHORT" and curr_price <= tp1)):
                     exit_qty = rem_qty * 0.5
-                    new_rem_qty = rem_qty - exit_qty
-                    await db_execute("""
-                    UPDATE active_trades SET remaining_qty = ?, stop_loss = ?, tp1_hit = 1 WHERE id = ?
-                    """, (new_rem_qty, entry, trade_id))
-                    logging.info(f"🎯 TP1 لمس شد برای {symbol}! خروج ۵۰٪ حجم و ریسک‌فری شدن معامله.")
+                    await db_execute("UPDATE active_trades SET remaining_qty = ?, stop_loss = ?, tp1_hit = 1 WHERE id = ?", (rem_qty - exit_qty, entry, trade_id))
+                    logging.info(f"🎯 TP1 لمس شد برای {symbol}! خروج ۵۰٪ و ریسک‌فری شدن.")
                     continue
 
-                # 3. بررسی TP2: خروج 30% دیگر + تریل کردن حد ضرر روی TP1
+                # ۳. بررسی TP2: خروج ۳۰٪ دیگر + انتقال SL به TP1
                 elif tp1_hit and not tp2_hit and ((direction == "LONG" and curr_price >= tp2) or (direction == "SHORT" and curr_price <= tp2)):
-                    exit_qty = rem_qty * 0.6  # معادل ۳۰٪ از کل حجم اولیه
-                    new_rem_qty = rem_qty - exit_qty
-                    await db_execute("""
-                    UPDATE active_trades SET remaining_qty = ?, stop_loss = ?, tp2_hit = 1 WHERE id = ?
-                    """, (new_rem_qty, tp1, trade_id))
-                    logging.info(f"🎯 TP2 لمس شد برای {symbol}! خروج ۳۰٪ حجم دیگر و انتقال SL به TP1.")
+                    exit_qty = rem_qty * 0.6
+                    await db_execute("UPDATE active_trades SET remaining_qty = ?, stop_loss = ?, tp2_hit = 1 WHERE id = ?", (rem_qty - exit_qty, tp1, trade_id))
+                    logging.info(f"🎯 TP2 لمس شد برای {symbol}! خروج ۳۰٪ و انتقال SL به TP1.")
                     continue
 
-                # 4. بررسی TP3: خروج کامل (تکمیل معامله)
+                # ۴. بررسی TP3: خروج کامل
                 elif (direction == "LONG" and curr_price >= tp3) or (direction == "SHORT" and curr_price <= tp3):
                     close_reason = "TP3_FULL"
                     pnl = (tp3 - entry) * rem_qty if direction == "LONG" else (entry - tp3) * rem_qty
 
-                # بستن نهایی معامله در دیتابیس در صورت خروج کامل
                 if close_reason:
                     win = 1 if pnl > 0 else 0
                     await db_execute("DELETE FROM active_trades WHERE id = ?", (trade_id,))
@@ -395,64 +434,56 @@ class TradeManager:
                     INSERT INTO trade_history (id, symbol, direction, entry_price, close_price, pnl, win, rsi, adx, atr, imbalance, close_reason)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?)
                     """, (trade_id, symbol, direction, entry, curr_price, pnl, win, close_reason))
-                    
-                    logging.info(f"🏁 معامله بسته‌ شد: {symbol} | دلیل: {close_reason} | سود/زیان: {pnl:.2f}")
-                    
-                    # آموزش مجدد مدل در صورت جمع‌آوری داده کافی
+                    logging.info(f"🏁 معامله بسته شد: {symbol} | دلیل: {close_reason} | سود/زیان: {pnl:.2f}")
                     self.ai_engine.train_model()
 
             await asyncio.sleep(3)
 
 # ==========================================
-# 8. MAIN SCANNER & BOT EXECUTION LOOP
+# 9. MAIN EXECUTION LOOP
 # ==========================================
 async def main():
     init_db()
     ex_manager = ExchangeManager()
     ai_engine = AdvancedAIEngine()
+    image_analyzer = ChartImageAnalyzer(OPENAI_API_KEY)
     trade_manager = TradeManager(ex_manager, ai_engine)
 
-    symbols_to_scan = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "BNBUSDT"]
-    account_balance = 1000.0  # موجودی فرضی حساب به تتر
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"]
+    account_balance = 1000.0
 
     async with aiohttp.ClientSession() as session:
         await ex_manager.load_exchange_info(session)
         ai_engine.train_model()
 
-        # اجرای همزمان حلقه زیرنظر داشتن پوزیشن‌ها
         asyncio.create_task(trade_manager.track_active_positions(session))
-
-        logging.info("🤖 ربات معاملاتی پیشرفته فعال شد. در حال اسکن بازار...")
+        logging.info("🤖 ربات پیشرفته فعال شد. در حال اسکن...")
 
         while True:
-            for symbol in symbols_to_scan:
-                # 1. دریافت کندل‌ها و محاسبه اندیکاتورها
+            for symbol in symbols:
                 df = await ex_manager.fetch_klines(session, symbol, "15m")
                 if df is None:
                     continue
                 
                 df = TechnicalAnalyzer.compute_indicators(df)
-                
-                # 2. تحلیل عمق دفتر سفارشات
                 imbalance = await OrderBookAnalyzer.get_depth_imbalance(session, symbol)
 
-                # 3. بررسی سیگنال توسط موتور استراتژی
-                signal = StrategyEngine.analyze_signal(df, imbalance)
+                # نمونه: در صورت وجود تصویر چارت می‌توان سیگنال آن را دریافت کرد
+                chart_signal = None  # می‌توان آدرس فایل عکس را داد: await image_analyzer.analyze_chart_image(session, "chart.jpg")
+
+                signal = StrategyEngine.analyze_signal(df, imbalance, chart_signal)
 
                 if signal:
-                    # 4. ارزیابی احتمال برد توسط هوش مصنوعی
                     win_prob = ai_engine.predict_win_probability(
                         signal['rsi'], signal['adx'], signal['atr'], signal['imbalance']
                     )
 
-                    # ورود به معامله تنها در صورت تایید هوش مصنوعی (احتمال بالای ۵۵٪)
                     if win_prob >= 0.55:
-                        # بررسی عدم وجود پوزیشن فعال روی همین نماد
                         existing = await db_execute("SELECT id FROM active_trades WHERE symbol = ?", (symbol,))
                         if not existing:
                             await trade_manager.execute_trade(symbol, signal, account_balance)
 
-            await asyncio.sleep(15)  # اسکن مجدد هر ۱۵ ثانیه
+            await asyncio.sleep(15)
 
 if __name__ == "__main__":
     try:
