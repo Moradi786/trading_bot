@@ -1,7 +1,10 @@
-google-genai
-matplotlib
-python-telegram-bot
-pandas
+scikit-learn
 xgboost
+pandas
+numpy
+matplotlib
+google-genai
+python-telegram-bot
 aiohttp
 python-dotenv
+
