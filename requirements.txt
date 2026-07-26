@@ -1,9 +1,9 @@
-scikit-learn
-xgboost
-pandas
-numpy
-matplotlib
 google-genai
+matplotlib
 python-telegram-bot
+pandas
+xgboost
+scikit-learn
+numpy
 aiohttp
 python-dotenv
