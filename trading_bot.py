@@ -1,28 +1,29 @@
 import os
 import asyncio
 import sqlite3
-import math
 import logging
 import json
-from decimal import Decimal
+import time
+import io
 import aiohttp
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from xgboost import XGBClassifier
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-# بارگذاری متغیرها از فایل .env
 load_dotenv()
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
 DB_NAME = "alerts.db"
-RISK_PER_TRADE = 0.02
-LEVERAGE = 10
-AI_MIN_SAMPLES = 50
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -31,38 +32,122 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 EXCHANGES = {
     "binance": {
         "url": "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100",
-        "depth_url": "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=20",
-        "exchange_info": "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    },
-    "okx": {
-        "url": "https://www.okx.com/api/v5/market/history-candles?instId={okx_symbol}-SWAP&bar={interval}&limit=100"
+        "depth_url": "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=20"
     }
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ==========================================
-# 2. TELEGRAM NOTIFIER SYSTEM
+# 2. GEMINI VISION ANALYZER (تحلیل عکس چارت فرستاده‌شده توسط شما)
 # ==========================================
-async def send_telegram_msg(session: aiohttp.ClientSession, text: str):
-    """ارسال مستقیم پیام به کانال/گروه تلگرام"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    try:
-        async with session.post(url, json=payload, timeout=5) as resp:
-            if resp.status != 200:
-                logging.error(f"خطا در ارسال پیام تلگرام: {await resp.text()}")
-    except Exception as e:
-        logging.error(f"خطای ارتباط با تلگرام: {e}")
+class ChartImageAnalyzer:
+    def __init__(self, api_key: str):
+        self.client = genai.Client(api_key=api_key) if api_key else None
+
+    async def analyze_chart_image(self, image_bytes: bytes) -> dict:
+        if not self.client:
+            return None
+        try:
+            prompt = """
+            این تصویر یک چارت معاملاتی است. لطفا آن را دقیق بررسی کن و خروجی را فقط به فرمت JSON زیر بده:
+            {
+                "pattern_detected": "نام الگو مثل Head and Shoulders یا Bullish Flag یا SMC Sweep یا None",
+                "signal": "LONG یا SHORT یا NEUTRAL",
+                "confidence_score": عدد بین 0 تا 100,
+                "analysis_summary": "یک جمله کوتاه درباره تحلیل"
+            }
+            """
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    prompt
+                ]
+            )
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        except Exception as e:
+            logging.error(f"خطا در تحلیل تصویر توسط Gemini: {e}")
+            return None
 
 # ==========================================
-# 3. DATABASE (WAL MODE)
+# 3. TELEGRAM NOTIFIER & PHOTO HANDLER
+# ==========================================
+async def send_telegram_msg(session: aiohttp.ClientSession, text: str, photo_bytes: bytes = None):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    if photo_bytes:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        data = aiohttp.FormData()
+        data.add_field("chat_id", TELEGRAM_CHAT_ID)
+        data.add_field("caption", text)
+        data.add_field("parse_mode", "Markdown")
+        data.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
+        try:
+            async with session.post(url, data=data, timeout=10) as resp:
+                if resp.status != 200:
+                    logging.error(f"خطا در ارسال عکس به تلگرام: {await resp.text()}")
+        except Exception as e:
+            logging.error(f"خطای ارتباط با تلگرام: {e}")
+    else:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        try:
+            async with session.post(url, json=payload, timeout=5) as resp:
+                if resp.status != 200:
+                    logging.error(f"خطا در ارسال پیام تلگرام: {await resp.text()}")
+        except Exception as e:
+            logging.error(f"خطای ارتباط با تلگرام: {e}")
+
+async def handle_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دریافت و تحلیل تصویر چارت فرستاده‌شده توسط کاربر با Gemini"""
+    await update.message.reply_text("📸 تصویر چارت دریافت شد. در حال ارسال به Gemini AI برای تحلیل...")
+    photo_file = await update.message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+
+    analyzer = ChartImageAnalyzer(GEMINI_API_KEY)
+    result = await analyzer.analyze_chart_image(bytes(photo_bytes))
+
+    if result:
+        sig_emoji = "🟢" if result.get('signal') == "LONG" else ("🔴" if result.get('signal') == "SHORT" else "⚪")
+        msg = f"🔍 **نتیجه تحلیل Gemini AI:**\n\n" \
+              f"📌 الگوی شناسایی‌شده: `{result.get('pattern_detected', 'هیچکدام')}`\n" \
+              f"📊 سیگنال پیشنهادی: `{result.get('signal', 'NEUTRAL')}` {sig_emoji}\n" \
+              f"🎯 میزان اطمینان: `{result.get('confidence_score', 0)}%`\n" \
+              f"💡 توضیحات: {result.get('analysis_summary', 'بدون توضیح')}"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ خطا در پردازش تصویر توسط Gemini.")
+
+# ==========================================
+# 4. CHART GENERATOR SYSTEM (رسم خودکار چارت)
+# ==========================================
+class ChartGenerator:
+    @staticmethod
+    def generate_chart_image(df: pd.DataFrame, symbol: str, signal: dict) -> bytes:
+        fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
+        ax.plot(df.index, df['close'], label="Price", color="#1f77b4", linewidth=1.5)
+        
+        entry, sl, tp1 = signal['entry'], signal['sl'], signal['tp1']
+        ax.axhline(y=entry, color='blue', linestyle='--', linewidth=1, label=f"Entry: {entry}")
+        ax.axhline(y=sl, color='red', linestyle='--', linewidth=1, label=f"SL: {round(sl, 4)}")
+        ax.axhline(y=tp1, color='green', linestyle='--', linewidth=1, label=f"TP1: {round(tp1, 4)}")
+        
+        ax.set_title(f"{symbol} - {signal['direction']} Signal Chart", fontsize=12, fontweight='bold')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.legend(loc="upper left")
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+
+# ==========================================
+# 5. DATABASE
 # ==========================================
 def sync_execute(query: str, params: tuple = ()):
     with sqlite3.connect(DB_NAME, timeout=20.0) as conn:
@@ -74,25 +159,10 @@ def sync_execute(query: str, params: tuple = ()):
 
 def init_db():
     sync_execute("""
-    CREATE TABLE IF NOT EXISTS active_trades (
-        id TEXT PRIMARY KEY,
-        symbol TEXT,
-        direction TEXT,
-        entry_price REAL,
-        stop_loss REAL,
-        tp1 REAL, tp2 REAL, tp3 REAL,
-        quantity REAL, remaining_qty REAL,
-        position_size_usdt REAL,
-        tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-    sync_execute("""
-    CREATE TABLE IF NOT EXISTS trade_history (
-        id TEXT PRIMARY KEY,
-        symbol TEXT, direction TEXT,
-        entry_price REAL, close_price REAL,
-        pnl REAL, pnl_pct REAL, win INTEGER, rsi REAL, adx REAL, atr REAL, imbalance REAL, close_reason TEXT
+    CREATE TABLE IF NOT EXISTS signal_history (
+        id TEXT PRIMARY KEY, symbol TEXT, direction TEXT,
+        entry_price REAL, stop_loss REAL, tp1 REAL, tp2 REAL, tp3 REAL,
+        rsi REAL, adx REAL, atr REAL, imbalance REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     """)
 
@@ -100,33 +170,9 @@ async def db_execute(query: str, params: tuple = ()):
     return await asyncio.to_thread(sync_execute, query, params)
 
 # ==========================================
-# 4. EXCHANGE & PRECISION MANAGER
+# 6. DATA FETCHING & TECHNICAL ANALYSIS
 # ==========================================
 class ExchangeManager:
-    def __init__(self):
-        self.symbol_info = {}
-
-    async def load_exchange_info(self, session: aiohttp.ClientSession):
-        try:
-            async with session.get(EXCHANGES["binance"]["exchange_info"]) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for s in data["symbols"]:
-                        symbol = s["symbol"]
-                        step_size = "1"
-                        for f in s["filters"]:
-                            if f["filterType"] == "LOT_SIZE":
-                                step_size = f["stepSize"]
-                        self.symbol_info[symbol] = {"step_size": float(step_size)}
-        except Exception as e:
-            logging.error(f"خطا در دریافت قوانین صرافی: {e}")
-
-    def format_quantity(self, symbol: str, quantity: float) -> float:
-        info = self.symbol_info.get(symbol, {"step_size": 0.001})
-        step = Decimal(str(info["step_size"]))
-        qty_dec = Decimal(str(quantity))
-        return float((qty_dec // step) * step)
-
     async def fetch_klines(self, session: aiohttp.ClientSession, symbol: str, interval: str = "15m"):
         url = EXCHANGES["binance"]["url"].format(symbol=symbol, interval=interval)
         try:
@@ -135,26 +181,10 @@ class ExchangeManager:
                     data = await resp.json()
                     df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', '_1', '_2', '_3', '_4', '_5', '_6'])
                     return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-        except Exception:
-            pass
-
-        okx_sym = f"{symbol[:-4]}-{symbol[-4:]}" if symbol.endswith("USDT") else symbol
-        url_okx = EXCHANGES["okx"]["url"].format(okx_symbol=okx_sym, interval=interval)
-        try:
-            async with session.get(url_okx, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    raw = data.get("data", [])
-                    df = pd.DataFrame(raw, columns=['time', 'open', 'high', 'low', 'close', 'volume', '_1', '_2', '_3'])
-                    df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-                    return df.iloc[::-1].reset_index(drop=True)
         except Exception as e:
             logging.error(f"خطا در دریافت کندل {symbol}: {e}")
         return None
 
-# ==========================================
-# 5. TECHNICAL & ORDERBOOK ANALYZER
-# ==========================================
 class TechnicalAnalyzer:
     @staticmethod
     def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -201,19 +231,12 @@ class OrderBookAnalyzer:
         return 0.0
 
 # ==========================================
-# 6. AI ENGINE & STRATEGY
+# 7. ADVANCED STRATEGY ENGINE & AI FILTER
 # ==========================================
 class AdvancedAIEngine:
     def __init__(self):
         self.model = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.03, subsample=0.8, random_state=42)
         self.is_trained = False
-
-    def train_model(self):
-        rows = sync_execute("SELECT rsi, adx, atr, imbalance, win FROM trade_history")
-        if len(rows) < AI_MIN_SAMPLES: return
-        df = pd.DataFrame(rows, columns=['rsi', 'adx', 'atr', 'imbalance', 'win'])
-        self.model.fit(df[['rsi', 'adx', 'atr', 'imbalance']], df['win'])
-        self.is_trained = True
 
     def predict_win_probability(self, rsi: float, adx: float, atr: float, imbalance: float) -> float:
         if not self.is_trained: return 0.60
@@ -221,138 +244,124 @@ class AdvancedAIEngine:
 
 class StrategyEngine:
     @staticmethod
+    def detect_hidden_divergence(df: pd.DataFrame) -> tuple[bool, bool]:
+        if len(df) < 20: return False, False
+        price_lows = df['low'].iloc[-10:]
+        rsi_lows = df['rsi'].iloc[-10:]
+        
+        hidden_bullish = (df['low'].iloc[-1] > price_lows.min()) and (df['rsi'].iloc[-1] < rsi_lows.min())
+        hidden_bearish = (df['high'].iloc[-1] < df['high'].iloc[-10:].max()) and (df['rsi'].iloc[-1] > df['rsi'].iloc[-10:].max())
+        
+        return hidden_bullish, hidden_bearish
+
+    @staticmethod
     def analyze_signal(df: pd.DataFrame, imbalance: float) -> dict:
         if df is None or len(df) < 30: return None
         curr = df.iloc[-1]
+        prev = df.iloc[-2]
         atr, price = curr['atr'], curr['close']
         c_long, c_short = 0, 0
 
-        if curr['rsi'] > 52 and curr['adx'] > 22 and curr['plus_di'] > curr['minus_di']: c_long += 1
-        elif curr['rsi'] < 48 and curr['adx'] > 22 and curr['minus_di'] > curr['plus_di']: c_short += 1
+        # ۱. استراتژی RSI + DMI پیشرفته (ADX > 25 و واگرایی مخفی)
+        hidden_bull, hidden_bear = StrategyEngine.detect_hidden_divergence(df)
+        if curr['adx'] > 25:
+            if curr['plus_di'] > curr['minus_di'] and (curr['rsi'] > 50 or hidden_bull):
+                c_long += 1
+            elif curr['minus_di'] > curr['plus_di'] and (curr['rsi'] < 50 or hidden_bear):
+                c_short += 1
 
+        # ۲. پیشرفته‌سازی Candle Setup (سایه ۳ برابر بدنه + Volume Spike ۱.۵ برابر)
         body = abs(curr['close'] - curr['open'])
-        if (min(curr['open'], curr['close']) - curr['low']) > body * 2.5 and curr['volume'] > curr['vol_ma20'] * 1.3: c_long += 1
-        elif (curr['high'] - max(curr['open'], curr['close'])) > body * 2.5 and curr['volume'] > curr['vol_ma20'] * 1.3: c_short += 1
+        lower_wick = min(curr['open'], curr['close']) - curr['low']
+        upper_wick = curr['high'] - max(curr['open'], curr['close'])
+        volume_spike = curr['volume'] > (curr['vol_ma20'] * 1.5)
 
-        if imbalance > 0.25: c_long += 1
-        elif imbalance < -0.25: c_short += 1
+        if lower_wick >= (body * 3.0) and volume_spike and curr['close'] > prev['high']:
+            c_long += 1
+        elif upper_wick >= (body * 3.0) and volume_spike and curr['close'] < prev['low']:
+            c_short += 1
 
-        direction = "LONG" if c_long >= 2 else ("SHORT" if c_short >= 2 else None)
+        # ۳. شکست معتبر Breakout + 0.5 * ATR
+        resistance = df['high'].iloc[-20:-1].max()
+        support = df['low'].iloc[-20:-1].min()
+        
+        if curr['close'] > (resistance + 0.5 * atr) and volume_spike:
+            c_long += 1
+        elif curr['close'] < (support - 0.5 * atr) and volume_spike:
+            c_short += 1
+
+        # ۴. SMC Liquidity Sweep (جاروی نقدینگی سقف و کف‌های برابر)
+        eq_high = abs(df['high'].iloc[-5:-1].max() - df['high'].iloc[-10:-5].max()) < (atr * 0.1)
+        eq_low = abs(df['low'].iloc[-5:-1].min() - df['low'].iloc[-10:-5].min()) < (atr * 0.1)
+
+        if eq_low and lower_wick >= (body * 2.5):
+            c_long += 1
+        elif eq_high and upper_wick >= (body * 2.5):
+            c_short += 1
+
+        # ۵. Orderbook Imbalance (عمق نقدینگی)
+        if imbalance > 0.30: c_long += 1
+        elif imbalance < -0.30: c_short += 1
+
+        # صدور سیگنال فقط با حداقل ۳ تاییدیه هم‌زمان
+        direction = "LONG" if c_long >= 3 else ("SHORT" if c_short >= 3 else None)
         if not direction: return None
 
         risk = atr * 1.5
-        
-        # اصلاح حد سودها بر اساس جهت معامله (اصلاح خطای محاسباتی عکس)
         if direction == "LONG":
             sl = price - risk
             tp1, tp2, tp3 = price + (risk * 1.5), price + (risk * 3.0), price + (risk * 5.0)
-        else: # SHORT
+        else:
             sl = price + risk
             tp1, tp2, tp3 = price - (risk * 1.5), price - (risk * 3.0), price - (risk * 5.0)
 
-        return {"direction": direction, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "rsi": curr['rsi'], "adx": curr['adx'], "atr": atr, "imbalance": imbalance}
+        return {
+            "direction": direction, "entry": price, "sl": sl, 
+            "tp1": tp1, "tp2": tp2, "tp3": tp3, 
+            "rsi": curr['rsi'], "adx": curr['adx'], "atr": atr, "imbalance": imbalance
+        }
 
 # ==========================================
-# 7. PAPER TRADING MANAGER & NOTIFICATIONS
+# 8. SIGNAL MANAGER & MARKET SCANNER
 # ==========================================
-class TradeManager:
-    def __init__(self, ex_manager: ExchangeManager, ai_engine: AdvancedAIEngine):
-        self.ex_manager = ex_manager
+class SignalManager:
+    def __init__(self, ai_engine: AdvancedAIEngine):
         self.ai_engine = ai_engine
+        self.recent_signals = {}
 
-    async def execute_trade(self, session: aiohttp.ClientSession, symbol: str, signal: dict, account_balance: float):
+    async def process_signal(self, session: aiohttp.ClientSession, symbol: str, signal: dict, df: pd.DataFrame):
+        current_time = time.time()
+        if symbol in self.recent_signals and (current_time - self.recent_signals[symbol]) < 900:
+            return
+
+        self.recent_signals[symbol] = current_time
         entry = signal['entry']
-        raw_qty = ((account_balance * RISK_PER_TRADE) / abs(entry - signal['sl'])) * LEVERAGE
-        qty = self.ex_manager.format_quantity(symbol, raw_qty)
-        if qty <= 0: return
-
-        size_usdt = round(qty * entry, 1)
-        trade_id = f"{symbol}_{int(asyncio.get_event_loop().time())}"
+        signal_id = f"{symbol}_{int(current_time)}"
 
         await db_execute("""
-        INSERT INTO active_trades (id, symbol, direction, entry_price, stop_loss, tp1, tp2, tp3, quantity, remaining_qty, position_size_usdt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (trade_id, symbol, signal['direction'], entry, signal['sl'], signal['tp1'], signal['tp2'], signal['tp3'], qty, qty, size_usdt))
+        INSERT INTO signal_history (id, symbol, direction, entry_price, stop_loss, tp1, tp2, tp3, rsi, adx, atr, imbalance)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (signal_id, symbol, signal['direction'], entry, signal['sl'], signal['tp1'], signal['tp2'], signal['tp3'], signal['rsi'], signal['adx'], signal['atr'], signal['imbalance']))
 
         dir_emoji = "🔴" if signal['direction'] == "SHORT" else "🟢"
         
-        # فرمت دقیق پیام مطابق با تصویر شما
-        msg = f"📄 **(PAPER) Trade Opened** ✅\n\n" \
+        msg = f"🚨 **New Advanced Signal** 📢\n\n" \
               f"🪐 #{symbol} | {signal['direction']} {dir_emoji}\n" \
-              f"📍 Entry: {entry}\n" \
-              f"📊 Size: {size_usdt} USDT\n" \
+              f"📍 Entry Price: {entry}\n" \
               f"🛡 SL: {round(signal['sl'], 5)}\n" \
-              f"🎯 TP1: {round(signal['tp1'], 5)} | TP2: {round(signal['tp2'], 5)} | TP3: {round(signal['tp3'], 5)}"
+              f"🎯 TP1: {round(signal['tp1'], 5)}\n" \
+              f"🎯 TP2: {round(signal['tp2'], 5)}\n" \
+              f"🎯 TP3: {round(signal['tp3'], 5)}"
 
-        await send_telegram_msg(session, msg)
-        logging.info(f"🚀 Paper Trade باز شد: {symbol}")
+        chart_bytes = ChartGenerator.generate_chart_image(df, symbol, signal)
+        await send_telegram_msg(session, msg, photo_bytes=chart_bytes)
+        logging.info(f"📢 سیگنال پیشرفته به همراه چارت ارسال شد: {symbol} | {signal['direction']}")
 
-    async def track_active_positions(self, session: aiohttp.ClientSession):
-        while True:
-            trades = await db_execute("SELECT id, symbol, direction, entry_price, stop_loss, tp1, tp2, tp3, quantity, remaining_qty, position_size_usdt, tp1_hit, tp2_hit FROM active_trades")
-            for t in trades:
-                trade_id, symbol, direction, entry, sl, tp1, tp2, tp3, qty, rem_qty, size_usdt, tp1_hit, tp2_hit = t
-                df = await self.ex_manager.fetch_klines(session, symbol, "1m")
-                if df is None or df.empty: continue
-                
-                curr_price = df.iloc[-1]['close']
-                close_reason, pnl = None, 0
-
-                if (direction == "LONG" and curr_price <= sl) or (direction == "SHORT" and curr_price >= sl):
-                    close_reason = "Loss"
-                    pnl = (sl - entry) * rem_qty if direction == "LONG" else (entry - sl) * rem_qty
-
-                elif not tp1_hit and ((direction == "LONG" and curr_price >= tp1) or (direction == "SHORT" and curr_price <= tp1)):
-                    await db_execute("UPDATE active_trades SET remaining_qty = ?, stop_loss = ?, tp1_hit = 1 WHERE id = ?", (rem_qty * 0.5, entry, trade_id))
-                    continue
-
-                elif tp1_hit and not tp2_hit and ((direction == "LONG" and curr_price >= tp2) or (direction == "SHORT" and curr_price <= tp2)):
-                    await db_execute("UPDATE active_trades SET remaining_qty = ?, stop_loss = ?, tp2_hit = 1 WHERE id = ?", (rem_qty * 0.4, tp1, trade_id))
-                    continue
-
-                elif (direction == "LONG" and curr_price >= tp3) or (direction == "SHORT" and curr_price <= tp3):
-                    close_reason = "Profit"
-                    pnl = (tp3 - entry) * rem_qty if direction == "LONG" else (entry - tp3) * rem_qty
-
-                if close_reason:
-                    win = 1 if pnl > 0 else 0
-                    pnl_pct = ((curr_price - entry) / entry * 100) if direction == "LONG" else ((entry - curr_price) / entry * 100)
-                    
-                    await db_execute("DELETE FROM active_trades WHERE id = ?", (trade_id,))
-                    await db_execute("""
-                    INSERT INTO trade_history (id, symbol, direction, entry_price, close_price, pnl, pnl_pct, win, rsi, adx, atr, imbalance, close_reason)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?)
-                    """, (trade_id, symbol, direction, entry, curr_price, pnl, pnl_pct, win, close_reason))
-
-                    # فرمت پیام بسته‌شدن معامله مطابق عکس
-                    status_icon = "❌" if close_reason == "Loss" else "💰"
-                    close_msg = f"{status_icon} **Trade Closed ({close_reason})**\n\n" \
-                                f"🪐 #{symbol} | PnL: {pnl_pct:+.2f}%"
-                    
-                    await send_telegram_msg(session, close_msg)
-                    logging.info(f"🏁 معامله بسته‌شد: {symbol} | PnL: {pnl_pct:.2f}%")
-                    self.ai_engine.train_model()
-
-            await asyncio.sleep(3)
-
-# ==========================================
-# 8. MAIN EXECUTION LOOP
-# ==========================================
-async def main():
-    init_db()
+async def start_market_scanner(signal_manager: SignalManager, ai_engine: AdvancedAIEngine):
     ex_manager = ExchangeManager()
-    ai_engine = AdvancedAIEngine()
-    trade_manager = TradeManager(ex_manager, ai_engine)
-
-    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "AAVEUSDT", "LINKUSDT", "SUIUSDT", "TRUMPUSDT"]
-    account_balance = 1000.0
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"]
 
     async with aiohttp.ClientSession() as session:
-        await ex_manager.load_exchange_info(session)
-        ai_engine.train_model()
-        asyncio.create_task(trade_manager.track_active_positions(session))
-
-        logging.info("🤖 Paper Trading Bot فعال شد...")
         while True:
             for symbol in symbols:
                 df = await ex_manager.fetch_klines(session, symbol, "15m")
@@ -364,10 +373,27 @@ async def main():
                 if signal:
                     win_prob = ai_engine.predict_win_probability(signal['rsi'], signal['adx'], signal['atr'], signal['imbalance'])
                     if win_prob >= 0.55:
-                        existing = await db_execute("SELECT id FROM active_trades WHERE symbol = ?", (symbol,))
-                        if not existing:
-                            await trade_manager.execute_trade(session, symbol, signal, account_balance)
+                        await signal_manager.process_signal(session, symbol, signal, df)
             await asyncio.sleep(15)
+
+# ==========================================
+# 9. MAIN EXECUTION
+# ==========================================
+async def main():
+    init_db()
+    ai_engine = AdvancedAIEngine()
+    signal_manager = SignalManager(ai_engine)
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.PHOTO, handle_user_photo))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    logging.info("🤖 ربات با تمام استراتژی‌های پیشرفته و Gemini Vision آماده کار است...")
+
+    await start_market_scanner(signal_manager, ai_engine)
 
 if __name__ == "__main__":
     asyncio.run(main())
