@@ -8,3 +8,4 @@ scikit-learn
 joblib
 numpy
 google-genai
+matplotlib
