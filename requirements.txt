@@ -7,3 +7,4 @@ xgboost
 scikit-learn
 joblib
 numpy
+google-genai
