@@ -5,35 +5,22 @@ import sqlite3
 import time
 import hmac
 import hashlib
-import io
-import json
 from typing import Dict, Any, Optional, List, Tuple
 from decimal import Decimal, ROUND_DOWN
 
 import aiohttp
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 import joblib
-from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from aiohttp import web
 
-try:
-    from google import genai
-    from google.genai import types
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-
-load_dotenv()
-
+# ==========================================================
+# 0. Config
+# ==========================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("UnifiedBot")
 
@@ -41,12 +28,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "1.0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "3"))
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
-EXECUTE_TRADES = os.getenv("EXECUTE_TRADES", "false").lower() == "true"
 
 DB_NAME = "unified_bot.db"
 MODEL_PATH = "ai_model.joblib"
@@ -59,17 +44,18 @@ MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 ALERT_TTL = 86400
 
-
+# ==========================================================
+# 1. Async Database
+# ==========================================================
 def _sync_execute(query: str, params: tuple = ()):
-    with sqlite3.connect(DB_NAME, timeout=20.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
+    with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(query, params)
         conn.commit()
         return cursor.fetchall()
 
 def _sync_fetch_df(query: str, params: tuple = ()) -> pd.DataFrame:
-    with sqlite3.connect(DB_NAME, timeout=20.0) as conn:
+    with sqlite3.connect(DB_NAME) as conn:
         return pd.read_sql_query(query, conn, params=params)
 
 async def db_execute(query: str, params: tuple = ()):
@@ -96,10 +82,9 @@ async def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id TEXT UNIQUE,
             symbol TEXT, interval TEXT, direction TEXT, strategy TEXT,
             entry_price REAL, stop_loss REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-            sl_percent REAL, rsi REAL, adx REAL, atr REAL, trend TEXT,
-            ai_prob REAL, ai_confidence TEXT,
-            ob_imbalance REAL, ob_slippage REAL, ob_stop_hunt REAL,
-            ob_iceberg_bids INTEGER, ob_iceberg_asks INTEGER,
+            sl_percent REAL, rsi REAL, adx REAL, trend TEXT, ai_prob REAL,
+            ai_confidence TEXT, ob_imbalance REAL, ob_slippage REAL,
+            ob_stop_hunt REAL, ob_iceberg_bids INTEGER, ob_iceberg_asks INTEGER,
             executed INTEGER DEFAULT 0, feedback TEXT DEFAULT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""",
         """CREATE TABLE IF NOT EXISTS bot_stats (
@@ -115,7 +100,9 @@ async def init_database():
         await db_execute("INSERT OR IGNORE INTO bot_stats (key, value) VALUES (?, 0)", (k,))
     LOGGER.info("Database initialized.")
 
-
+# ==========================================================
+# 2. Rate Limiting
+# ==========================================================
 class RateLimiter:
     def __init__(self, rate=10, per=1):
         self.rate = rate
@@ -141,6 +128,9 @@ binance_limiter = RateLimiter(rate=20, per=1)
 bybit_limiter = RateLimiter(rate=10, per=1)
 okx_limiter = RateLimiter(rate=10, per=1)
 
+# ==========================================================
+# 3. Exchanges
+# ==========================================================
 EXCHANGES = [
     {"name":"Binance","weight":10,"limiter":binance_limiter,
      "url":"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100",
@@ -209,7 +199,9 @@ async def fetch_order_book(session, symbol, limit=50):
     except: pass
     return [], []
 
-
+# ==========================================================
+# 4. Indicators
+# ==========================================================
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1: return 50.0
     gains, losses = [], []
@@ -264,6 +256,15 @@ def calc_dmi(highs, lows, closes, period=14):
         adx = (adx * (period - 1) + dxs[i][2]) / period
     return round(lp, 2), round(lm, 2), round(adx, 2)
 
+def detect_hidden_divergence(highs, lows, closes):
+    if len(closes) < 20: return False, False
+    price_lows = lows[-10:]
+    rsi_vals = [calc_rsi(closes[:len(closes)-10+i+1]) for i in range(10)]
+    if len(rsi_vals) < 10: return False, False
+    hidden_bull = (lows[-1] > min(price_lows)) and (rsi_vals[-1] < min(rsi_vals))
+    hidden_bear = (highs[-1] < max(highs[-10:])) and (rsi_vals[-1] > max(rsi_vals))
+    return hidden_bull, hidden_bear
+
 def find_pivots(highs, lows, lr=3):
     ph, pl = [], []
     for i in range(lr, len(highs) - lr - 1):
@@ -290,16 +291,9 @@ def htf_sr(k4h, k1d):
             s.extend([p[1] for p in pl[-3:]])
     return s, r
 
-def detect_hidden_divergence(highs, lows, closes):
-    if len(closes) < 20: return False, False
-    price_lows = lows[-10:]
-    rsi_vals = [calc_rsi(closes[:len(closes)-10+i+1]) for i in range(10)]
-    if len(rsi_vals) < 10: return False, False
-    hidden_bull = (lows[-1] > min(price_lows)) and (rsi_vals[-1] < min(rsi_vals))
-    hidden_bear = (highs[-1] < max(highs[-10:])) and (rsi_vals[-1] > max(rsi_vals))
-    return hidden_bull, hidden_bear
-
-
+# ==========================================================
+# 5. Order Book Microstructure
+# ==========================================================
 class OrderBookAnalyzer:
     @staticmethod
     def analyze(bids, asks, entry_price=0.0, sl_price=0.0):
@@ -337,72 +331,91 @@ class OrderBookAnalyzer:
             "iceberg_asks": int(iceberg_asks)
         }
 
-    @staticmethod
-    async def get_depth_imbalance(session, symbol):
-        bids, asks = await fetch_order_book(session, symbol, 20)
-        if not bids or not asks: return 0.0
-        bv = sum(float(b[1]) for b in bids[:20])
-        av = sum(float(a[1]) for a in asks[:20])
-        if bv + av == 0: return 0.0
-        return (bv - av) / (bv + av)
-
-
+# ==========================================================
+# 6. AI Engine
+# ==========================================================
 class ChartGenerator:
     @staticmethod
     def generate_chart_image(df: pd.DataFrame, symbol: str, signal: dict) -> bytes:
         fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
-        ax.plot(df.index, df['close'], label="Price", color="#1f77b4", linewidth=1.5)
-        entry = signal.get('entry_price', signal.get('entry', 0))
-        sl = signal.get('stop_loss', signal.get('sl', 0))
-        tp1 = signal.get('tp1', 0)
-        if entry: ax.axhline(y=entry, color='blue', linestyle='--', linewidth=1, label=f"Entry: {entry}")
-        if sl: ax.axhline(y=sl, color='red', linestyle='--', linewidth=1, label=f"SL: {round(sl, 4)}")
-        if tp1: ax.axhline(y=tp1, color='green', linestyle='--', linewidth=1, label=f"TP1: {round(tp1, 4)}")
-        ax.set_title(f"{symbol} - {signal.get('direction', 'SIGNAL')} Chart", fontsize=12, fontweight='bold')
-        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.plot(df.index, df["close"], label="Price", color="#1f77b4", linewidth=1.5)
+        entry = signal.get("entry_price", signal.get("entry", 0))
+        sl = signal.get("stop_loss", signal.get("sl", 0))
+        tp1 = signal.get("tp1", 0)
+        if entry: ax.axhline(y=entry, color="blue", linestyle="--", linewidth=1, label=f"Entry: {entry}")
+        if sl: ax.axhline(y=sl, color="red", linestyle="--", linewidth=1, label=f"SL: {round(sl, 4)}")
+        if tp1: ax.axhline(y=tp1, color="green", linestyle="--", linewidth=1, label=f"TP1: {round(tp1, 4)}")
+        ax.set_title(f"{symbol} - {signal.get('direction', 'SIGNAL')} Chart", fontsize=12, fontweight="bold")
+        ax.grid(True, linestyle=":", alpha=0.6)
         ax.legend(loc="upper left")
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.savefig(buf, format="png", bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
         return buf.getvalue()
 
 def klines_to_df(klines):
-    df = pd.DataFrame(klines, columns=['time', 'open', 'high', 'low', 'close', 'volume', '_1', '_2', '_3', '_4', '_5', '_6'])
-    return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-
+    df = pd.DataFrame(klines, columns=["time", "open", "high", "low", "close", "volume", "_1", "_2", "_3", "_4", "_5", "_6"])
+    return df[["open", "high", "low", "close", "volume"]].astype(float)
 
 class ChartImageAnalyzer:
     def __init__(self, api_key: str):
-        self.client = genai.Client(api_key=api_key) if api_key and GEMINI_AVAILABLE else None
+        if not GEMINI_AVAILABLE:
+            LOGGER.error("Gemini not available: google-genai not installed.")
+            self.client = None
+            return
+        if not api_key:
+            LOGGER.error("Gemini API key not set.")
+            self.client = None
+            return
+        try:
+            self.client = genai.Client(api_key=api_key)
+            LOGGER.info("Gemini client initialized.")
+        except Exception as e:
+            LOGGER.error(f"Gemini client init failed: {e}")
+            self.client = None
 
     async def analyze_chart_image(self, image_bytes: bytes) -> dict:
         if not self.client:
+            LOGGER.error("Gemini client is None.")
             return None
         try:
-            prompt = """
-            This is a trading chart image. Analyze it carefully and return ONLY the following JSON format:
-            {
-                "pattern_detected": "pattern name like Head and Shoulders, Bullish Flag, SMC Sweep, or None",
-                "signal": "LONG or SHORT or NEUTRAL",
-                "confidence_score": number between 0 and 100,
-                "analysis_summary": "one short sentence about the analysis"
-            }
-            """
+            prompt_text = (
+                "Analyze this trading chart image. "
+                "Return ONLY valid JSON with no markdown formatting: "
+                '{"pattern_detected": "pattern name or None", '
+                '"signal": "LONG or SHORT or NEUTRAL", '
+                '"confidence_score": 0-100, '
+                '"analysis_summary": "short analysis"}'
+            )
+            LOGGER.info(f"Sending {len(image_bytes)} bytes to Gemini...")
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    prompt
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                    prompt_text
                 ]
             )
-            text = response.text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
-        except Exception as e:
-            LOGGER.error(f"Gemini analysis error: {e}")
+            text = ""
+            if hasattr(response, "text") and response.text:
+                text = response.text
+            elif hasattr(response, "parts") and response.parts:
+                text = "".join([p.text for p in response.parts if hasattr(p, "text")])
+            else:
+                LOGGER.error(f"Unexpected Gemini response format: {type(response)}")
+                return None
+            text = text.replace("```json", "").replace("```", "").strip()
+            LOGGER.info(f"Gemini raw response: {text[:200]}...")
+            result = json.loads(text)
+            LOGGER.info(f"Gemini parsed: {result}")
+            return result
+        except json.JSONDecodeError as e:
+            LOGGER.error(f"Gemini returned invalid JSON: {e}")
             return None
-
+        except Exception as e:
+            LOGGER.error(f"Gemini analysis error: {type(e).__name__}: {e}")
+            return None
 
 class AIEngine:
     FEATURE_COLS = [
@@ -480,7 +493,121 @@ class AIEngine:
         finally:
             self._training = False
 
+# ==========================================================
+# 7. Signal Analysis
+# ==========================================================
+def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
+    if len(klines) < 50: return None
+    closed = klines[:-1]
+    O = [float(k[1]) for k in closed]
+    H = [float(k[2]) for k in closed]
+    L = [float(k[3]) for k in closed]
+    C = [float(k[4]) for k in closed]
+    V = [float(k[5]) for k in closed]
+    live = float(klines[-1][4])
 
+    current_time_ms = int(time.time() * 1000)
+    candle_start_ms = int(klines[-1][0])
+    elapsed = (current_time_ms - candle_start_ms) / 1000.0
+    if elapsed > MAX_SIGNAL_AGE:
+        return None
+
+    rsi = calc_rsi(C)
+    atr = calc_atr(H, L, C)
+    pdi, mdi, adx = calc_dmi(H, L, C)
+    sma7 = sum(C[-7:]) / 7
+
+    co, ch, cl, cc, cv = O[-1], H[-1], L[-1], C[-1], V[-1]
+    bb = min(co, cc); bt = max(co, cc)
+    body = abs(cc - co); rng = ch - cl
+    if rng == 0 or body == 0 or atr == 0: return None
+    uw = ch - bt; lw = bb - cl
+    spread_pct = (rng / cl) * 100
+    if spread_pct > 5.0: return None
+
+    ph, pl = find_pivots(H, L)
+    trend = dow_trend(ph, pl)
+    avg_v20 = sum(V[-21:-1]) / 20 if len(V) >= 21 else cv
+    vol_spike = cv >= 1.2 * avg_v20
+
+    recent_low = min(L[-6:-1])
+    sweep_long = (cl < recent_low) and (cc > recent_low) and vol_spike
+    recent_high = max(H[-6:-1])
+    sweep_short = (ch > recent_high) and (cc < recent_high) and vol_spike
+
+    lookback = 12
+    rh = max(H[-lookback:-1]); rl = min(L[-lookback:-1])
+    rw = ((rh - rl) / rl) * 100 if rl > 0 else 999.0
+    in_range = rw <= 3.5
+    near_s = any(rl >= s * 0.985 and rl <= s * 1.025 for s in htf_s) if htf_s else True
+    near_r = any(rh <= r * 1.015 and rh >= r * 0.975 for r in htf_r) if htf_r else True
+
+    green = cc > co; red = cc < co
+    breakout_long = in_range and cc > rh and green and vol_spike and (near_s or near_r)
+    breakout_short = in_range and cc < rl and red and vol_spike and (near_r or near_s)
+
+    valid_size = rng >= 0.5 * atr
+    setup_long = (trend != "BEARISH") and green and valid_size and (lw >= 2.0 * body) and (lw / rng >= 0.5) and (uw <= 0.2 * rng) and (cl <= sma7 < bb) and (cc > sma7) and vol_spike
+    setup_short = (trend != "BULLISH") and red and valid_size and (uw >= 2.0 * body) and (uw / rng >= 0.5) and (lw <= 0.2 * rng) and (ch >= sma7 > bt) and (cc < sma7) and vol_spike
+
+    dmi_long = (52 <= rsi <= 68) and (pdi > mdi) and (adx >= 20) and green and vol_spike
+    dmi_short = (32 <= rsi <= 48) and (mdi > pdi) and (adx >= 20) and red and vol_spike
+
+    longs, shorts = [], []
+    if dmi_long: longs.append("RSI+DMI Momentum")
+    if setup_long: longs.append("Candle Setup")
+    if breakout_long: longs.append("Range Breakout")
+    if sweep_long: longs.append("SMC Liquidity Sweep")
+    if hidden_long: longs.append("Hidden Divergence")
+    if adv_candle_long: longs.append("Advanced Candle")
+    if atr_bo_long: longs.append("ATR Breakout")
+    if eq_sweep_long: longs.append("SMC EQ Sweep")
+    if ob_long: longs.append("OB Imbalance")
+
+    if dmi_short: shorts.append("RSI+DMI Momentum")
+    if setup_short: shorts.append("Candle Setup")
+    if breakout_short: shorts.append("Range Breakdown")
+    if sweep_short: shorts.append("SMC Liquidity Sweep")
+    if hidden_short: shorts.append("Hidden Divergence")
+    if adv_candle_short: shorts.append("Advanced Candle")
+    if atr_bo_short: shorts.append("ATR Breakdown")
+    if eq_sweep_short: shorts.append("SMC EQ Sweep")
+    if ob_short: shorts.append("OB Imbalance")
+
+    def build(direction, strategies, entry, sl, risk):
+        sl_pct = (risk / entry) * 100 if entry > 0 else 999
+        if sl_pct <= max_sl and risk > 0:
+            return {
+                "strategy": " + ".join(strategies), "direction": direction,
+                "entry_price": entry, "stop_loss": round(sl, 5), "sl_percent": round(sl_pct, 2),
+                "tp1": round(entry + (risk * 2), 5), "tp2": round(entry + (risk * 5), 5), "tp3": round(entry + (risk * 7), 5),
+                "rsi": rsi, "adx": adx, "trend": trend, "sma7": round(sma7, 5),
+                "atr": atr, "live": live, "vol_spike": vol_spike,
+                "lower_wick_ratio": round(lw / rng, 4), "upper_wick_ratio": round(uw / rng, 4),
+                "price_to_sma7_ratio": round(cc / sma7, 4), "atr_pct": round((atr / cc) * 100, 4),
+                "spread_pct": round(spread_pct, 4), "vol_ratio": round(cv / avg_v20, 4) if avg_v20 > 0 else 1.0,
+                "trend_code": 1 if trend == "BULLISH" else (-1 if trend == "BEARISH" else 0),
+                "plus_di": pdi, "minus_di": mdi
+            }
+        return None
+
+    if longs:
+        sl = max(cl, cc - 1.5 * atr)
+        risk = cc - sl
+        res = build("LONG", longs, cc, sl, risk)
+        if res and abs((live - cc) / cc) * 100 <= MAX_SLIPPAGE:
+            return res
+    if shorts:
+        sl = min(ch, cc + 1.5 * atr)
+        risk = sl - cc
+        res = build("SHORT", shorts, cc, sl, risk)
+        if res and abs((cc - live) / cc) * 100 <= MAX_SLIPPAGE:
+            return res
+    return None
+
+# ==========================================================
+# 8. Risk Manager
+# ==========================================================
 class RiskManager:
     def __init__(self, risk_percent=RISK_PER_TRADE, leverage=LEVERAGE):
         self.risk_pct = risk_percent
@@ -494,6 +621,9 @@ class RiskManager:
         margin = notional / self.leverage
         return round(notional, 2), round(margin, 2)
 
+# ==========================================================
+# 9. Binance Trader
+# ==========================================================
 class BinanceTrader:
     BASE = "https://fapi.binance.com"
     def __init__(self, api_key, api_secret, paper=True):
@@ -547,284 +677,156 @@ class BinanceTrader:
         params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": quantity, "timestamp": ts}
         return await self._request("POST", "/fapi/v1/order", params, signed=True)
 
+# ==========================================================
+# 10. Telegram Manager
+# ==========================================================
+class TelegramManager:
+    def __init__(self, token, chat_id):
+        self.bot = Bot(token=token)
+        self.chat_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+        self.sent_alerts = {}
 
-def analyze_signal(klines, symbol, interval, htf_s, htf_r, ob_imbalance=0.0, max_sl=2.0):
-    if len(klines) < 50: return None
-    closed = klines[:-1]
-    O = [float(k[1]) for k in closed]
-    H = [float(k[2]) for k in closed]
-    L = [float(k[3]) for k in closed]
-    C = [float(k[4]) for k in closed]
-    V = [float(k[5]) for k in closed]
-    live = float(klines[-1][4])
+    async def send(self, text, reply_markup=None, retries=3):
+        for i in range(retries):
+            try:
+                await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+                return True
+            except Exception as e:
+                if i == retries - 1: LOGGER.error(f"TG error: {e}"); return False
+                await asyncio.sleep(2 ** i)
 
-    current_time_ms = int(time.time() * 1000)
-    candle_start_ms = int(klines[-1][0])
-    elapsed = (current_time_ms - candle_start_ms) / 1000.0
-    if elapsed > MAX_SIGNAL_AGE:
-        return None
+    async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id):
+        tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+        dir_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
+        conf_emoji = "🔥" if ai_prob >= 0.75 else ("✅" if ai_prob >= 0.60 else ("⚠️" if ai_prob >= 0.55 else "❓"))
 
-    rsi = calc_rsi(C)
-    atr = calc_atr(H, L, C)
-    pdi, mdi, adx = calc_dmi(H, L, C)
-    sma7 = sum(C[-7:]) / 7
-
-    co, ch, cl, cc, cv = O[-1], H[-1], L[-1], C[-1], V[-1]
-    bb = min(co, cc); bt = max(co, cc)
-    body = abs(cc - co); rng = ch - cl
-    if rng == 0 or body == 0 or atr == 0: return None
-    uw = ch - bt; lw = bb - cl
-    spread_pct = (rng / cl) * 100
-    if spread_pct > 5.0: return None
-
-    ph, pl = find_pivots(H, L)
-    trend = dow_trend(ph, pl)
-    avg_v20 = sum(V[-21:-1]) / 20 if len(V) >= 21 else cv
-    vol_spike = cv >= 1.2 * avg_v20
-
-    prev_high = H[-2] if len(H) >= 2 else ch
-    prev_low = L[-2] if len(L) >= 2 else cl
-
-    # --- Bot 2/3 Strategies ---
-    recent_low = min(L[-6:-1])
-    sweep_long = (cl < recent_low) and (cc > recent_low) and vol_spike
-    recent_high = max(H[-6:-1])
-    sweep_short = (ch > recent_high) and (cc < recent_high) and vol_spike
-
-    lookback = 12
-    rh = max(H[-lookback:-1]); rl = min(L[-lookback:-1])
-    rw = ((rh - rl) / rl) * 100 if rl > 0 else 999.0
-    in_range = rw <= 3.5
-    near_s = any(rl >= s * 0.985 and rl <= s * 1.025 for s in htf_s) if htf_s else True
-    near_r = any(rh <= r * 1.015 and rh >= r * 0.975 for r in htf_r) if htf_r else True
-
-    green = cc > co; red = cc < co
-    breakout_long = in_range and cc > rh and green and vol_spike and (near_s or near_r)
-    breakout_short = in_range and cc < rl and red and vol_spike and (near_r or near_s)
-
-    valid_size = rng >= 0.5 * atr
-    setup_long = (trend != "BEARISH") and green and valid_size and (lw >= 2.0 * body) and (lw / rng >= 0.5) and (uw <= 0.2 * rng) and (cl <= sma7 < bb) and (cc > sma7) and vol_spike
-    setup_short = (trend != "BULLISH") and red and valid_size and (uw >= 2.0 * body) and (uw / rng >= 0.5) and (lw <= 0.2 * rng) and (ch >= sma7 > bt) and (cc < sma7) and vol_spike
-
-    dmi_long = (52 <= rsi <= 68) and (pdi > mdi) and (adx >= 20) and green and vol_spike
-    dmi_short = (32 <= rsi <= 48) and (mdi > pdi) and (adx >= 20) and red and vol_spike
-
-    # --- Bot 4 Additional Strategies ---
-    hidden_bull, hidden_bear = detect_hidden_divergence(H, L, C)
-    hidden_long = hidden_bull and vol_spike
-    hidden_short = hidden_bear and vol_spike
-
-    adv_candle_long = (lw >= 3.0 * body) and (cc > prev_high) and vol_spike
-    adv_candle_short = (uw >= 3.0 * body) and (cc < prev_low) and vol_spike
-
-    resistance_20 = max(H[-20:-1]) if len(H) >= 21 else rh
-    support_20 = min(L[-20:-1]) if len(L) >= 21 else rl
-    atr_bo_long = (cc > resistance_20 + 0.5 * atr) and vol_spike
-    atr_bo_short = (cc < support_20 - 0.5 * atr) and vol_spike
-
-    eq_high = False; eq_low = False
-    if len(H) >= 11 and len(L) >= 11:
-        eq_high = abs(max(H[-5:-1]) - max(H[-10:-5])) < (atr * 0.1)
-        eq_low = abs(min(L[-5:-1]) - min(L[-10:-5])) < (atr * 0.1)
-    eq_sweep_long = eq_low and lw >= 2.5 * body
-    eq_sweep_short = eq_high and uw >= 2.5 * body
-
-    ob_long = ob_imbalance > 0.30
-    ob_short = ob_imbalance < -0.30
-
-    # Build strategy lists
-    longs, shorts = [], []
-    if dmi_long: longs.append("RSI+DMI Momentum")
-    if setup_long: longs.append("Candle Setup")
-    if breakout_long: longs.append("Range Breakout")
-    if sweep_long: longs.append("SMC Liquidity Sweep")
-    if hidden_long: longs.append("Hidden Divergence")
-    if adv_candle_long: longs.append("Advanced Candle")
-    if atr_bo_long: longs.append("ATR Breakout")
-    if eq_sweep_long: longs.append("SMC EQ Sweep")
-    if ob_long: longs.append("OB Imbalance")
-
-    if dmi_short: shorts.append("RSI+DMI Momentum")
-    if setup_short: shorts.append("Candle Setup")
-    if breakout_short: shorts.append("Range Breakdown")
-    if sweep_short: shorts.append("SMC Liquidity Sweep")
-    if hidden_short: shorts.append("Hidden Divergence")
-    if adv_candle_short: shorts.append("Advanced Candle")
-    if atr_bo_short: shorts.append("ATR Breakdown")
-    if eq_sweep_short: shorts.append("SMC EQ Sweep")
-    if ob_short: shorts.append("OB Imbalance")
-
-    def build(direction, strategies, entry, sl, risk):
-        sl_pct = (risk / entry) * 100 if entry > 0 else 999
-        if sl_pct <= max_sl and risk > 0:
-            return {
-                "strategy": " + ".join(strategies), "direction": direction,
-                "entry_price": entry, "stop_loss": round(sl, 5), "sl_percent": round(sl_pct, 2),
-                "tp1": round(entry + (risk * 2), 5), "tp2": round(entry + (risk * 5), 5), "tp3": round(entry + (risk * 7), 5),
-                "rsi": rsi, "adx": adx, "atr": atr, "trend": trend, "sma7": round(sma7, 5),
-                "live": live, "vol_spike": vol_spike,
-                "lower_wick_ratio": round(lw / rng, 4), "upper_wick_ratio": round(uw / rng, 4),
-                "price_to_sma7_ratio": round(cc / sma7, 4), "atr_pct": round((atr / cc) * 100, 4),
-                "spread_pct": round(spread_pct, 4), "vol_ratio": round(cv / avg_v20, 4) if avg_v20 > 0 else 1.0,
-                "trend_code": 1 if trend == "BULLISH" else (-1 if trend == "BEARISH" else 0),
-                "plus_di": pdi, "minus_di": mdi
-            }
-        return None
-
-    if longs:
-        sl = max(cl, cc - 1.5 * atr)
-        risk = cc - sl
-        res = build("LONG", longs, cc, sl, risk)
-        if res and abs((live - cc) / cc) * 100 <= MAX_SLIPPAGE:
-            return res
-    if shorts:
-        sl = min(ch, cc + 1.5 * atr)
-        risk = sl - cc
-        res = build("SHORT", shorts, cc, sl, risk)
-        if res and abs((cc - live) / cc) * 100 <= MAX_SLIPPAGE:
-            return res
-    return None
-
-
-async def send_telegram_msg(session: aiohttp.ClientSession, text: str, photo_bytes: bytes = None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    if photo_bytes:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        data = aiohttp.FormData()
-        data.add_field("chat_id", str(TELEGRAM_CHAT_ID))
-        data.add_field("caption", text)
-        data.add_field("parse_mode", "Markdown")
-        data.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
-        try:
-            async with session.post(url, data=data, timeout=10) as resp:
-                if resp.status != 200:
-                    LOGGER.error(f"Telegram photo send error: {await resp.text()}")
-        except Exception as e:
-            LOGGER.error(f"Telegram photo error: {e}")
-    else:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-        try:
-            async with session.post(url, json=payload, timeout=5) as resp:
-                if resp.status != 200:
-                    LOGGER.error(f"Telegram msg error: {await resp.text()}")
-        except Exception as e:
-            LOGGER.error(f"Telegram msg error: {e}")
-
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = await db_execute("SELECT key, value FROM bot_stats")
-    stats = {r[0]: r[1] for r in rows}
-    total = stats.get("total_signals", 0)
-    wr = round((stats.get("tp1_hits",0)+stats.get("tp2_hits",0)+stats.get("tp3_hits",0))/total*100,1) if total else 0
-    msg = (
-        f"📊 *Bot Statistics*\n\n"
-        f"🔢 Total Signals: `{total}`\n"
-        f"🎯 TP1: `{stats.get('tp1_hits',0)}` | TP2: `{stats.get('tp2_hits',0)}` | TP3: `{stats.get('tp3_hits',0)}`\n"
-        f"❌ SL: `{stats.get('sl_hits',0)}`\n"
-        f"🧠 AI Trades: `{stats.get('ai_trades',0)}`\n"
-        f"👍 Good Feedback: `{stats.get('feedback_good',0)}`\n"
-        f"👎 Bad Feedback: `{stats.get('feedback_bad',0)}`\n"
-        f"🏆 Win Rate: `{wr}%`"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    df = await db_fetch_df("SELECT * FROM active_trades")
-    if df.empty:
-        await update.message.reply_text("ℹ️ No active positions.", parse_mode=ParseMode.MARKDOWN)
-    else:
-        lines = "\n".join([f"🔹 `#{r['symbol']}` ({r['direction']}) @ `{r['entry_price']}`" for _, r in df.iterrows()])
-        await update.message.reply_text(f"📌 *Active Trades ({len(df)}):*\n\n{lines}", parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Get BTC trend from global (we'll store it in a global or module var)
-    # For now just show basic stats
-    df = await db_fetch_df("SELECT * FROM active_trades")
-    sa = await db_fetch_df("SELECT * FROM signal_history WHERE datetime(timestamp) > datetime('now', '-1 day')")
-    msg = (
-        f"🔍 *Debug Info:*\n\n"
-        f"📊 Active Trades: `{len(df)}`\n"
-        f"📨 Signals (24h): `{len(sa)}`\n"
-        f"💾 DB: `{DB_NAME}`"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        f"🤖 *Control Menu*\n\n"
-        f"▫️ `/stats` — Statistics\n"
-        f"▫️ `/active` — Active positions\n"
-        f"▫️ `/debug` — Debug info\n"
-        f"▫️ `/help` — Help\n\n"
-        f"📸 Send a chart photo for Gemini AI analysis!"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📸 Chart image received. Sending to Gemini AI for analysis...")
-    try:
-        photo_file = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error downloading photo: {e}")
-        return
-
-    analyzer = ChartImageAnalyzer(GEMINI_API_KEY)
-    result = await analyzer.analyze_chart_image(bytes(photo_bytes))
-
-    if result:
-        sig = result.get('signal', 'NEUTRAL')
-        sig_emoji = "🟢" if sig == "LONG" else ("🔴" if sig == "SHORT" else "⚪")
         msg = (
-            f"🔍 *Gemini AI Analysis Result:*\n\n"
-            f"📌 Pattern: `{result.get('pattern_detected', 'None')}`\n"
-            f"📊 Signal: `{sig}` {sig_emoji}\n"
-            f"🎯 Confidence: `{result.get('confidence_score', 0)}%`\n"
-            f"💡 Summary: {result.get('analysis_summary', 'No summary')}"
+            f"🚨 *NEW TRADING SIGNAL* 🚨\n\n"
+            f"🪙 *Symbol:* `#{symbol}`\n"
+            f"📊 *Direction:* {signal['direction']} {dir_emoji}\n"
+            f"🎯 *Strategy:* {signal['strategy']} ({interval})\n"
+            f"{conf_emoji} *AI Score:* `{ai_prob:.1%}` Confidence\n"
+            f"⏱️ *Timeframe:* {interval}\n\n"
+            f"💵 *Entry Price:* `{signal['entry_price']}`\n"
+            f"🛡️ *Stop Loss:* `{signal['stop_loss']}` (`{signal['sl_percent']}%`)\n\n"
+            f"🎯 *Take Profit Targets:*\n"
+            f"🔹 *TP1:* `{signal['tp1']}`\n"
+            f"🔹 *TP2:* `{signal['tp2']}`\n"
+            f"🔹 *TP3:* `{signal['tp3']}`\n\n"
+            f"📉 *RSI:* `{signal['rsi']}` | *Trend:* `{signal['trend']}`\n"
+            f"🌐 *BTC Trend:* `{btc_trend}`\n\n"
+            f"📖 *Order Book Microstructure:*\n"
+            f"• Imbalance Ratio: `{ob_data['imbalance']:.2f}`\n"
+            f"• Slippage: `{ob_data['slippage']:.2f}%`\n"
+            f"• Stop Hunt Risk: `{ob_data['stop_hunt_risk']}`\n"
+            f"• Iceberg Bids/Asks: `{ob_data['iceberg_bids']}` / `{ob_data['iceberg_asks']}`"
         )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        # Save to DB
-        await db_execute(
-            "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?, ?, ?, ?, ?)",
-            ("USER_UPLOAD", result.get('pattern_detected'), sig, result.get('confidence_score', 0), result.get('analysis_summary'))
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 TradingView", url=tv)],
+            [
+                InlineKeyboardButton("✅ Good Signal", callback_data=f"good|{alert_id}"),
+                InlineKeyboardButton("❌ Bad Signal", callback_data=f"bad|{alert_id}")
+            ]
+        ])
+        await self.send(msg, reply_markup=kb)
+
+    async def notify_fill(self, symbol, direction, entry, size, sl, tp1, tp2, tp3, paper):
+        p = "📄 PAPER" if paper else "💰 REAL"
+        de = "🟢" if direction == "LONG" else "🔴"
+        await self.send(
+            f"({p}) *Trade Opened* ✅\n\n"
+            f"🪙 `#{symbol}` | {direction} {de}\n"
+            f"📍 Entry: `{entry}`\n"
+            f"📊 Size: `{size}` USDT\n"
+            f"🛡️ SL: `{sl}`\n"
+            f"🎯 TP1: `{tp1}` | TP2: `{tp2}` | TP3: `{tp3}`"
         )
-    else:
-        await update.message.reply_text("❌ Gemini could not analyze the image.")
 
+    async def notify_close(self, symbol, outcome, pnl_pct=0):
+        icon = "💰" if outcome == 1 else "❌"
+        text = "Profit" if outcome == 1 else "Loss"
+        await self.send(f"{icon} *Trade Closed ({text})*\n\n🪙 `#{symbol}` | PnL: `{pnl_pct:.2f}%`")
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cq = update.callback_query
-    data = cq.data or ""
-    parts = data.split("|")
-    if len(parts) == 2:
-        fb_type, alert_id = parts[0], parts[1]
-        if fb_type in ("good", "bad"):
-            await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb_type, alert_id))
-            await db_execute(f"UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{fb_type}'")
-            label = "✅ Good signal recorded (AI learning)" if fb_type == "good" else "❌ Error recorded"
-            await cq.answer(text=label, show_alert=False)
-            return
-    await cq.answer(text="Unknown action", show_alert=False)
+    async def notify_feedback(self, alert_id, feedback_type):
+        label = "Good signal (AI learning) ✅" if feedback_type == "good" else "Error logged ❌"
+        await self.send(f"Feedback recorded: {label}")
 
+    async def command_listener(self):
+        last_id = 0
+        while True:
+            try:
+                updates = await self.bot.get_updates(offset=last_id + 1, timeout=5)
+                for u in updates:
+                    last_id = u.update_id
+                    if u.message and u.message.text:
+                        cmd = u.message.text.strip().split("@")[0].lower()
+                        cid = u.message.chat_id
+                        if cmd == "/stats":
+                            rows = await db_execute("SELECT key, value FROM bot_stats")
+                            stats = {r[0]: r[1] for r in rows}
+                            total = stats.get("total_signals", 0)
+                            wr = round((stats.get("tp1_hits",0)+stats.get("tp2_hits",0)+stats.get("tp3_hits",0))/total*100,1) if total else 0
+                            await self.send(
+                                f"📊 *Bot Statistics*\n\n"
+                                f"🔢 Total Signals: `{total}`\n"
+                                f"🎯 TP1: `{stats.get('tp1_hits',0)}` | TP2: `{stats.get('tp2_hits',0)}` | TP3: `{stats.get('tp3_hits',0)}`\n"
+                                f"❌ SL: `{stats.get('sl_hits',0)}`\n"
+                                f"🧠 AI Trades: `{stats.get('ai_trades',0)}`\n"
+                                f"👍 Good Feedback: `{stats.get('feedback_good',0)}`\n"
+                                f"👎 Bad Feedback: `{stats.get('feedback_bad',0)}`\n"
+                                f"🏆 Win Rate: `{wr}%`", chat_id=cid
+                            )
+                        elif cmd == "/active":
+                            df = await db_fetch_df("SELECT * FROM active_trades")
+                            if df.empty:
+                                await self.send("ℹ️ No active positions.", chat_id=cid)
+                            else:
+                                lines = "\n".join([f"🔹 `{r['symbol']}` ({r['direction']}) @ `{r['entry_price']}`" for _, r in df.iterrows()])
+                                await self.send(f"📌 *Active Trades ({len(df)}):*\n\n{lines}", chat_id=cid)
+                        elif cmd == "/help":
+                            await self.send(
+                                f"🤖 *Control Menu*\n\n"
+                                f"▫️ `/stats` — Statistics\n"
+                                f"▫️ `/active` — Active positions\n"
+                                f"▫️ `/help` — Help", chat_id=cid
+                            )
+                    if u.callback_query:
+                        cq = u.callback_query
+                        data = cq.data or ""
+                        parts = data.split("|")
+                        if len(parts) == 2:
+                            fb_type, alert_id = parts[0], parts[1]
+                            if fb_type in ("good", "bad"):
+                                await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb_type, alert_id))
+                                await db_execute(f"UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{fb_type}'")
+                                await self.notify_feedback(alert_id, fb_type)
+                                try:
+                                    await self.bot.answer_callback_query(cq.id)
+                                except: pass
+            except Exception as e:
+                LOGGER.error(f"Command listener: {e}")
+            await asyncio.sleep(2)
 
+# ==========================================================
+# 11. Main Unified Bot
+# ==========================================================
 class UnifiedTradingBot:
     def __init__(self):
         self.ai = AIEngine()
         self.risk = RiskManager()
         self.trader = BinanceTrader(BINANCE_API_KEY, BINANCE_API_SECRET, PAPER_TRADING)
+        self.tg = TelegramManager(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.btc_trend = "NEUTRAL"
         self.btc_pause_until = 0
         self.symbol_cache = {"symbols": [], "last_update": 0}
-        self.recent_signals = {}
 
     async def start(self):
+        await init_database()
         await self.trader.start()
+        asyncio.create_task(self.tg.command_listener())
         asyncio.create_task(self.position_tracker())
-        mode = "SIGNAL ONLY (AI Learning Mode)" if not EXECUTE_TRADES else ("PAPER TRADING" if PAPER_TRADING else "LIVE TRADING")
-        LOGGER.info(f"Unified Bot ready. Mode: {mode}")
+        LOGGER.info("Unified Bot (AI + Signal + Execution) ready.")
 
     async def get_symbols(self, session):
         now = time.time()
@@ -862,17 +864,9 @@ class UnifiedTradingBot:
             LOGGER.error(f"BTC update: {e}")
 
     async def execute_signal(self, session, symbol, interval, signal):
-        # Cooldown check (Bot 4 style)
-        current_time = time.time()
-        if symbol in self.recent_signals and (current_time - self.recent_signals[symbol]) < 900:
-            return
-        self.recent_signals[symbol] = current_time
-
-        # Order Book
         bids, asks = await fetch_order_book(session, symbol)
         ob = OrderBookAnalyzer.analyze(bids, asks, signal["entry_price"], signal["stop_loss"])
 
-        # AI features
         features = {
             "rsi": signal["rsi"], "spread_pct": ob["spread_pct"],
             "vol_ratio": signal["vol_ratio"], "lower_wick_ratio": signal["lower_wick_ratio"],
@@ -882,80 +876,15 @@ class UnifiedTradingBot:
             "orderbook_imbalance": ob["imbalance"]
         }
 
-        # AI Filter
         prob = await self.ai.predict(features)
         conf_label = self.ai.confidence_label(prob)
         if prob < 0.55 and self.ai.is_trained:
             LOGGER.info(f"AI rejected {symbol} ({prob:.2f} — {conf_label})")
             return
 
-        # Alert ID
         alert_id = f"{symbol}_{interval}_{int(time.time())}"
+        await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id)
 
-        # Generate chart
-        df_chart = klines_to_df(await fetch_klines(session, symbol, interval) or [])
-        chart_bytes = None
-        if not df_chart.empty:
-            chart_bytes = ChartGenerator.generate_chart_image(df_chart, symbol, signal)
-
-        # Telegram notification with chart
-        dir_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
-        conf_emoji = "🔥" if prob >= 0.75 else ("✅" if prob >= 0.60 else ("⚠️" if prob >= 0.55 else "❓"))
-        msg = (
-            f"🚨 *NEW TRADING SIGNAL* 🚨\n\n"
-            f"🪙 *Symbol:* `#{symbol}`\n"
-            f"📊 *Direction:* {signal['direction']} {dir_emoji}\n"
-            f"🎯 *Strategy:* {signal['strategy']} ({interval})\n"
-            f"{conf_emoji} *AI Score:* `{prob:.1%}` Confidence\n"
-            f"⏱️ *Timeframe:* {interval}\n\n"
-            f"💵 *Entry Price:* `{signal['entry_price']}`\n"
-            f"🛡️ *Stop Loss:* `{signal['stop_loss']}` (`{signal['sl_percent']}%`)\n\n"
-            f"🎯 *Take Profit Targets:*\n"
-            f"🔹 *TP1:* `{signal['tp1']}`\n"
-            f"🔹 *TP2:* `{signal['tp2']}`\n"
-            f"🔹 *TP3:* `{signal['tp3']}`\n\n"
-            f"📉 *RSI:* `{signal['rsi']}` | *Trend:* `{signal['trend']}`\n"
-            f"🌐 *BTC Trend:* `{self.btc_trend}`\n\n"
-            f"📖 *Order Book Microstructure:*\n"
-            f"• Imbalance Ratio: `{ob['imbalance']:.2f}`\n"
-            f"• Slippage: `{ob['slippage']:.2f}%`\n"
-            f"• Stop Hunt Risk: `{ob['stop_hunt_risk']}`\n"
-            f"• Iceberg Bids/Asks: `{ob['iceberg_bids']}` / `{ob['iceberg_asks']}`"
-        )
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 TradingView", url=f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}")],
-            [
-                InlineKeyboardButton("✅ Good Signal", callback_data=f"good|{alert_id}"),
-                InlineKeyboardButton("❌ Bad Signal", callback_data=f"bad|{alert_id}")
-            ]
-        ])
-
-        # Send via direct API for photo support
-        if chart_bytes:
-            await send_telegram_msg(session, msg, photo_bytes=chart_bytes)
-        else:
-            await send_telegram_msg(session, msg)
-
-        # Record features for AI learning (even without execution)
-        cols = "symbol, rsi, spread_pct, vol_ratio, lower_wick_ratio, upper_wick_ratio, trend_code, adx, plus_di, minus_di, price_to_sma7_ratio, atr_pct, orderbook_imbalance"
-        vals = (symbol, features["rsi"], features["spread_pct"], features["vol_ratio"], features["lower_wick_ratio"],
-                features["upper_wick_ratio"], features["trend_code"], features["adx"], features["plus_di"],
-                features["minus_di"], features["price_to_sma7_ratio"], features["atr_pct"], features["orderbook_imbalance"])
-        await db_execute(f"INSERT INTO trade_features ({cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
-        feat_id = (await db_execute("SELECT last_insert_rowid()"))[0][0]
-
-        # Update signal_history with AI data
-        await db_execute(
-            "UPDATE signal_history SET ai_prob = ?, ai_confidence = ?, ob_imbalance = ?, ob_slippage = ?, ob_stop_hunt = ?, ob_iceberg_bids = ?, ob_iceberg_asks = ? WHERE alert_id = ?",
-            (prob, conf_label, ob["imbalance"], ob["slippage"], ob["stop_hunt_risk"], ob["iceberg_bids"], ob["iceberg_asks"], alert_id)
-        )
-
-        if not EXECUTE_TRADES:
-            LOGGER.info(f"📡 SIGNAL ONLY (trading OFF): {symbol} | AI: {prob:.1%} | Features recorded for learning.")
-            return
-
-        # Balance & sizing
         balance = await self.trader.get_balance()
         if balance <= 0:
             LOGGER.warning("Balance zero.")
@@ -968,7 +897,13 @@ class UnifiedTradingBot:
             LOGGER.warning("Position size zero.")
             return
 
-        # Execute trade
+        cols = "symbol, rsi, spread_pct, vol_ratio, lower_wick_ratio, upper_wick_ratio, trend_code, adx, plus_di, minus_di, price_to_sma7_ratio, atr_pct, orderbook_imbalance"
+        vals = (symbol, features["rsi"], features["spread_pct"], features["vol_ratio"], features["lower_wick_ratio"],
+                features["upper_wick_ratio"], features["trend_code"], features["adx"], features["plus_di"],
+                features["minus_di"], features["price_to_sma7_ratio"], features["atr_pct"], features["orderbook_imbalance"])
+        await db_execute(f"INSERT INTO trade_features ({cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
+        feat_id = (await db_execute("SELECT last_insert_rowid()"))[0][0]
+
         side = "BUY" if signal["direction"] == "LONG" else "SELL"
         qty = round(notional / entry, 4)
         res = await self.trader.place_market_order(symbol, side, qty, LEVERAGE)
@@ -982,9 +917,10 @@ class UnifiedTradingBot:
             )
             await db_execute("INSERT OR REPLACE INTO bot_stats (key, value) VALUES ('ai_trades', COALESCE((SELECT value FROM bot_stats WHERE key='ai_trades'), 0) + 1)")
             await db_execute(
-                "UPDATE signal_history SET executed = 1 WHERE alert_id = ?",
-                (alert_id,)
+                "UPDATE signal_history SET executed = 1, ai_prob = ?, ai_confidence = ?, ob_imbalance = ?, ob_slippage = ?, ob_stop_hunt = ?, ob_iceberg_bids = ?, ob_iceberg_asks = ? WHERE alert_id = ?",
+                (prob, conf_label, ob["imbalance"], ob["slippage"], ob["stop_hunt_risk"], ob["iceberg_bids"], ob["iceberg_asks"], alert_id)
             )
+            await self.tg.notify_fill(symbol, signal["direction"], entry, notional, sl, tp1, tp2, tp3, PAPER_TRADING)
             LOGGER.info(f"Trade opened: {symbol} | AI: {prob:.1%} | Size: {notional}")
 
     async def position_tracker(self):
@@ -1036,7 +972,7 @@ class UnifiedTradingBot:
                             await db_execute("UPDATE trade_features SET outcome = ? WHERE id = ?", (outcome, fid))
                             await db_execute("DELETE FROM active_trades WHERE trade_id = ?", (tid,))
                             pnl = ((price - entry) / entry * 100) if direction == "LONG" else ((entry - price) / entry * 100)
-                            await send_telegram_msg(session, f"{'💰' if outcome==1 else '❌'} *Trade Closed ({'Profit' if outcome==1 else 'Loss'})*\n\n🪙 `#{sym}` | PnL: `{pnl:.2f}%`")
+                            await self.tg.notify_close(sym, outcome, pnl)
                             asyncio.create_task(self.ai.retrain())
             except Exception as e:
                 LOGGER.error(f"Tracker error: {e}")
@@ -1066,8 +1002,7 @@ class UnifiedTradingBot:
                             klines = await fetch_klines(session, symbol, interval)
                             if not klines: continue
 
-                            ob_imbalance = await OrderBookAnalyzer.get_depth_imbalance(session, symbol)
-                            sig = analyze_signal(klines, symbol, interval, htf_s, htf_r, ob_imbalance, MAX_SL_PERCENT)
+                            sig = analyze_signal(klines, symbol, interval, htf_s, htf_r, MAX_SL_PERCENT)
                             if not sig: continue
 
                             if symbol != "BTCUSDT":
@@ -1079,8 +1014,8 @@ class UnifiedTradingBot:
                             if exists: continue
 
                             await db_execute(
-                                "INSERT INTO signal_history (alert_id, symbol, interval, direction, strategy, entry_price, stop_loss, tp1, tp2, tp3, sl_percent, rsi, adx, atr, trend) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (alert_id, symbol, interval, sig["direction"], sig["strategy"], sig["entry_price"], sig["stop_loss"], sig["tp1"], sig["tp2"], sig["tp3"], sig["sl_percent"], sig["rsi"], sig["adx"], sig["atr"], sig["trend"])
+                                "INSERT INTO signal_history (alert_id, symbol, interval, direction, strategy, entry_price, stop_loss, tp1, tp2, tp3, sl_percent, rsi, adx, trend) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (alert_id, symbol, interval, sig["direction"], sig["strategy"], sig["entry_price"], sig["stop_loss"], sig["tp1"], sig["tp2"], sig["tp3"], sig["sl_percent"], sig["rsi"], sig["adx"], sig["trend"])
                             )
                             await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'total_signals'")
                             await self.execute_signal(session, symbol, interval, sig)
@@ -1092,13 +1027,13 @@ class UnifiedTradingBot:
                     LOGGER.error(f"Scanner: {e}")
                     await asyncio.sleep(15)
 
-
+# ==========================================================
+# 12. Web & Entry
+# ==========================================================
 async def health(request):
     return web.Response(text="Unified Bot Running", status=200)
 
 async def main():
-    await init_database()
-
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -1107,24 +1042,9 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("stats", cmd_stats))
-    application.add_handler(CommandHandler("active", cmd_active))
-    application.add_handler(CommandHandler("debug", cmd_debug))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("start", cmd_help))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-
     bot = UnifiedTradingBot()
     await bot.start()
-    asyncio.create_task(bot.scanner_loop())
-
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    LOGGER.info("🚀 All systems operational. Bot is running.")
-    await asyncio.Event().wait()
+    await bot.scanner_loop()
 
 if __name__ == "__main__":
     asyncio.run(main())
