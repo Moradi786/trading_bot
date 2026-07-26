@@ -14,7 +14,7 @@ import aiohttp
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # Headless mode for servers
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
@@ -23,7 +23,6 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from aiohttp import web
 
-# Gemini imports
 try:
     from google import genai
     from google.genai import types
@@ -58,6 +57,12 @@ MIN_BTC_VOLUME = 250.0
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 ALERT_TTL = 86400
+
+# Order Book Quality Thresholds
+OB_MIN_BIDS = 5
+OB_MIN_ASKS = 5
+OB_MAX_SPREAD_PCT = 0.5
+OB_MIN_IMBALANCE_CONF = 0.15
 
 # ==========================================================
 # 1. Async Database
@@ -111,7 +116,7 @@ async def init_database():
     ]
     for q in queries:
         await db_execute(q)
-    for k in ["total_signals","tp1_hits","tp2_hits","tp3_hits","sl_hits","ai_trades","feedback_good","feedback_bad"]:
+    for k in ["total_signals","tp1_hits","tp2_hits","tp3_hits","sl_hits","ai_trades","feedback_good","feedback_bad","ob_rejected","spread_rejected","slippage_rejected"]:
         await db_execute("INSERT OR IGNORE INTO bot_stats (key, value) VALUES (?, 0)", (k,))
     LOGGER.info("Database initialized.")
 
@@ -144,7 +149,7 @@ bybit_limiter = RateLimiter(rate=10, per=1)
 okx_limiter = RateLimiter(rate=10, per=1)
 
 # ==========================================================
-# 3. Exchanges
+# 3. Exchanges (Klines)
 # ==========================================================
 EXCHANGES = [
     {"name":"Binance","weight":10,"limiter":binance_limiter,
@@ -204,18 +209,167 @@ async def fetch_klines(session, symbol, interval):
         await asyncio.sleep(0.05)
     return None
 
-async def fetch_order_book(session, symbol, limit=50):
+# ==========================================================
+# 3b. Multi-Exchange Order Book (NEW)
+# ==========================================================
+OB_EXCHANGES = [
+    {
+        "name": "Binance Futures",
+        "limiter": binance_limiter,
+        "url": "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit={limit}",
+        "parser": lambda d: (d.get("bids", []), d.get("asks", []))
+    },
+    {
+        "name": "Binance Spot",
+        "limiter": binance_limiter,
+        "url": "https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}",
+        "parser": lambda d: (d.get("bids", []), d.get("asks", []))
+    },
+    {
+        "name": "Bybit Linear",
+        "limiter": bybit_limiter,
+        "url": "https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit={limit}",
+        "parser": lambda d: _parse_bybit_ob(d)
+    },
+    {
+        "name": "OKX",
+        "limiter": okx_limiter,
+        "url": "https://www.okx.com/api/v5/market/books?instId={symbol}-SWAP&sz={limit}",
+        "parser": lambda d: _parse_okx_ob(d)
+    }
+]
+
+def _parse_bybit_ob(data):
     try:
-        url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit={limit}"
-        async with session.get(url, timeout=5) as r:
-            if r.status == 200:
-                data = await r.json()
-                return data.get("bids", []), data.get("asks", [])
-    except: pass
-    return [], []
+        if data.get("retCode") != 0: return [], []
+        result = data.get("result", {})
+        bids = [[b[0], b[1]] for b in result.get("b", [])]
+        asks = [[a[0], a[1]] for a in result.get("a", [])]
+        return bids, asks
+    except: return [], []
+
+def _parse_okx_ob(data):
+    try:
+        book = data.get("data", [{}])[0]
+        bids = [[b[0], b[1]] for b in book.get("bids", [])]
+        asks = [[a[0], a[1]] for a in book.get("asks", [])]
+        return bids, asks
+    except: return [], []
+
+async def fetch_order_book(session, symbol, limit=50):
+    """
+    Fetch order book from multiple exchanges with fallback.
+    Returns (bids, asks, source_name) or ([], [], None) on failure.
+    """
+    for ex in OB_EXCHANGES:
+        for attempt in range(2):
+            try:
+                await ex["limiter"].acquire()
+                url = ex["url"].format(symbol=symbol, limit=limit)
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        bids, asks = ex["parser"](data)
+                        if len(bids) >= OB_MIN_BIDS and len(asks) >= OB_MIN_ASKS:
+                            LOGGER.info(f"OB fetched from {ex['name']} for {symbol} (bids:{len(bids)}, asks:{len(asks)})")
+                            return bids, asks, ex["name"]
+                        else:
+                            LOGGER.warning(f"{ex['name']} OB too shallow for {symbol}: bids={len(bids)}, asks={len(asks)}")
+                    else:
+                        LOGGER.warning(f"{ex['name']} OB HTTP {r.status} for {symbol}")
+            except Exception as e:
+                LOGGER.warning(f"{ex['name']} OB error {symbol} (attempt {attempt+1}): {e}")
+            await asyncio.sleep(0.3)
+    LOGGER.error(f"All OB sources failed for {symbol}")
+    return [], [], None
 
 # ==========================================================
-# 4. Indicators
+# 4. Order Book Quality Validator (NEW)
+# ==========================================================
+def validate_order_book(ob_data: dict, direction: str, symbol: str) -> Tuple[bool, str]:
+    """
+    Validates if order book quality is good enough for trading.
+    Returns (is_valid, reason).
+
+    HOW TO USE THESE METRICS:
+    -------------------------
+    imbalance:  
+        +0.3 to +1.0  = Heavy buying pressure (good for LONG)
+        -1.0 to -0.3  = Heavy selling pressure (good for SHORT)
+        -0.3 to +0.3  = Neutral (weak confirmation)
+
+    spread_pct:
+        < 0.05% = Excellent liquidity
+        0.05-0.2% = Good
+        0.2-0.5% = Acceptable
+        > 0.5% = Bad liquidity, skip trade
+
+    slippage:
+        Same as spread. High slippage = you lose money on entry.
+
+    stop_hunt_risk:
+        0.0 = Safe, no orders near your SL
+        > 0.5 = Dangerous! Many orders near SL = whale might hunt it
+
+    iceberg_bids/asks:
+        > 3 = Institutional hidden orders detected = strong signal
+
+    """
+    # 1. Check spread
+    if ob_data["spread_pct"] > OB_MAX_SPREAD_PCT:
+        return False, f"spread_too_high ({ob_data['spread_pct']:.3f}%)"
+
+    # 2. Check if order book confirms direction (imbalance)
+    imbalance = ob_data["imbalance"]
+    if direction == "LONG" and imbalance < -OB_MIN_IMBALANCE_CONF:
+        # Sellers dominate but we want LONG = weak confirmation
+        return False, f"ob_against_long (imbalance: {imbalance:.2f})"
+    if direction == "SHORT" and imbalance > OB_MIN_IMBALANCE_CONF:
+        # Buyers dominate but we want SHORT = weak confirmation
+        return False, f"ob_against_short (imbalance: {imbalance:.2f})"
+
+    # 3. Check stop hunt risk
+    if ob_data["stop_hunt_risk"] > 0.7:
+        return False, f"stop_hunt_risk_high ({ob_data['stop_hunt_risk']})"
+
+    # 4. Check if we have meaningful data
+    if ob_data["iceberg_bids"] == 0 and ob_data["iceberg_asks"] == 0 and abs(imbalance) < 0.05:
+        LOGGER.info(f"{symbol}: OB flat (no strong bias), allowing signal with caution")
+
+    return True, "ok"
+
+def ob_confidence_score(ob_data: dict, direction: str) -> float:
+    """
+    Returns 0.0-1.0 score based on how much OB supports the trade.
+    """
+    score = 0.5  # neutral base
+    imbalance = ob_data["imbalance"]
+
+    # Imbalance bonus/penalty
+    if direction == "LONG":
+        if imbalance > 0.3: score += 0.3
+        elif imbalance > 0.1: score += 0.15
+        elif imbalance < -0.3: score -= 0.3
+    else:  # SHORT
+        if imbalance < -0.3: score += 0.3
+        elif imbalance < -0.1: score += 0.15
+        elif imbalance > 0.3: score -= 0.3
+
+    # Spread bonus (tight spread = good)
+    if ob_data["spread_pct"] < 0.05: score += 0.1
+    elif ob_data["spread_pct"] > 0.3: score -= 0.2
+
+    # Iceberg bonus (institutional interest)
+    total_iceberg = ob_data["iceberg_bids"] + ob_data["iceberg_asks"]
+    if total_iceberg >= 5: score += 0.1
+
+    # Stop hunt penalty
+    if ob_data["stop_hunt_risk"] > 0.5: score -= 0.2
+
+    return max(0.0, min(1.0, score))
+
+# ==========================================================
+# 5. Indicators
 # ==========================================================
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1: return 50.0
@@ -307,26 +461,34 @@ def htf_sr(k4h, k1d):
     return s, r
 
 # ==========================================================
-# 5. Order Book Microstructure
+# 6. Order Book Microstructure Analyzer
 # ==========================================================
 class OrderBookAnalyzer:
     @staticmethod
     def analyze(bids, asks, entry_price=0.0, sl_price=0.0):
         if not bids or not asks:
             return {"imbalance": 0.0, "spread_pct": 0.0, "slippage": 0.0,
-                    "stop_hunt_risk": 0.0, "iceberg_bids": 0, "iceberg_asks": 0}
+                    "stop_hunt_risk": 0.0, "iceberg_bids": 0, "iceberg_asks": 0,
+                    "bid_depth": 0.0, "ask_depth": 0.0, "source": "none"}
+
+        # Depth analysis (top 20 levels)
+        bv20 = sum(float(b[1]) for b in bids[:20])
+        av20 = sum(float(a[1]) for a in asks[:20])
         bv10 = sum(float(b[1]) for b in bids[:10])
         av10 = sum(float(a[1]) for a in asks[:10])
         tv10 = bv10 + av10 + 1e-9
+
         imbalance = (bv10 - av10) / tv10
         bb = float(bids[0][0])
         ba = float(asks[0][0])
         spread_pct = ((ba - bb) / bb) * 100 if bb > 0 else 0.0
         slippage = spread_pct
+
         avg_bid_size = bv10 / 10 if bids else 0
         avg_ask_size = av10 / 10 if asks else 0
         iceberg_bids = sum(1 for b in bids[:20] if float(b[1]) > avg_bid_size * 3)
         iceberg_asks = sum(1 for a in asks[:20] if float(a[1]) > avg_ask_size * 3)
+
         stop_hunt_risk = 0.0
         if sl_price > 0 and entry_price > 0:
             bid_prices = [float(b[0]) for b in bids[:20]]
@@ -337,17 +499,21 @@ class OrderBookAnalyzer:
                 min_dist = min(sl_distances)
                 if min_dist < 0.1:
                     stop_hunt_risk = round(1.0 - (min_dist / 0.1), 2)
+
         return {
             "imbalance": round(float(imbalance), 4),
             "spread_pct": round(float(spread_pct), 4),
             "slippage": round(float(slippage), 4),
             "stop_hunt_risk": round(float(stop_hunt_risk), 2),
             "iceberg_bids": int(iceberg_bids),
-            "iceberg_asks": int(iceberg_asks)
+            "iceberg_asks": int(iceberg_asks),
+            "bid_depth": round(float(bv20), 2),
+            "ask_depth": round(float(av20), 2),
+            "source": "multi"
         }
 
 # ==========================================================
-# 6. AI Engine
+# 7. AI Engine
 # ==========================================================
 class ChartGenerator:
     @staticmethod
@@ -509,7 +675,7 @@ class AIEngine:
             self._training = False
 
 # ==========================================================
-# 7. Signal Analysis
+# 8. Signal Analysis
 # ==========================================================
 def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     if len(klines) < 50: return None
@@ -570,7 +736,6 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
 
     hidden_long, hidden_short = detect_hidden_divergence(H, L, C)
 
-    # Advanced strategies (placeholder - set to False if not implemented)
     adv_candle_long = False
     adv_candle_short = False
     atr_bo_long = False
@@ -604,10 +769,18 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     def build(direction, strategies, entry, sl, risk):
         sl_pct = (risk / entry) * 100 if entry > 0 else 999
         if sl_pct <= max_sl and risk > 0:
+            if direction == "LONG":
+                tp1 = round(entry + (risk * 2), 5)
+                tp2 = round(entry + (risk * 5), 5)
+                tp3 = round(entry + (risk * 7), 5)
+            else:
+                tp1 = round(entry - (risk * 2), 5)
+                tp2 = round(entry - (risk * 5), 5)
+                tp3 = round(entry - (risk * 7), 5)
             return {
                 "strategy": " + ".join(strategies), "direction": direction,
                 "entry_price": entry, "stop_loss": round(sl, 5), "sl_percent": round(sl_pct, 2),
-                "tp1": round(entry + (risk * 2), 5), "tp2": round(entry + (risk * 5), 5), "tp3": round(entry + (risk * 7), 5),
+                "tp1": tp1, "tp2": tp2, "tp3": tp3,
                 "rsi": rsi, "adx": adx, "trend": trend, "sma7": round(sma7, 5),
                 "atr": atr, "live": live, "vol_spike": vol_spike,
                 "lower_wick_ratio": round(lw / rng, 4), "upper_wick_ratio": round(uw / rng, 4),
@@ -633,7 +806,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     return None
 
 # ==========================================================
-# 8. Risk Manager
+# 9. Risk Manager
 # ==========================================================
 class RiskManager:
     def __init__(self, risk_percent=RISK_PER_TRADE, leverage=LEVERAGE):
@@ -649,7 +822,7 @@ class RiskManager:
         return round(notional, 2), round(margin, 2)
 
 # ==========================================================
-# 9. Binance Trader
+# 10. Binance Trader
 # ==========================================================
 class BinanceTrader:
     BASE = "https://fapi.binance.com"
@@ -705,13 +878,14 @@ class BinanceTrader:
         return await self._request("POST", "/fapi/v1/order", params, signed=True)
 
 # ==========================================================
-# 10. Telegram Manager
+# 11. Telegram Manager
 # ==========================================================
 class TelegramManager:
-    def __init__(self, token, chat_id):
+    def __init__(self, token, chat_id, chart_analyzer=None):
         self.bot = Bot(token=token)
         self.chat_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
         self.sent_alerts = {}
+        self.chart_analyzer = chart_analyzer
 
     async def send(self, text, reply_markup=None, retries=3):
         for i in range(retries):
@@ -722,42 +896,83 @@ class TelegramManager:
                 if i == retries - 1: LOGGER.error(f"TG error: {e}"); return False
                 await asyncio.sleep(2 ** i)
 
-    async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id, gemini_result=None):
+    async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id, gemini_result=None, ob_conf_score=None):
         tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
         dir_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
         conf_emoji = "🔥" if ai_prob >= 0.75 else ("✅" if ai_prob >= 0.60 else ("⚠️" if ai_prob >= 0.55 else "❓"))
 
+        # OB Quality indicator
+        ob_quality = ""
+        if ob_conf_score is not None:
+            if ob_conf_score >= 0.7: ob_quality = "🟢 Strong OB"
+            elif ob_conf_score >= 0.4: ob_quality = "🟡 Neutral OB"
+            else: ob_quality = "🔴 Weak OB"
+
         gemini_text = ""
         if gemini_result:
             gemini_text = (
-                f"\n🧠 *Gemini Vision Analysis:*\n"
-                f"• Pattern: `{gemini_result.get('pattern_detected', 'N/A')}`\n"
-                f"• Signal: `{gemini_result.get('signal', 'N/A')}`\n"
-                f"• Confidence: `{gemini_result.get('confidence_score', 'N/A')}`\n"
+                f"
+🧠 *Gemini Vision Analysis:*
+"
+                f"• Pattern: `{gemini_result.get('pattern_detected', 'N/A')}`
+"
+                f"• Signal: `{gemini_result.get('signal', 'N/A')}`
+"
+                f"• Confidence: `{gemini_result.get('confidence_score', 'N/A')}`
+"
                 f"• Summary: _{gemini_result.get('analysis_summary', 'N/A')}_"
             )
 
         msg = (
-            f"🚨 *NEW TRADING SIGNAL* 🚨\n\n"
-            f"🪙 *Symbol:* `#{symbol}`\n"
-            f"📊 *Direction:* {signal['direction']} {dir_emoji}\n"
-            f"🎯 *Strategy:* {signal['strategy']} ({interval})\n"
-            f"{conf_emoji} *AI Score:* `{ai_prob:.1%}` Confidence\n"
-            f"⏱️ *Timeframe:* {interval}\n\n"
-            f"💵 *Entry Price:* `{signal['entry_price']}`\n"
-            f"🛡️ *Stop Loss:* `{signal['stop_loss']}` (`{signal['sl_percent']}%`)\n\n"
-            f"🎯 *Take Profit Targets:*\n"
-            f"🔹 *TP1:* `{signal['tp1']}`\n"
-            f"🔹 *TP2:* `{signal['tp2']}`\n"
-            f"🔹 *TP3:* `{signal['tp3']}`\n\n"
-            f"📉 *RSI:* `{signal['rsi']}` | *Trend:* `{signal['trend']}`\n"
+            f"🚨 *NEW TRADING SIGNAL* 🚨
+
+"
+            f"🪙 *Symbol:* `#{symbol}`
+"
+            f"📊 *Direction:* {signal['direction']} {dir_emoji}
+"
+            f"🎯 *Strategy:* {signal['strategy']} ({interval})
+"
+            f"{conf_emoji} *AI Score:* `{ai_prob:.1%}` Confidence
+"
+            f"⏱️ *Timeframe:* {interval}
+
+"
+            f"💵 *Entry Price:* `{signal['entry_price']}`
+"
+            f"🛡️ *Stop Loss:* `{signal['stop_loss']}` (`{signal['sl_percent']}%`)
+
+"
+            f"🎯 *Take Profit Targets:*
+"
+            f"🔹 *TP1:* `{signal['tp1']}`
+"
+            f"🔹 *TP2:* `{signal['tp2']}`
+"
+            f"🔹 *TP3:* `{signal['tp3']}`
+
+"
+            f"📉 *RSI:* `{signal['rsi']}` | *Trend:* `{signal['trend']}`
+"
             f"🌐 *BTC Trend:* `{btc_trend}`"
-            f"{gemini_text}\n\n"
-            f"📖 *Order Book Microstructure:*\n"
-            f"• Imbalance Ratio: `{ob_data['imbalance']:.2f}`\n"
-            f"• Slippage: `{ob_data['slippage']:.2f}%`\n"
-            f"• Stop Hunt Risk: `{ob_data['stop_hunt_risk']}`\n"
-            f"• Iceberg Bids/Asks: `{ob_data['iceberg_bids']}` / `{ob_data['iceberg_asks']}`"
+            f"{gemini_text}
+
+"
+            f"📖 *Order Book Microstructure:*
+"
+            f"• Imbalance Ratio: `{ob_data['imbalance']:.2f}`
+"
+            f"• Slippage: `{ob_data['slippage']:.2f}%`
+"
+            f"• Stop Hunt Risk: `{ob_data['stop_hunt_risk']}`
+"
+            f"• Iceberg Bids/Asks: `{ob_data['iceberg_bids']}` / `{ob_data['iceberg_asks']}`
+"
+            f"• Depth (Bid/Ask): `{ob_data['bid_depth']:,.0f}` / `{ob_data['ask_depth']:,.0f}`
+"
+            f"• Source: `{ob_data.get('source', 'unknown')}`
+"
+            f"• OB Quality: `{ob_quality}`"
         )
 
         kb = InlineKeyboardMarkup([
@@ -773,18 +988,26 @@ class TelegramManager:
         p = "📄 PAPER" if paper else "💰 REAL"
         de = "🟢" if direction == "LONG" else "🔴"
         await self.send(
-            f"({p}) *Trade Opened* ✅\n\n"
-            f"🪙 `#{symbol}` | {direction} {de}\n"
-            f"📍 Entry: `{entry}`\n"
-            f"📊 Size: `{size}` USDT\n"
-            f"🛡️ SL: `{sl}`\n"
+            f"({p}) *Trade Opened* ✅
+
+"
+            f"🪙 `#{symbol}` | {direction} {de}
+"
+            f"📍 Entry: `{entry}`
+"
+            f"📊 Size: `{size}` USDT
+"
+            f"🛡️ SL: `{sl}`
+"
             f"🎯 TP1: `{tp1}` | TP2: `{tp2}` | TP3: `{tp3}`"
         )
 
     async def notify_close(self, symbol, outcome, pnl_pct=0):
         icon = "💰" if outcome == 1 else "❌"
         text = "Profit" if outcome == 1 else "Loss"
-        await self.send(f"{icon} *Trade Closed ({text})*\n\n🪙 `#{symbol}` | PnL: `{pnl_pct:.2f}%`")
+        await self.send(f"{icon} *Trade Closed ({text})*
+
+🪙 `#{symbol}` | PnL: `{pnl_pct:.2f}%`")
 
     async def notify_feedback(self, alert_id, feedback_type):
         label = "Good signal (AI learning) ✅" if feedback_type == "good" else "Error logged ❌"
@@ -797,22 +1020,35 @@ class TelegramManager:
                 updates = await self.bot.get_updates(offset=last_id + 1, timeout=5)
                 for u in updates:
                     last_id = u.update_id
+                    cid = u.message.chat_id if u.message else (u.callback_query.message.chat_id if u.callback_query else self.chat_id)
+
                     if u.message and u.message.text:
                         cmd = u.message.text.strip().split("@")[0].lower()
-                        cid = u.message.chat_id
                         if cmd == "/stats":
                             rows = await db_execute("SELECT key, value FROM bot_stats")
                             stats = {r[0]: r[1] for r in rows}
                             total = stats.get("total_signals", 0)
                             wr = round((stats.get("tp1_hits",0)+stats.get("tp2_hits",0)+stats.get("tp3_hits",0))/total*100,1) if total else 0
                             await self.send(
-                                f"📊 *Bot Statistics*\n\n"
-                                f"🔢 Total Signals: `{total}`\n"
-                                f"🎯 TP1: `{stats.get('tp1_hits',0)}` | TP2: `{stats.get('tp2_hits',0)}` | TP3: `{stats.get('tp3_hits',0)}`\n"
-                                f"❌ SL: `{stats.get('sl_hits',0)}`\n"
-                                f"🧠 AI Trades: `{stats.get('ai_trades',0)}`\n"
-                                f"👍 Good Feedback: `{stats.get('feedback_good',0)}`\n"
-                                f"👎 Bad Feedback: `{stats.get('feedback_bad',0)}`\n"
+                                f"📊 *Bot Statistics*
+
+"
+                                f"🔢 Total Signals: `{total}`
+"
+                                f"🎯 TP1: `{stats.get('tp1_hits',0)}` | TP2: `{stats.get('tp2_hits',0)}` | TP3: `{stats.get('tp3_hits',0)}`
+"
+                                f"❌ SL: `{stats.get('sl_hits',0)}`
+"
+                                f"🧠 AI Trades: `{stats.get('ai_trades',0)}`
+"
+                                f"👍 Good Feedback: `{stats.get('feedback_good',0)}`
+"
+                                f"👎 Bad Feedback: `{stats.get('feedback_bad',0)}`
+"
+                                f"🚫 OB Rejected: `{stats.get('ob_rejected',0)}`
+"
+                                f"🚫 Spread Rejected: `{stats.get('spread_rejected',0)}`
+"
                                 f"🏆 Win Rate: `{wr}%`", chat_id=cid
                             )
                         elif cmd == "/active":
@@ -820,15 +1056,57 @@ class TelegramManager:
                             if df.empty:
                                 await self.send("ℹ️ No active positions.", chat_id=cid)
                             else:
-                                lines = "\n".join([f"🔹 `{r['symbol']}` ({r['direction']}) @ `{r['entry_price']}`" for _, r in df.iterrows()])
-                                await self.send(f"📌 *Active Trades ({len(df)}):*\n\n{lines}", chat_id=cid)
+                                lines = "
+".join([f"🔹 `{r['symbol']}` ({r['direction']}) @ `{r['entry_price']}`" for _, r in df.iterrows()])
+                                await self.send(f"📌 *Active Trades ({len(df)}):*
+
+{lines}", chat_id=cid)
                         elif cmd == "/help":
                             await self.send(
-                                f"🤖 *Control Menu*\n\n"
-                                f"▫️ `/stats` — Statistics\n"
-                                f"▫️ `/active` — Active positions\n"
+                                f"🤖 *Control Menu*
+
+"
+                                f"▫️ `/stats` — Statistics
+"
+                                f"▫️ `/active` — Active positions
+"
                                 f"▫️ `/help` — Help", chat_id=cid
                             )
+
+                    # PHOTO HANDLER
+                    if u.message and u.message.photo:
+                        try:
+                            photo = u.message.photo[-1]
+                            file_obj = await self.bot.get_file(photo.file_id)
+                            file_url = f"https://api.telegram.org/file/bot{self.bot.token}/{file_obj.file_path}"
+                            async with aiohttp.ClientSession() as s:
+                                async with s.get(file_url) as r:
+                                    if r.status == 200:
+                                        image_bytes = await r.read()
+                                        if self.chart_analyzer and self.chart_analyzer.client:
+                                            gemini_result = await self.chart_analyzer.analyze_chart_image(image_bytes)
+                                            if gemini_result:
+                                                msg = (
+                                                    f"🧠 *Gemini Chart Analysis*
+
+"
+                                                    f"• Pattern: `{gemini_result.get('pattern_detected', 'N/A')}`
+"
+                                                    f"• Signal: `{gemini_result.get('signal', 'N/A')}`
+"
+                                                    f"• Confidence: `{gemini_result.get('confidence_score', 'N/A')}`
+"
+                                                    f"• Summary: _{gemini_result.get('analysis_summary', 'N/A')}_"
+                                                )
+                                                await self.send(msg, chat_id=cid)
+                                            else:
+                                                await self.send("❌ Gemini could not analyze the image.", chat_id=cid)
+                                        else:
+                                            await self.send("⚠️ Gemini analyzer not available. Check GEMINI_API_KEY.", chat_id=cid)
+                        except Exception as e:
+                            LOGGER.error(f"Photo analysis error: {e}")
+                            await self.send("❌ Error analyzing image.", chat_id=cid)
+
                     if u.callback_query:
                         cq = u.callback_query
                         data = cq.data or ""
@@ -847,18 +1125,18 @@ class TelegramManager:
             await asyncio.sleep(2)
 
 # ==========================================================
-# 11. Main Unified Bot
+# 12. Main Unified Bot
 # ==========================================================
 class UnifiedTradingBot:
     def __init__(self):
         self.ai = AIEngine()
         self.risk = RiskManager()
         self.trader = BinanceTrader(BINANCE_API_KEY, BINANCE_API_SECRET, PAPER_TRADING)
-        self.tg = TelegramManager(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.chart_analyzer = ChartImageAnalyzer(GEMINI_API_KEY)
+        self.tg = TelegramManager(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, self.chart_analyzer)
         self.btc_trend = "NEUTRAL"
         self.btc_pause_until = 0
-        self.symbol_cache = {"symbols": [], "last_update": 0}
+        self.symbol_cache = {"symbols": [], "last_update": 0, "volumes": {}}
 
     async def start(self):
         await init_database()
@@ -873,17 +1151,28 @@ class UnifiedTradingBot:
         if now - self.symbol_cache["last_update"] > 300 or not self.symbol_cache["symbols"]:
             try:
                 url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-                async with session.get(url, timeout=10) as r:
+                async with session.get(url, timeout=15) as r:
                     if r.status == 200:
                         data = await r.json()
                         btc_p = next((float(x["lastPrice"]) for x in data if x.get("symbol") == "BTCUSDT"), 60000)
-                        min_vol = MIN_BTC_VOLUME * btc_p
-                        syms = [x["symbol"] for x in data if x["symbol"].endswith("USDT") and float(x.get("quoteVolume",0)) >= min_vol]
-                        self.symbol_cache = {"symbols": syms, "last_update": now}
-                        LOGGER.info(f"{len(syms)} symbols loaded.")
+                        min_vol_usdt = MIN_BTC_VOLUME * btc_p
+                        syms = []
+                        vols = {}
+                        for x in data:
+                            sym = x["symbol"]
+                            if sym.endswith("USDT"):
+                                qv = float(x.get("quoteVolume", 0))
+                                if qv >= min_vol_usdt:
+                                    syms.append(sym)
+                                    vols[sym] = qv
+                        self.symbol_cache = {"symbols": syms, "last_update": now, "volumes": vols}
+                        LOGGER.info(f"{len(syms)} symbols loaded (min vol: {min_vol_usdt:,.0f} USDT).")
+                    else:
+                        LOGGER.error(f"Failed to fetch 24hr ticker: HTTP {r.status}")
             except Exception as e:
-                LOGGER.error(f"Symbol fetch: {e}")
-                self.symbol_cache["symbols"] = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
+                LOGGER.error(f"Symbol fetch error: {e}")
+                if not self.symbol_cache["symbols"]:
+                    self.symbol_cache = {"symbols": [], "last_update": 0, "volumes": {}}
         return self.symbol_cache["symbols"]
 
     async def update_btc(self, session):
@@ -904,8 +1193,25 @@ class UnifiedTradingBot:
             LOGGER.error(f"BTC update: {e}")
 
     async def execute_signal(self, session, symbol, interval, signal):
-        bids, asks = await fetch_order_book(session, symbol)
+        # ===== MULTI-EXCHANGE ORDER BOOK =====
+        bids, asks, ob_source = await fetch_order_book(session, symbol)
         ob = OrderBookAnalyzer.analyze(bids, asks, signal["entry_price"], signal["stop_loss"])
+        ob["source"] = ob_source or "failed"
+
+        # Validate OB quality
+        ob_valid, ob_reason = validate_order_book(ob, signal["direction"], symbol)
+        ob_conf = ob_confidence_score(ob, signal["direction"])
+
+        if not ob_valid:
+            LOGGER.warning(f"OB REJECTED {symbol}: {ob_reason}")
+            if "spread" in ob_reason:
+                await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'spread_rejected'")
+            else:
+                await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'ob_rejected'")
+            return  # Skip signal
+
+        LOGGER.info(f"OB ACCEPTED {symbol} from {ob_source}: conf={ob_conf:.2f}, imb={ob['imbalance']:.2f}")
+        # ======================================
 
         features = {
             "rsi": signal["rsi"], "spread_pct": ob["spread_pct"],
@@ -931,13 +1237,11 @@ class UnifiedTradingBot:
                     chart_bytes = ChartGenerator.generate_chart_image(df, symbol, signal)
                     gemini_result = await self.chart_analyzer.analyze_chart_image(chart_bytes)
                     if gemini_result:
-                        # Save to DB
                         await db_execute(
                             "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
                             (symbol, gemini_result.get("pattern_detected"), gemini_result.get("signal"),
                              gemini_result.get("confidence_score"), gemini_result.get("analysis_summary"))
                         )
-                        # Filter: if Gemini strongly disagrees, skip signal
                         gemini_signal = gemini_result.get("signal", "NEUTRAL")
                         gemini_conf = gemini_result.get("confidence_score", 0)
                         if gemini_signal != "NEUTRAL" and gemini_signal != signal["direction"] and gemini_conf >= 70:
@@ -949,7 +1253,7 @@ class UnifiedTradingBot:
         # ==================================
 
         alert_id = f"{symbol}_{interval}_{int(time.time())}"
-        await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result)
+        await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf)
 
         balance = await self.trader.get_balance()
         if balance <= 0:
@@ -970,9 +1274,8 @@ class UnifiedTradingBot:
         await db_execute(f"INSERT INTO trade_features ({cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
         feat_id = (await db_execute("SELECT last_insert_rowid()"))[0][0]
 
-        # Check if trading is enabled
         if not EXECUTE_TRADES:
-            LOGGER.info(f"📡 SIGNAL ONLY (trading OFF): {symbol} | AI: {prob:.1%} | Features recorded.")
+            LOGGER.info(f"📡 SIGNAL ONLY (trading OFF): {symbol} | AI: {prob:.1%} | OB: {ob_conf:.2f} | Features recorded.")
             return
 
         side = "BUY" if signal["direction"] == "LONG" else "SELL"
@@ -992,7 +1295,7 @@ class UnifiedTradingBot:
                 (prob, conf_label, ob["imbalance"], ob["slippage"], ob["stop_hunt_risk"], ob["iceberg_bids"], ob["iceberg_asks"], alert_id)
             )
             await self.tg.notify_fill(symbol, signal["direction"], entry, notional, sl, tp1, tp2, tp3, PAPER_TRADING)
-            LOGGER.info(f"Trade opened: {symbol} | AI: {prob:.1%} | Size: {notional}")
+            LOGGER.info(f"Trade opened: {symbol} | AI: {prob:.1%} | OB: {ob_conf:.2f} | Size: {notional}")
 
     async def position_tracker(self):
         while True:
@@ -1065,6 +1368,11 @@ class UnifiedTradingBot:
                         await asyncio.sleep(5); continue
 
                     for symbol in symbols:
+                        vol = self.symbol_cache.get("volumes", {}).get(symbol, 0)
+                        if vol <= 0:
+                            LOGGER.debug(f"Skipping {symbol}: no volume data")
+                            continue
+
                         k4h = await fetch_klines(session, symbol, "4h")
                         k1d = await fetch_klines(session, symbol, "1d")
                         htf_s, htf_r = htf_sr(k4h, k1d)
@@ -1099,7 +1407,7 @@ class UnifiedTradingBot:
                     await asyncio.sleep(15)
 
 # ==========================================================
-# 12. Web & Entry
+# 13. Web & Entry
 # ==========================================================
 async def health(request):
     return web.Response(text="Unified Bot Running", status=200)
