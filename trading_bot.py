@@ -5,18 +5,31 @@ import sqlite3
 import time
 import hmac
 import hashlib
+import io
+import json
 from typing import Dict, Any, Optional, List, Tuple
 from decimal import Decimal, ROUND_DOWN
 
 import aiohttp
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # Headless mode for servers
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 import joblib
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from aiohttp import web
+
+# Gemini imports
+try:
+    from google import genai
+    from google.genai import types
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
 # ==========================================================
 # 0. Config
@@ -28,10 +41,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "1.0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "3"))
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
+EXECUTE_TRADES = os.getenv("EXECUTE_TRADES", "false").lower() == "true"
 
 DB_NAME = "unified_bot.db"
 MODEL_PATH = "ai_model.joblib"
@@ -553,6 +568,18 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     dmi_long = (52 <= rsi <= 68) and (pdi > mdi) and (adx >= 20) and green and vol_spike
     dmi_short = (32 <= rsi <= 48) and (mdi > pdi) and (adx >= 20) and red and vol_spike
 
+    hidden_long, hidden_short = detect_hidden_divergence(H, L, C)
+
+    # Advanced strategies (placeholder - set to False if not implemented)
+    adv_candle_long = False
+    adv_candle_short = False
+    atr_bo_long = False
+    atr_bo_short = False
+    eq_sweep_long = False
+    eq_sweep_short = False
+    ob_long = False
+    ob_short = False
+
     longs, shorts = [], []
     if dmi_long: longs.append("RSI+DMI Momentum")
     if setup_long: longs.append("Candle Setup")
@@ -695,10 +722,20 @@ class TelegramManager:
                 if i == retries - 1: LOGGER.error(f"TG error: {e}"); return False
                 await asyncio.sleep(2 ** i)
 
-    async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id):
+    async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id, gemini_result=None):
         tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
         dir_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
         conf_emoji = "🔥" if ai_prob >= 0.75 else ("✅" if ai_prob >= 0.60 else ("⚠️" if ai_prob >= 0.55 else "❓"))
+
+        gemini_text = ""
+        if gemini_result:
+            gemini_text = (
+                f"\n🧠 *Gemini Vision Analysis:*\n"
+                f"• Pattern: `{gemini_result.get('pattern_detected', 'N/A')}`\n"
+                f"• Signal: `{gemini_result.get('signal', 'N/A')}`\n"
+                f"• Confidence: `{gemini_result.get('confidence_score', 'N/A')}`\n"
+                f"• Summary: _{gemini_result.get('analysis_summary', 'N/A')}_"
+            )
 
         msg = (
             f"🚨 *NEW TRADING SIGNAL* 🚨\n\n"
@@ -714,7 +751,8 @@ class TelegramManager:
             f"🔹 *TP2:* `{signal['tp2']}`\n"
             f"🔹 *TP3:* `{signal['tp3']}`\n\n"
             f"📉 *RSI:* `{signal['rsi']}` | *Trend:* `{signal['trend']}`\n"
-            f"🌐 *BTC Trend:* `{btc_trend}`\n\n"
+            f"🌐 *BTC Trend:* `{btc_trend}`"
+            f"{gemini_text}\n\n"
             f"📖 *Order Book Microstructure:*\n"
             f"• Imbalance Ratio: `{ob_data['imbalance']:.2f}`\n"
             f"• Slippage: `{ob_data['slippage']:.2f}%`\n"
@@ -817,6 +855,7 @@ class UnifiedTradingBot:
         self.risk = RiskManager()
         self.trader = BinanceTrader(BINANCE_API_KEY, BINANCE_API_SECRET, PAPER_TRADING)
         self.tg = TelegramManager(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        self.chart_analyzer = ChartImageAnalyzer(GEMINI_API_KEY)
         self.btc_trend = "NEUTRAL"
         self.btc_pause_until = 0
         self.symbol_cache = {"symbols": [], "last_update": 0}
@@ -826,7 +865,8 @@ class UnifiedTradingBot:
         await self.trader.start()
         asyncio.create_task(self.tg.command_listener())
         asyncio.create_task(self.position_tracker())
-        LOGGER.info("Unified Bot (AI + Signal + Execution) ready.")
+        mode = "SIGNAL ONLY (AI Learning Mode)" if not EXECUTE_TRADES else ("PAPER TRADING" if PAPER_TRADING else "LIVE TRADING")
+        LOGGER.info(f"Unified Bot ready. Mode: {mode}")
 
     async def get_symbols(self, session):
         now = time.time()
@@ -882,8 +922,34 @@ class UnifiedTradingBot:
             LOGGER.info(f"AI rejected {symbol} ({prob:.2f} — {conf_label})")
             return
 
+        # ===== GEMINI CHART ANALYSIS =====
+        gemini_result = None
+        if self.chart_analyzer.client:
+            try:
+                df = klines_to_df(await fetch_klines(session, symbol, interval))
+                if df is not None and not df.empty:
+                    chart_bytes = ChartGenerator.generate_chart_image(df, symbol, signal)
+                    gemini_result = await self.chart_analyzer.analyze_chart_image(chart_bytes)
+                    if gemini_result:
+                        # Save to DB
+                        await db_execute(
+                            "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
+                            (symbol, gemini_result.get("pattern_detected"), gemini_result.get("signal"),
+                             gemini_result.get("confidence_score"), gemini_result.get("analysis_summary"))
+                        )
+                        # Filter: if Gemini strongly disagrees, skip signal
+                        gemini_signal = gemini_result.get("signal", "NEUTRAL")
+                        gemini_conf = gemini_result.get("confidence_score", 0)
+                        if gemini_signal != "NEUTRAL" and gemini_signal != signal["direction"] and gemini_conf >= 70:
+                            LOGGER.info(f"Gemini REJECTED {symbol}: Gemini says {gemini_signal} (conf: {gemini_conf}), we have {signal['direction']}")
+                            return
+                        LOGGER.info(f"Gemini APPROVED {symbol}: {gemini_signal} (conf: {gemini_conf})")
+            except Exception as e:
+                LOGGER.error(f"Gemini chart analysis failed for {symbol}: {e}")
+        # ==================================
+
         alert_id = f"{symbol}_{interval}_{int(time.time())}"
-        await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id)
+        await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result)
 
         balance = await self.trader.get_balance()
         if balance <= 0:
@@ -903,6 +969,11 @@ class UnifiedTradingBot:
                 features["minus_di"], features["price_to_sma7_ratio"], features["atr_pct"], features["orderbook_imbalance"])
         await db_execute(f"INSERT INTO trade_features ({cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
         feat_id = (await db_execute("SELECT last_insert_rowid()"))[0][0]
+
+        # Check if trading is enabled
+        if not EXECUTE_TRADES:
+            LOGGER.info(f"📡 SIGNAL ONLY (trading OFF): {symbol} | AI: {prob:.1%} | Features recorded.")
+            return
 
         side = "BUY" if signal["direction"] == "LONG" else "SELL"
         qty = round(notional / entry, 4)
