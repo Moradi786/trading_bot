@@ -1,11 +1,7 @@
-python-telegram-bot
-libsql-client
-aiohttp
-python-dotenv
-pandas
-xgboost
-scikit-learn
-joblib
-numpy
 google-genai
 matplotlib
+python-telegram-bot
+pandas
+xgboost
+aiohttp
+python-dotenv
