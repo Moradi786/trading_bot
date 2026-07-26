@@ -58,12 +58,6 @@ MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 ALERT_TTL = 86400
 
-# Order Book Quality Thresholds
-OB_MIN_BIDS = 5
-OB_MIN_ASKS = 5
-OB_MAX_SPREAD_PCT = 0.5
-OB_MIN_IMBALANCE_CONF = 0.15
-
 # ==========================================================
 # 1. Async Database
 # ==========================================================
@@ -116,7 +110,7 @@ async def init_database():
     ]
     for q in queries:
         await db_execute(q)
-    for k in ["total_signals","tp1_hits","tp2_hits","tp3_hits","sl_hits","ai_trades","feedback_good","feedback_bad","ob_rejected","spread_rejected","slippage_rejected"]:
+    for k in ["total_signals","tp1_hits","tp2_hits","tp3_hits","sl_hits","ai_trades","feedback_good","feedback_bad"]:
         await db_execute("INSERT OR IGNORE INTO bot_stats (key, value) VALUES (?, 0)", (k,))
     LOGGER.info("Database initialized.")
 
@@ -149,7 +143,7 @@ bybit_limiter = RateLimiter(rate=10, per=1)
 okx_limiter = RateLimiter(rate=10, per=1)
 
 # ==========================================================
-# 3. Exchanges (Klines)
+# 3. Exchanges
 # ==========================================================
 EXCHANGES = [
     {"name":"Binance","weight":10,"limiter":binance_limiter,
@@ -210,166 +204,31 @@ async def fetch_klines(session, symbol, interval):
     return None
 
 # ==========================================================
-# 3b. Multi-Exchange Order Book (NEW)
+# 3b. Order Book (FIXED with retry + spot fallback)
 # ==========================================================
-OB_EXCHANGES = [
-    {
-        "name": "Binance Futures",
-        "limiter": binance_limiter,
-        "url": "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit={limit}",
-        "parser": lambda d: (d.get("bids", []), d.get("asks", []))
-    },
-    {
-        "name": "Binance Spot",
-        "limiter": binance_limiter,
-        "url": "https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}",
-        "parser": lambda d: (d.get("bids", []), d.get("asks", []))
-    },
-    {
-        "name": "Bybit Linear",
-        "limiter": bybit_limiter,
-        "url": "https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit={limit}",
-        "parser": lambda d: _parse_bybit_ob(d)
-    },
-    {
-        "name": "OKX",
-        "limiter": okx_limiter,
-        "url": "https://www.okx.com/api/v5/market/books?instId={symbol}-SWAP&sz={limit}",
-        "parser": lambda d: _parse_okx_ob(d)
-    }
-]
-
-def _parse_bybit_ob(data):
-    try:
-        if data.get("retCode") != 0: return [], []
-        result = data.get("result", {})
-        bids = [[b[0], b[1]] for b in result.get("b", [])]
-        asks = [[a[0], a[1]] for a in result.get("a", [])]
-        return bids, asks
-    except: return [], []
-
-def _parse_okx_ob(data):
-    try:
-        book = data.get("data", [{}])[0]
-        bids = [[b[0], b[1]] for b in book.get("bids", [])]
-        asks = [[a[0], a[1]] for a in book.get("asks", [])]
-        return bids, asks
-    except: return [], []
-
 async def fetch_order_book(session, symbol, limit=50):
-    """
-    Fetch order book from multiple exchanges with fallback.
-    Returns (bids, asks, source_name) or ([], [], None) on failure.
-    """
-    for ex in OB_EXCHANGES:
-        for attempt in range(2):
+    urls = [
+        f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit={limit}",
+        f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}"
+    ]
+    for attempt in range(3):
+        for url in urls:
             try:
-                await ex["limiter"].acquire()
-                url = ex["url"].format(symbol=symbol, limit=limit)
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                     if r.status == 200:
                         data = await r.json()
-                        bids, asks = ex["parser"](data)
-                        if len(bids) >= OB_MIN_BIDS and len(asks) >= OB_MIN_ASKS:
-                            LOGGER.info(f"OB fetched from {ex['name']} for {symbol} (bids:{len(bids)}, asks:{len(asks)})")
-                            return bids, asks, ex["name"]
-                        else:
-                            LOGGER.warning(f"{ex['name']} OB too shallow for {symbol}: bids={len(bids)}, asks={len(asks)}")
-                    else:
-                        LOGGER.warning(f"{ex['name']} OB HTTP {r.status} for {symbol}")
+                        bids = data.get("bids", [])
+                        asks = data.get("asks", [])
+                        if bids and asks:
+                            return bids, asks
             except Exception as e:
-                LOGGER.warning(f"{ex['name']} OB error {symbol} (attempt {attempt+1}): {e}")
-            await asyncio.sleep(0.3)
-    LOGGER.error(f"All OB sources failed for {symbol}")
-    return [], [], None
+                LOGGER.warning(f"OB fetch error {symbol} (attempt {attempt+1}): {e}")
+                await asyncio.sleep(0.5)
+    LOGGER.error(f"Failed OB for {symbol}")
+    return [], []
 
 # ==========================================================
-# 4. Order Book Quality Validator (NEW)
-# ==========================================================
-def validate_order_book(ob_data: dict, direction: str, symbol: str) -> Tuple[bool, str]:
-    """
-    Validates if order book quality is good enough for trading.
-    Returns (is_valid, reason).
-
-    HOW TO USE THESE METRICS:
-    -------------------------
-    imbalance:  
-        +0.3 to +1.0  = Heavy buying pressure (good for LONG)
-        -1.0 to -0.3  = Heavy selling pressure (good for SHORT)
-        -0.3 to +0.3  = Neutral (weak confirmation)
-
-    spread_pct:
-        < 0.05% = Excellent liquidity
-        0.05-0.2% = Good
-        0.2-0.5% = Acceptable
-        > 0.5% = Bad liquidity, skip trade
-
-    slippage:
-        Same as spread. High slippage = you lose money on entry.
-
-    stop_hunt_risk:
-        0.0 = Safe, no orders near your SL
-        > 0.5 = Dangerous! Many orders near SL = whale might hunt it
-
-    iceberg_bids/asks:
-        > 3 = Institutional hidden orders detected = strong signal
-
-    """
-    # 1. Check spread
-    if ob_data["spread_pct"] > OB_MAX_SPREAD_PCT:
-        return False, f"spread_too_high ({ob_data['spread_pct']:.3f}%)"
-
-    # 2. Check if order book confirms direction (imbalance)
-    imbalance = ob_data["imbalance"]
-    if direction == "LONG" and imbalance < -OB_MIN_IMBALANCE_CONF:
-        # Sellers dominate but we want LONG = weak confirmation
-        return False, f"ob_against_long (imbalance: {imbalance:.2f})"
-    if direction == "SHORT" and imbalance > OB_MIN_IMBALANCE_CONF:
-        # Buyers dominate but we want SHORT = weak confirmation
-        return False, f"ob_against_short (imbalance: {imbalance:.2f})"
-
-    # 3. Check stop hunt risk
-    if ob_data["stop_hunt_risk"] > 0.7:
-        return False, f"stop_hunt_risk_high ({ob_data['stop_hunt_risk']})"
-
-    # 4. Check if we have meaningful data
-    if ob_data["iceberg_bids"] == 0 and ob_data["iceberg_asks"] == 0 and abs(imbalance) < 0.05:
-        LOGGER.info(f"{symbol}: OB flat (no strong bias), allowing signal with caution")
-
-    return True, "ok"
-
-def ob_confidence_score(ob_data: dict, direction: str) -> float:
-    """
-    Returns 0.0-1.0 score based on how much OB supports the trade.
-    """
-    score = 0.5  # neutral base
-    imbalance = ob_data["imbalance"]
-
-    # Imbalance bonus/penalty
-    if direction == "LONG":
-        if imbalance > 0.3: score += 0.3
-        elif imbalance > 0.1: score += 0.15
-        elif imbalance < -0.3: score -= 0.3
-    else:  # SHORT
-        if imbalance < -0.3: score += 0.3
-        elif imbalance < -0.1: score += 0.15
-        elif imbalance > 0.3: score -= 0.3
-
-    # Spread bonus (tight spread = good)
-    if ob_data["spread_pct"] < 0.05: score += 0.1
-    elif ob_data["spread_pct"] > 0.3: score -= 0.2
-
-    # Iceberg bonus (institutional interest)
-    total_iceberg = ob_data["iceberg_bids"] + ob_data["iceberg_asks"]
-    if total_iceberg >= 5: score += 0.1
-
-    # Stop hunt penalty
-    if ob_data["stop_hunt_risk"] > 0.5: score -= 0.2
-
-    return max(0.0, min(1.0, score))
-
-# ==========================================================
-# 5. Indicators
+# 4. Indicators
 # ==========================================================
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1: return 50.0
@@ -461,34 +320,26 @@ def htf_sr(k4h, k1d):
     return s, r
 
 # ==========================================================
-# 6. Order Book Microstructure Analyzer
+# 5. Order Book Microstructure
 # ==========================================================
 class OrderBookAnalyzer:
     @staticmethod
     def analyze(bids, asks, entry_price=0.0, sl_price=0.0):
         if not bids or not asks:
             return {"imbalance": 0.0, "spread_pct": 0.0, "slippage": 0.0,
-                    "stop_hunt_risk": 0.0, "iceberg_bids": 0, "iceberg_asks": 0,
-                    "bid_depth": 0.0, "ask_depth": 0.0, "source": "none"}
-
-        # Depth analysis (top 20 levels)
-        bv20 = sum(float(b[1]) for b in bids[:20])
-        av20 = sum(float(a[1]) for a in asks[:20])
+                    "stop_hunt_risk": 0.0, "iceberg_bids": 0, "iceberg_asks": 0}
         bv10 = sum(float(b[1]) for b in bids[:10])
         av10 = sum(float(a[1]) for a in asks[:10])
         tv10 = bv10 + av10 + 1e-9
-
         imbalance = (bv10 - av10) / tv10
         bb = float(bids[0][0])
         ba = float(asks[0][0])
         spread_pct = ((ba - bb) / bb) * 100 if bb > 0 else 0.0
         slippage = spread_pct
-
         avg_bid_size = bv10 / 10 if bids else 0
         avg_ask_size = av10 / 10 if asks else 0
         iceberg_bids = sum(1 for b in bids[:20] if float(b[1]) > avg_bid_size * 3)
         iceberg_asks = sum(1 for a in asks[:20] if float(a[1]) > avg_ask_size * 3)
-
         stop_hunt_risk = 0.0
         if sl_price > 0 and entry_price > 0:
             bid_prices = [float(b[0]) for b in bids[:20]]
@@ -499,21 +350,17 @@ class OrderBookAnalyzer:
                 min_dist = min(sl_distances)
                 if min_dist < 0.1:
                     stop_hunt_risk = round(1.0 - (min_dist / 0.1), 2)
-
         return {
             "imbalance": round(float(imbalance), 4),
             "spread_pct": round(float(spread_pct), 4),
             "slippage": round(float(slippage), 4),
             "stop_hunt_risk": round(float(stop_hunt_risk), 2),
             "iceberg_bids": int(iceberg_bids),
-            "iceberg_asks": int(iceberg_asks),
-            "bid_depth": round(float(bv20), 2),
-            "ask_depth": round(float(av20), 2),
-            "source": "multi"
+            "iceberg_asks": int(iceberg_asks)
         }
 
 # ==========================================================
-# 7. AI Engine
+# 6. AI Engine
 # ==========================================================
 class ChartGenerator:
     @staticmethod
@@ -675,7 +522,7 @@ class AIEngine:
             self._training = False
 
 # ==========================================================
-# 8. Signal Analysis
+# 7. Signal Analysis
 # ==========================================================
 def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     if len(klines) < 50: return None
@@ -766,6 +613,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     if eq_sweep_short: shorts.append("SMC EQ Sweep")
     if ob_short: shorts.append("OB Imbalance")
 
+    # FIXED: TP calculation for SHORT direction (subtract, not add)
     def build(direction, strategies, entry, sl, risk):
         sl_pct = (risk / entry) * 100 if entry > 0 else 999
         if sl_pct <= max_sl and risk > 0:
@@ -773,7 +621,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
                 tp1 = round(entry + (risk * 2), 5)
                 tp2 = round(entry + (risk * 5), 5)
                 tp3 = round(entry + (risk * 7), 5)
-            else:
+            else:  # SHORT
                 tp1 = round(entry - (risk * 2), 5)
                 tp2 = round(entry - (risk * 5), 5)
                 tp3 = round(entry - (risk * 7), 5)
@@ -806,7 +654,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, max_sl=2.0):
     return None
 
 # ==========================================================
-# 9. Risk Manager
+# 8. Risk Manager
 # ==========================================================
 class RiskManager:
     def __init__(self, risk_percent=RISK_PER_TRADE, leverage=LEVERAGE):
@@ -822,7 +670,7 @@ class RiskManager:
         return round(notional, 2), round(margin, 2)
 
 # ==========================================================
-# 10. Binance Trader
+# 9. Binance Trader
 # ==========================================================
 class BinanceTrader:
     BASE = "https://fapi.binance.com"
@@ -878,7 +726,7 @@ class BinanceTrader:
         return await self._request("POST", "/fapi/v1/order", params, signed=True)
 
 # ==========================================================
-# 11. Telegram Manager
+# 10. Telegram Manager
 # ==========================================================
 class TelegramManager:
     def __init__(self, token, chat_id, chart_analyzer=None):
@@ -896,17 +744,10 @@ class TelegramManager:
                 if i == retries - 1: LOGGER.error(f"TG error: {e}"); return False
                 await asyncio.sleep(2 ** i)
 
-    async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id, gemini_result=None, ob_conf_score=None):
+    async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id, gemini_result=None):
         tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
         dir_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
         conf_emoji = "🔥" if ai_prob >= 0.75 else ("✅" if ai_prob >= 0.60 else ("⚠️" if ai_prob >= 0.55 else "❓"))
-
-        # OB Quality indicator
-        ob_quality = ""
-        if ob_conf_score is not None:
-            if ob_conf_score >= 0.7: ob_quality = "🟢 Strong OB"
-            elif ob_conf_score >= 0.4: ob_quality = "🟡 Neutral OB"
-            else: ob_quality = "🔴 Weak OB"
 
         gemini_text = ""
         if gemini_result:
@@ -966,13 +807,7 @@ class TelegramManager:
 "
             f"• Stop Hunt Risk: `{ob_data['stop_hunt_risk']}`
 "
-            f"• Iceberg Bids/Asks: `{ob_data['iceberg_bids']}` / `{ob_data['iceberg_asks']}`
-"
-            f"• Depth (Bid/Ask): `{ob_data['bid_depth']:,.0f}` / `{ob_data['ask_depth']:,.0f}`
-"
-            f"• Source: `{ob_data.get('source', 'unknown')}`
-"
-            f"• OB Quality: `{ob_quality}`"
+            f"• Iceberg Bids/Asks: `{ob_data['iceberg_bids']}` / `{ob_data['iceberg_asks']}`"
         )
 
         kb = InlineKeyboardMarkup([
@@ -1020,10 +855,9 @@ class TelegramManager:
                 updates = await self.bot.get_updates(offset=last_id + 1, timeout=5)
                 for u in updates:
                     last_id = u.update_id
-                    cid = u.message.chat_id if u.message else (u.callback_query.message.chat_id if u.callback_query else self.chat_id)
-
                     if u.message and u.message.text:
                         cmd = u.message.text.strip().split("@")[0].lower()
+                        cid = u.message.chat_id
                         if cmd == "/stats":
                             rows = await db_execute("SELECT key, value FROM bot_stats")
                             stats = {r[0]: r[1] for r in rows}
@@ -1044,10 +878,6 @@ class TelegramManager:
                                 f"👍 Good Feedback: `{stats.get('feedback_good',0)}`
 "
                                 f"👎 Bad Feedback: `{stats.get('feedback_bad',0)}`
-"
-                                f"🚫 OB Rejected: `{stats.get('ob_rejected',0)}`
-"
-                                f"🚫 Spread Rejected: `{stats.get('spread_rejected',0)}`
 "
                                 f"🏆 Win Rate: `{wr}%`", chat_id=cid
                             )
@@ -1073,7 +903,7 @@ class TelegramManager:
                                 f"▫️ `/help` — Help", chat_id=cid
                             )
 
-                    # PHOTO HANDLER
+                    # PHOTO HANDLER - Analyze user chart images
                     if u.message and u.message.photo:
                         try:
                             photo = u.message.photo[-1]
@@ -1125,7 +955,7 @@ class TelegramManager:
             await asyncio.sleep(2)
 
 # ==========================================================
-# 12. Main Unified Bot
+# 11. Main Unified Bot
 # ==========================================================
 class UnifiedTradingBot:
     def __init__(self):
@@ -1193,25 +1023,8 @@ class UnifiedTradingBot:
             LOGGER.error(f"BTC update: {e}")
 
     async def execute_signal(self, session, symbol, interval, signal):
-        # ===== MULTI-EXCHANGE ORDER BOOK =====
-        bids, asks, ob_source = await fetch_order_book(session, symbol)
+        bids, asks = await fetch_order_book(session, symbol)
         ob = OrderBookAnalyzer.analyze(bids, asks, signal["entry_price"], signal["stop_loss"])
-        ob["source"] = ob_source or "failed"
-
-        # Validate OB quality
-        ob_valid, ob_reason = validate_order_book(ob, signal["direction"], symbol)
-        ob_conf = ob_confidence_score(ob, signal["direction"])
-
-        if not ob_valid:
-            LOGGER.warning(f"OB REJECTED {symbol}: {ob_reason}")
-            if "spread" in ob_reason:
-                await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'spread_rejected'")
-            else:
-                await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'ob_rejected'")
-            return  # Skip signal
-
-        LOGGER.info(f"OB ACCEPTED {symbol} from {ob_source}: conf={ob_conf:.2f}, imb={ob['imbalance']:.2f}")
-        # ======================================
 
         features = {
             "rsi": signal["rsi"], "spread_pct": ob["spread_pct"],
@@ -1253,7 +1066,7 @@ class UnifiedTradingBot:
         # ==================================
 
         alert_id = f"{symbol}_{interval}_{int(time.time())}"
-        await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf)
+        await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result)
 
         balance = await self.trader.get_balance()
         if balance <= 0:
@@ -1275,7 +1088,7 @@ class UnifiedTradingBot:
         feat_id = (await db_execute("SELECT last_insert_rowid()"))[0][0]
 
         if not EXECUTE_TRADES:
-            LOGGER.info(f"📡 SIGNAL ONLY (trading OFF): {symbol} | AI: {prob:.1%} | OB: {ob_conf:.2f} | Features recorded.")
+            LOGGER.info(f"📡 SIGNAL ONLY (trading OFF): {symbol} | AI: {prob:.1%} | Features recorded.")
             return
 
         side = "BUY" if signal["direction"] == "LONG" else "SELL"
@@ -1295,7 +1108,7 @@ class UnifiedTradingBot:
                 (prob, conf_label, ob["imbalance"], ob["slippage"], ob["stop_hunt_risk"], ob["iceberg_bids"], ob["iceberg_asks"], alert_id)
             )
             await self.tg.notify_fill(symbol, signal["direction"], entry, notional, sl, tp1, tp2, tp3, PAPER_TRADING)
-            LOGGER.info(f"Trade opened: {symbol} | AI: {prob:.1%} | OB: {ob_conf:.2f} | Size: {notional}")
+            LOGGER.info(f"Trade opened: {symbol} | AI: {prob:.1%} | Size: {notional}")
 
     async def position_tracker(self):
         while True:
@@ -1368,6 +1181,7 @@ class UnifiedTradingBot:
                         await asyncio.sleep(5); continue
 
                     for symbol in symbols:
+                        # Extra volume safety check
                         vol = self.symbol_cache.get("volumes", {}).get(symbol, 0)
                         if vol <= 0:
                             LOGGER.debug(f"Skipping {symbol}: no volume data")
@@ -1407,7 +1221,7 @@ class UnifiedTradingBot:
                     await asyncio.sleep(15)
 
 # ==========================================================
-# 13. Web & Entry
+# 12. Web & Entry
 # ==========================================================
 async def health(request):
     return web.Response(text="Unified Bot Running", status=200)
