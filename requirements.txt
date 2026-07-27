@@ -4,6 +4,7 @@ pandas
 numpy
 matplotlib
 google-genai
-python-telegram-bot
+python-telegram-bot==20.7
 aiohttp
 python-dotenv
+joblib
