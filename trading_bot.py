@@ -1040,6 +1040,69 @@ class TelegramManager:
         label = "Good signal (AI learning) ✅ | سیگنال خوب (یادگیری AI)" if feedback_type == "good" else "Error logged ❌ | خطا ثبت شد"
         await self.send("Feedback recorded | بازخورد ثبت شد: " + label)
 
+    async def analyze_user_chart(self, photo, chat_id):
+        """تحلیل عکس چارت ارسالی کاربر"""
+        try:
+            file_obj = await self.bot.get_file(photo.file_id)
+            file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
+
+            async with aiohttp.ClientSession() as s:
+                async with s.get(file_url) as r:
+                    if r.status == 200:
+                        image_bytes = await r.read()
+
+                        if not self.chart_analyzer or not self.chart_analyzer.client:
+                            await self.send(
+                                "⚠️ *Gemini analyzer not available | تحلیل‌گر جمینی در دسترس نیست*\n\n"
+                                "Check GEMINI_API_KEY | کلید API رو چک کن",
+                                chat_id=chat_id
+                            )
+                            return
+
+                        await self.send(
+                            "🧠 *Analyzing chart... | در حال تحلیل چارت...*",
+                            chat_id=chat_id
+                        )
+
+                        gemini_result = await self.chart_analyzer.analyze_chart_image(image_bytes)
+
+                        if gemini_result:
+                            await db_execute(
+                                "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
+                                ("USER_UPLOAD", 
+                                 gemini_result.get("pattern_detected"), 
+                                 gemini_result.get("signal"),
+                                 gemini_result.get("confidence_score"), 
+                                 gemini_result.get("analysis_summary"))
+                            )
+
+                            msg = (
+                                "🧠 *Gemini Chart Analysis | تحلیل تصویری چارت*\n\n"
+                                "📊 *Pattern Detected | الگوی شناسایی شده:*\n"
+                                "`{}`\n\n"
+                                "📈 *Signal | سیگنال:* `{}`\n\n"
+                                "🎯 *Confidence | اطمینان:* `{}%`\n\n"
+                                "📝 *Summary | خلاصه:*\n"
+                                "_{}_"
+                            ).format(
+                                str(gemini_result.get('pattern_detected', 'N/A')),
+                                str(gemini_result.get('signal', 'N/A')),
+                                str(gemini_result.get('confidence_score', 'N/A')),
+                                str(gemini_result.get('analysis_summary', 'N/A'))
+                            )
+                        else:
+                            msg = "❌ *Analysis failed | تحلیل ناموفق*\n\nGemini could not analyze the image."
+
+                        await self.send(msg, chat_id=chat_id)
+
+        except Exception as e:
+            LOGGER.error("User chart analysis error: " + str(e))
+            await self.send(
+                "❌ *Error | خطا*\n\n"
+                "Could not analyze image | نمی‌تونم عکس رو تحلیل کنم",
+                chat_id=chat_id
+            )
+
     async def command_listener(self):
         last_id = 0
         while True:
@@ -1098,47 +1161,26 @@ class TelegramManager:
                                 lines = "\n".join(lines_list)
                                 msg = "📌 *Active Trades | تریدهای فعال ({})*\n\n{}".format(str(len(df)), lines)
                                 await self.send(msg, chat_id=cid)
+                        elif cmd == "/analyze":
+                            msg = (
+                                "🖼️ *Chart Analysis | تحلیل چارت*\n\n"
+                                "▫️ عکس چارتت رو بفرست\n"
+                                "▫️ ربات خودکار تحلیل می‌کنه\n"
+                                "▫️ Gemini AI الگو رو تشخیص می‌ده"
+                            )
+                            await self.send(msg, chat_id=cid)
                         elif cmd == "/help":
                             msg = (
                                 "🤖 *Control Menu | منوی کنترل*\n\n"
                                 "▫️ `/stats` — Statistics | آمار\n"
                                 "▫️ `/active` — Active positions | تریدهای فعال\n"
+                                "▫️ `/analyze` — Chart analysis | تحلیل چارت\n"
                                 "▫️ `/help` — Help | راهنما"
                             )
                             await self.send(msg, chat_id=cid)
 
                     if u.message and u.message.photo:
-                        try:
-                            photo = u.message.photo[-1]
-                            file_obj = await self.bot.get_file(photo.file_id)
-                            file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
-                            async with aiohttp.ClientSession() as s:
-                                async with s.get(file_url) as r:
-                                    if r.status == 200:
-                                        image_bytes = await r.read()
-                                        if self.chart_analyzer and self.chart_analyzer.client:
-                                            gemini_result = await self.chart_analyzer.analyze_chart_image(image_bytes)
-                                            if gemini_result:
-                                                msg = (
-                                                    "🧠 *Gemini Chart Analysis | تحلیل تصویری:*\n\n"
-                                                    "• Pattern | الگو: `{}`\n"
-                                                    "• Signal | سیگنال: `{}`\n"
-                                                    "• Confidence | اطمینان: `{}`\n"
-                                                    "• Summary | خلاصه: _{}_"
-                                                ).format(
-                                                    str(gemini_result.get('pattern_detected', 'N/A')),
-                                                    str(gemini_result.get('signal', 'N/A')),
-                                                    str(gemini_result.get('confidence_score', 'N/A')),
-                                                    str(gemini_result.get('analysis_summary', 'N/A'))
-                                                )
-                                                await self.send(msg, chat_id=cid)
-                                            else:
-                                                await self.send("❌ Gemini could not analyze | جمینی نتونست تحلیل کنه.", chat_id=cid)
-                                        else:
-                                            await self.send("⚠️ Gemini analyzer not available | تحلیل‌گر جمینی در دسترس نیست. Check GEMINI_API_KEY.", chat_id=cid)
-                        except Exception as e:
-                            LOGGER.error("Photo analysis error: " + str(e))
-                            await self.send("❌ Error analyzing image | خطا در تحلیل تصویر.", chat_id=cid)
+                        await self.analyze_user_chart(u.message.photo[-1], cid)
 
                     if u.callback_query:
                         cq = u.callback_query
