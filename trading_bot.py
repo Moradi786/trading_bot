@@ -8,6 +8,12 @@ import io
 import json
 from typing import Dict, Any, Optional, List, Tuple
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import aiohttp
 import numpy as np
 import pandas as pd
@@ -38,6 +44,13 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
+
+# Allowed users (comma-separated Telegram IDs). Empty = allow all.
+ALLOWED_USER_IDS_STR = os.getenv("ALLOWED_USER_IDS", "")
+ALLOWED_USER_IDS = [int(x.strip()) for x in ALLOWED_USER_IDS_STR.split(",") if x.strip().isdigit()] if ALLOWED_USER_IDS_STR else []
+
+# Check interval for market scanner (seconds, minimum 5)
+CHECK_INTERVAL_SECONDS = max(5, int(os.getenv("CHECK_INTERVAL_SECONDS", "5")))
 
 DB_NAME = "signal_bot.db"
 MODEL_PATH = "ai_model.joblib"
@@ -1228,27 +1241,25 @@ class TelegramManager:
         label = "Good signal (AI learning) ✅ | سیگنال خوب (یادگیری AI)" if feedback_type == "good" else "Bad signal (AI learning) ❌ | سیگنال بد (یادگیری AI)"
         await self.send("Feedback recorded | بازخورد ثبت شد: " + label)
 
-        async def analyze_user_chart(self, photo, chat_id):
+    async def analyze_user_chart(self, photo, chat_id):
         LOGGER.info("=" * 50)
         LOGGER.info("analyze_user_chart STARTED for chat_id={}".format(chat_id))
-        
+
         try:
             LOGGER.info("Step 1: Getting file from Telegram...")
             LOGGER.info("photo.file_id={}".format(photo.file_id))
             LOGGER.info("photo.file_size={}".format(getattr(photo, 'file_size', 'unknown')))
-            
+
             file_obj = await self.bot.get_file(photo.file_id)
             LOGGER.info("Step 1 OK: file_path={}".format(file_obj.file_path))
-            
+
             # Method 1: Use bot.download_file (v20+ compatible)
             LOGGER.info("Step 2: Downloading file...")
             try:
-                # In v20+, download_file returns bytes directly
                 file_bytes = await self.bot.download_file(file_obj.file_path, read_timeout=30)
                 if isinstance(file_bytes, bytes):
                     image_bytes = file_bytes
                 else:
-                    # If it returns a file object, read it
                     image_bytes = bytes(file_bytes)
                 LOGGER.info("Step 2 OK: downloaded {} bytes".format(len(image_bytes)))
             except Exception as dl_e:
@@ -1261,7 +1272,7 @@ class TelegramManager:
                         LOGGER.info("Fallback HTTP status: {}".format(r.status))
                         if r.status != 200:
                             await self.send(
-                                "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}\n\nError: {}".format(r.status, str(dl_e)),
+                                "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}".format(r.status),
                                 chat_id=chat_id
                             )
                             return
@@ -1346,29 +1357,20 @@ class TelegramManager:
                     chat_id=chat_id
                 )
             except Exception as send_e:
-                LOGGER.error("Failed to send error message: {}".format(send_e))
-                
-    async def command_listener(self):
+                LOGGER.error("Failed to send error message: {}".format(send_e))    async def command_listener(self):
         last_id = 0
-        LOGGER.info("Command listener started. Waiting for messages...")
         while True:
             try:
-                LOGGER.debug("Polling for updates... last_id={}".format(last_id))
                 updates = await self.bot.get_updates(offset=last_id + 1, timeout=5)
-                LOGGER.debug("Got {} updates".format(len(updates)))
-                
                 for u in updates:
                     last_id = u.update_id
-                    LOGGER.info("Processing update_id={}".format(u.update_id))
 
                     # Authorization check
                     user_id = None
                     if u.message and u.message.from_user:
                         user_id = u.message.from_user.id
-                        LOGGER.info("Message from user_id={}".format(user_id))
                     elif u.callback_query and u.callback_query.from_user:
                         user_id = u.callback_query.from_user.id
-                        LOGGER.info("Callback from user_id={}".format(user_id))
 
                     if user_id and not self.is_authorized(user_id):
                         LOGGER.warning("Unauthorized access from user: {}".format(user_id))
@@ -1382,13 +1384,10 @@ class TelegramManager:
                         continue
 
                     cid = u.message.chat_id if u.message else (u.callback_query.message.chat_id if u.callback_query else self.chat_id)
-                    LOGGER.info("Chat ID: {}".format(cid))
 
-                    # Handle text messages
                     if u.message and u.message.text:
                         cmd = u.message.text.strip().split("@")[0].lower()
                         parts = cmd.split()
-                        LOGGER.info("Text command: {}".format(parts[0]))
 
                         if parts[0] == "/stats":
                             rows = await db_execute("SELECT key, value FROM bot_stats")
@@ -1431,11 +1430,16 @@ class TelegramManager:
                                 outcome = 1 if result == "win" else 0
                                 fb_type = "good" if result == "win" else "bad"
 
+                                # Update signal_history feedback
                                 await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb_type, alert_id))
+
+                                # Update trade_features outcome
                                 await db_execute(
                                     "UPDATE trade_features SET outcome = ? WHERE id = (SELECT id FROM signal_history WHERE alert_id = ?)",
                                     (outcome, alert_id)
                                 )
+
+                                # Update stats
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{}'".format(fb_type))
 
                                 await self.send(
@@ -1446,6 +1450,7 @@ class TelegramManager:
                                     chat_id=cid
                                 )
 
+                                # Trigger AI retrain
                                 asyncio.create_task(self.ai_engine.retrain())
                             else:
                                 await self.send(
@@ -1481,7 +1486,7 @@ class TelegramManager:
                     if u.message:
                         LOGGER.info("Message has photo={}".format(bool(u.message.photo)))
                         LOGGER.info("Message has document={}".format(bool(u.message.document)))
-                        
+
                         if u.message.photo:
                             LOGGER.info("Photo detected! Count={}".format(len(u.message.photo)))
                             LOGGER.info("Photo sizes: {}".format([p.file_size for p in u.message.photo]))
@@ -1498,17 +1503,15 @@ class TelegramManager:
                                 LOGGER.info("Document is an image, treating as photo")
                                 # Create a simple object with file_id
                                 class FakePhoto:
-                                    def __init__(self, file_id):
+                                    def __init__(self, file_id, file_size=0):
                                         self.file_id = file_id
-                                        self.file_size = 0
-                                await self.analyze_user_chart(FakePhoto(u.message.document.file_id), cid)
+                                        self.file_size = file_size
+                                await self.analyze_user_chart(FakePhoto(u.message.document.file_id, u.message.document.file_size), cid)
 
-                    # Handle callback queries
                     if u.callback_query:
                         cq = u.callback_query
                         data = cq.data or ""
                         parts = data.split("|")
-                        LOGGER.info("Callback query: data={}".format(data))
                         if len(parts) == 2:
                             fb_type, alert_id = parts[0], parts[1]
                             if fb_type in ("good", "bad"):
@@ -1522,15 +1525,14 @@ class TelegramManager:
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{}'".format(fb_type))
                                 await self.notify_feedback(alert_id, fb_type)
 
+                                # Trigger AI retrain
                                 asyncio.create_task(self.ai_engine.retrain())
 
                                 try:
                                     await self.bot.answer_callback_query(cq.id)
                                 except: pass
             except Exception as e:
-                LOGGER.error("Command listener error: {}".format(str(e)))
-                import traceback
-                LOGGER.error(traceback.format_exc())
+                LOGGER.error("Command listener: " + str(e))
             await asyncio.sleep(2)
 
 # ==========================================================
@@ -1540,10 +1542,11 @@ class SignalBot:
     def __init__(self):
         self.ai = AIEngine()
         self.chart_analyzer = ChartImageAnalyzer(GEMINI_API_KEY)
-        self.tg = TelegramManager(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, self.chart_analyzer, self.ai)
+        self.tg = TelegramManager(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, self.chart_analyzer, self.ai, ALLOWED_USER_IDS)
         self.btc_trend = "NEUTRAL"
         self.btc_pause_until = 0
         self.symbol_cache = {"symbols": [], "last_update": 0, "volumes": {}}
+        self.check_interval = CHECK_INTERVAL_SECONDS
 
     async def start(self):
         await init_database()
@@ -1761,7 +1764,7 @@ class SignalBot:
                             await asyncio.sleep(0.02)
 
                     symbols = await self.get_symbols(session)
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(self.check_interval)
                 except Exception as e:
                     LOGGER.error("Scanner: " + str(e))
                     await asyncio.sleep(15)
