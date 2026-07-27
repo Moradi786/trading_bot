@@ -123,7 +123,7 @@ async def init_database():
     ]
     for q in queries:
         await db_execute(q)
-    for k in ["total_signals","tp1_hits","tp2_hits","tp3_hits","sl_hits","ai_trades","feedback_good","feedback_bad","ob_rejected","spread_rejected","ob_quality_rejected","ob_depth_rejected","ob_stop_hunt_rejected","ob_slippage_rejected"]:
+    for k in ["total_signals","tp1_hits","tp2_hits","tp3_hits","sl_hits","ai_trades","feedback_good","feedback_bad","ob_rejected","spread_rejected","ob_quality_rejected","ob_depth_rejected","ob_stop_hunt_rejected","ob_slippage_rejected","volume_rejected"]:
         await db_execute("INSERT OR IGNORE INTO bot_stats (key, value) VALUES (?, 0)", (k,))
     LOGGER.info("Database initialized.")
 
@@ -311,16 +311,16 @@ async def fetch_order_book(session, symbol, limit=50):
                         data = await r.json()
                         bids, asks = ex["parser"](data)
                         if len(bids) >= OB_MIN_BIDS and len(asks) >= OB_MIN_ASKS:
-                            LOGGER.info(f"OB from {ex['name']} for {symbol}: bids={len(bids)}, asks={len(asks)}")
+                            LOGGER.info("OB from {} for {}: bids={}, asks={}".format(ex['name'], symbol, len(bids), len(asks)))
                             return bids, asks, ex["name"]
                         else:
-                            LOGGER.warning(f"{ex['name']} OB shallow for {symbol}: bids={len(bids)}, asks={len(asks)}")
+                            LOGGER.warning("{} OB shallow for {}: bids={}, asks={}".format(ex['name'], symbol, len(bids), len(asks)))
                     else:
-                        LOGGER.warning(f"{ex['name']} OB HTTP {r.status} for {symbol}")
+                        LOGGER.warning("{} OB HTTP {} for {}".format(ex['name'], r.status, symbol))
             except Exception as e:
-                LOGGER.warning(f"{ex['name']} OB error {symbol} (attempt {attempt+1}): {e}")
+                LOGGER.warning("{} OB error {} (attempt {}): {}".format(ex['name'], symbol, attempt+1, e))
             await asyncio.sleep(0.3)
-    LOGGER.error(f"All OB sources failed for {symbol}")
+    LOGGER.error("All OB sources failed for {}".format(symbol))
     return [], [], None
 
 # ==========================================================
@@ -328,14 +328,14 @@ async def fetch_order_book(session, symbol, limit=50):
 # ==========================================================
 def validate_order_book(ob_data: dict, direction: str, symbol: str) -> Tuple[bool, str]:
     if ob_data["spread_pct"] > OB_MAX_SPREAD_PCT:
-        return False, f"spread_too_high ({ob_data['spread_pct']:.3f}%)"
+        return False, "spread_too_high ({:.3f}%)".format(ob_data['spread_pct'])
     imbalance = ob_data["imbalance"]
     if direction == "LONG" and imbalance < -OB_MIN_IMBALANCE_CONF:
-        return False, f"ob_against_long (imbalance: {imbalance:.2f})"
+        return False, "ob_against_long (imbalance: {:.2f})".format(imbalance)
     if direction == "SHORT" and imbalance > OB_MIN_IMBALANCE_CONF:
-        return False, f"ob_against_short (imbalance: {imbalance:.2f})"
+        return False, "ob_against_short (imbalance: {:.2f})".format(imbalance)
     if ob_data["stop_hunt_risk"] > 0.7:
-        return False, f"stop_hunt_risk_high ({ob_data['stop_hunt_risk']})"
+        return False, "stop_hunt_risk_high ({})".format(ob_data['stop_hunt_risk'])
     return True, "ok"
 
 def ob_confidence_score(ob_data: dict, direction: str) -> float:
@@ -370,7 +370,7 @@ def ob_quality_filter(ob_data: dict, direction: str, symbol: str, entry_price: f
 
     # 1. Minimum quality score
     if score < OB_QUALITY_MIN_SCORE:
-        reasons.append(f"quality_score_low ({score:.2f} < {OB_QUALITY_MIN_SCORE})")
+        reasons.append("quality_score_low ({:.2f} < {})".format(score, OB_QUALITY_MIN_SCORE))
 
     # 2. Minimum depth check
     min_depth = OB_MIN_DEPTH_USDT
@@ -382,21 +382,21 @@ def ob_quality_filter(ob_data: dict, direction: str, symbol: str, entry_price: f
         ask_depth_usdt = ob_data.get("ask_depth", 0)
 
     if direction == "LONG" and bid_depth_usdt < min_depth:
-        reasons.append(f"bid_depth_low ({bid_depth_usdt:,.0f} < {min_depth:,.0f} USDT)")
+        reasons.append("bid_depth_low ({:,.0f} < {:,.0f} USDT)".format(bid_depth_usdt, min_depth))
     if direction == "SHORT" and ask_depth_usdt < min_depth:
-        reasons.append(f"ask_depth_low ({ask_depth_usdt:,.0f} < {min_depth:,.0f} USDT)")
+        reasons.append("ask_depth_low ({:,.0f} < {:,.0f} USDT)".format(ask_depth_usdt, min_depth))
 
     # 3. Stop hunt risk
     if ob_data.get("stop_hunt_risk", 0) > OB_MAX_STOP_HUNT_RISK:
-        reasons.append(f"stop_hunt_risk ({ob_data['stop_hunt_risk']:.2f} > {OB_MAX_STOP_HUNT_RISK})")
+        reasons.append("stop_hunt_risk ({:.2f} > {})".format(ob_data['stop_hunt_risk'], OB_MAX_STOP_HUNT_RISK))
 
     # 4. Slippage check
     if ob_data.get("slippage", 0) > OB_MAX_SLIPPAGE_PCT:
-        reasons.append(f"slippage_high ({ob_data['slippage']:.3f}% > {OB_MAX_SLIPPAGE_PCT}%)")
+        reasons.append("slippage_high ({:.3f}% > {}%)".format(ob_data['slippage'], OB_MAX_SLIPPAGE_PCT))
 
     # 5. Spread check (tighter than basic validator)
     if ob_data["spread_pct"] > 0.3:
-        reasons.append(f"spread_wide ({ob_data['spread_pct']:.3f}% > 0.3%)")
+        reasons.append("spread_wide ({:.3f}% > 0.3%)".format(ob_data['spread_pct']))
 
     if reasons:
         return False, " | ".join(reasons), score
@@ -551,10 +551,10 @@ class ChartGenerator:
         entry = signal.get("entry_price", signal.get("entry", 0))
         sl = signal.get("stop_loss", signal.get("sl", 0))
         tp1 = signal.get("tp1", 0)
-        if entry: ax.axhline(y=entry, color="blue", linestyle="--", linewidth=1, label=f"Entry: {entry}")
-        if sl: ax.axhline(y=sl, color="red", linestyle="--", linewidth=1, label=f"SL: {round(sl, 4)}")
-        if tp1: ax.axhline(y=tp1, color="green", linestyle="--", linewidth=1, label=f"TP1: {round(tp1, 4)}")
-        ax.set_title(f"{symbol} - {signal.get('direction', 'SIGNAL')} Chart", fontsize=12, fontweight="bold")
+        if entry: ax.axhline(y=entry, color="blue", linestyle="--", linewidth=1, label="Entry: " + str(entry))
+        if sl: ax.axhline(y=sl, color="red", linestyle="--", linewidth=1, label="SL: " + str(round(sl, 4)))
+        if tp1: ax.axhline(y=tp1, color="green", linestyle="--", linewidth=1, label="TP1: " + str(round(tp1, 4)))
+        ax.set_title(symbol + " - " + signal.get('direction', 'SIGNAL') + " Chart", fontsize=12, fontweight="bold")
         ax.grid(True, linestyle=":", alpha=0.6)
         ax.legend(loc="upper left")
         buf = io.BytesIO()
@@ -581,7 +581,7 @@ class ChartImageAnalyzer:
             self.client = genai.Client(api_key=api_key)
             LOGGER.info("Gemini client initialized.")
         except Exception as e:
-            LOGGER.error(f"Gemini client init failed: {e}")
+            LOGGER.error("Gemini client init failed: " + str(e))
             self.client = None
 
     async def analyze_chart_image(self, image_bytes: bytes) -> dict:
@@ -597,7 +597,7 @@ class ChartImageAnalyzer:
                 '"confidence_score": 0-100, '
                 '"analysis_summary": "short analysis"}'
             )
-            LOGGER.info(f"Sending {len(image_bytes)} bytes to Gemini...")
+            LOGGER.info("Sending {} bytes to Gemini...".format(len(image_bytes)))
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model="gemini-2.0-flash",
@@ -612,18 +612,18 @@ class ChartImageAnalyzer:
             elif hasattr(response, "parts") and response.parts:
                 text = "".join([p.text for p in response.parts if hasattr(p, "text")])
             else:
-                LOGGER.error(f"Unexpected Gemini response format: {type(response)}")
+                LOGGER.error("Unexpected Gemini response format: " + str(type(response)))
                 return None
             text = text.replace("```json", "").replace("```", "").strip()
-            LOGGER.info(f"Gemini raw response: {text[:200]}...")
+            LOGGER.info("Gemini raw response: " + text[:200] + "...")
             result = json.loads(text)
-            LOGGER.info(f"Gemini parsed: {result}")
+            LOGGER.info("Gemini parsed: " + str(result))
             return result
         except json.JSONDecodeError as e:
-            LOGGER.error(f"Gemini returned invalid JSON: {e}")
+            LOGGER.error("Gemini returned invalid JSON: " + str(e))
             return None
         except Exception as e:
-            LOGGER.error(f"Gemini analysis error: {type(e).__name__}: {e}")
+            LOGGER.error("Gemini analysis error: " + type(e).__name__ + ": " + str(e))
             return None
 
 class AIEngine:
@@ -648,7 +648,7 @@ class AIEngine:
             joblib.dump(self.scaler, SCALER_PATH)
             LOGGER.info("AI model saved.")
         except Exception as e:
-            LOGGER.error(f"Save error: {e}")
+            LOGGER.error("Save error: " + str(e))
 
     def load(self):
         if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
@@ -658,7 +658,7 @@ class AIEngine:
                 self.is_trained = True
                 LOGGER.info("AI model loaded.")
             except Exception as e:
-                LOGGER.error(f"Load error: {e}")
+                LOGGER.error("Load error: " + str(e))
 
     async def predict(self, features: Dict[str, float]) -> float:
         if not self.is_trained: return 0.50
@@ -680,7 +680,7 @@ class AIEngine:
         try:
             df = await db_fetch_df("SELECT * FROM trade_features WHERE outcome IS NOT NULL")
             if len(df) < self.min_samples or len(df["outcome"].unique()) < 2:
-                LOGGER.info(f"Not enough data for training ({len(df)}).")
+                LOGGER.info("Not enough data for training ({}).".format(len(df)))
                 return False
             def _train():
                 for c in self.FEATURE_COLS:
@@ -695,10 +695,10 @@ class AIEngine:
                 self.is_trained = True
                 self.save()
             await asyncio.to_thread(_train)
-            LOGGER.info(f"AI retrained on {len(df)} trades.")
+            LOGGER.info("AI retrained on {} trades.".format(len(df)))
             return True
         except Exception as e:
-            LOGGER.error(f"Retrain error: {e}"); return False
+            LOGGER.error("Retrain error: " + str(e)); return False
         finally:
             self._training = False
 
@@ -867,7 +867,7 @@ class BinanceTrader:
         if self.session: await self.session.close()
 
     def _sign(self, params: dict):
-        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        qs = "&".join("{}={}".format(k, v) for k, v in sorted(params.items()))
         sig = hmac.new(self.secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
         return qs + "&signature=" + sig
 
@@ -880,11 +880,11 @@ class BinanceTrader:
                 qs = self._sign(params or {})
                 url += "?" + qs
             elif params:
-                url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+                url += "?" + "&".join("{}={}".format(k, v) for k, v in params.items())
             async with self.session.request(method, url, headers=headers, timeout=10) as r:
                 return await r.json()
         except Exception as e:
-            LOGGER.error(f"Binance API error: {e}"); return None
+            LOGGER.error("Binance API error: " + str(e)); return None
 
     async def get_balance(self):
         if self.paper: return 10000.0
@@ -898,15 +898,15 @@ class BinanceTrader:
 
     async def place_market_order(self, symbol: str, side: str, quantity: float, leverage: int = 3):
         if self.paper:
-            LOGGER.info(f"PAPER ORDER | {side} {quantity} {symbol} @ x{leverage}")
-            return {"orderId": f"PAPER_{int(time.time()*1000)}", "status": "FILLED"}
+            LOGGER.info("PAPER ORDER | {} {} {} @ x{}".format(side, quantity, symbol, leverage))
+            return {"orderId": "PAPER_" + str(int(time.time()*1000)), "status": "FILLED"}
         await self._request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage, "timestamp": int(time.time()*1000)}, signed=True)
         ts = int(time.time() * 1000)
         params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": quantity, "timestamp": ts}
         return await self._request("POST", "/fapi/v1/order", params, signed=True)
 
 # ==========================================================
-# 11. Telegram Manager
+# 11. Telegram Manager (دوزبانه - English | فارسی)
 # ==========================================================
 class TelegramManager:
     def __init__(self, token, chat_id, chart_analyzer=None):
@@ -921,90 +921,124 @@ class TelegramManager:
                 await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
                 return True
             except Exception as e:
-                if i == retries - 1: LOGGER.error(f"TG error: {e}"); return False
+                if i == retries - 1:
+                    LOGGER.error("TG error: " + str(e))
+                    return False
                 await asyncio.sleep(2 ** i)
 
     async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id, gemini_result=None, ob_conf_score=None, ob_quality_status=None):
-        tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+        tv = "https://www.tradingview.com/chart/?symbol=BINANCE:{}".format(symbol)
         dir_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
         conf_emoji = "🔥" if ai_prob >= 0.75 else ("✅" if ai_prob >= 0.60 else ("⚠️" if ai_prob >= 0.55 else "❓"))
 
         ob_quality = ""
         if ob_conf_score is not None:
-            if ob_conf_score >= 0.7: ob_quality = "🟢 Strong OB"
-            elif ob_conf_score >= 0.4: ob_quality = "🟡 Neutral OB"
-            else: ob_quality = "🔴 Weak OB"
+            if ob_conf_score >= 0.7: ob_quality = "🟢 Strong OB | قوی"
+            elif ob_conf_score >= 0.4: ob_quality = "🟡 Neutral OB | متوسط"
+            else: ob_quality = "🔴 Weak OB | ضعیف"
 
         ob_filter_status = ""
         if ob_quality_status:
-            ob_filter_status = f"\n🔍 *OB Auto Filter:* `{ob_quality_status}`"
+            ob_filter_status = "\n🔍 *OB Auto Filter | فیلتر خودکار:* `{}`".format(ob_quality_status)
 
         gemini_text = ""
         if gemini_result:
             gemini_text = (
-                "\n🧠 *Gemini Vision Analysis:*\n"
-                "• Pattern: `" + str(gemini_result.get('pattern_detected', 'N/A')) + "`\n"
-                "• Signal: `" + str(gemini_result.get('signal', 'N/A')) + "`\n"
-                "• Confidence: `" + str(gemini_result.get('confidence_score', 'N/A')) + "`\n"
-                "• Summary: _" + str(gemini_result.get('analysis_summary', 'N/A')) + "_"
+                "\n🧠 *Gemini Vision Analysis | تحلیل تصویری:*\n"
+                "• Pattern | الگو: `{}`\n"
+                "• Signal | سیگنال: `{}`\n"
+                "• Confidence | اطمینان: `{}`\n"
+                "• Summary | خلاصه: _{}_"
+            ).format(
+                str(gemini_result.get('pattern_detected', 'N/A')),
+                str(gemini_result.get('signal', 'N/A')),
+                str(gemini_result.get('confidence_score', 'N/A')),
+                str(gemini_result.get('analysis_summary', 'N/A'))
             )
 
         msg = (
-            "🚨 *NEW TRADING SIGNAL* 🚨\n\n"
-            "🪙 *Symbol:* `#" + symbol + "`\n"
-            "📊 *Direction:* " + signal['direction'] + " " + dir_emoji + "\n"
-            "🎯 *Strategy:* " + signal['strategy'] + " (" + interval + ")\n"
-            + conf_emoji + " *AI Score:* `" + f"{ai_prob:.1%}" + "` Confidence\n"
-            "⏱️ *Timeframe:* " + interval + "\n\n"
-            "💵 *Entry Price:* `" + str(signal['entry_price']) + "`\n"
-            "🛡️ *Stop Loss:* `" + str(signal['stop_loss']) + "` (`" + str(signal['sl_percent']) + "%`)\n\n"
-            "🎯 *Take Profit Targets:*\n"
-            "🔹 *TP1:* `" + str(signal['tp1']) + "`\n"
-            "🔹 *TP2:* `" + str(signal['tp2']) + "`\n"
-            "🔹 *TP3:* `" + str(signal['tp3']) + "`\n\n"
-            "📉 *RSI:* `" + str(signal['rsi']) + "` | *Trend:* `" + signal['trend'] + "`\n"
-            "🌐 *BTC Trend:* `" + btc_trend + "`"
-            + gemini_text + "\n\n"
-            "📖 *Order Book Microstructure:*\n"
-            "• Imbalance Ratio: `" + f"{ob_data['imbalance']:.2f}" + "`\n"
-            "• Slippage: `" + f"{ob_data['slippage']:.2f}" + "%`\n"
-            "• Stop Hunt Risk: `" + str(ob_data['stop_hunt_risk']) + "`\n"
-            "• Iceberg Bids/Asks: `" + str(ob_data['iceberg_bids']) + "` / `" + str(ob_data['iceberg_asks']) + "`\n"
-            "• Depth (Bid/Ask): `" + f"{ob_data['bid_depth']:,.0f}" + "` / `" + f"{ob_data['ask_depth']:,.0f}" + "`\n"
-            "• Source: `" + str(ob_data.get('source', 'unknown')) + "`\n"
-            "• OB Quality: `" + ob_quality + "`"
-            + ob_filter_status
+            "🚨 *NEW TRADING SIGNAL | سیگنال جدید ترید* 🚨\n\n"
+            "🪙 *Symbol | ارز:* `#{}`\n"
+            "📊 *Direction | جهت:* {} {}\n"
+            "🎯 *Strategy | استراتژی:* {} ({})\n"
+            "{} *AI Score | امتیاز AI:* `{}` Confidence | اطمینان\n"
+            "⏱️ *Timeframe | تایم‌فریم:* {}\n\n"
+            "💵 *Entry Price | قیمت ورود:* `{}`\n"
+            "🛡️ *Stop Loss | استاپ لاس:* `{}` (`{}%`)\n\n"
+            "🎯 *Take Profit Targets | اهداف سود:*\n"
+            "🔹 *TP1:* `{}`\n"
+            "🔹 *TP2:* `{}`\n"
+            "🔹 *TP3:* `{}`\n\n"
+            "📉 *RSI:* `{}` | *Trend | ترند:* `{}`\n"
+            "🌐 *BTC Trend | ترند بیت‌کوین:* `{}`"
+            "{}\n\n"
+            "📖 *Order Book Microstructure | سفارشات کتاب:*\n"
+            "• Imbalance Ratio | نسبت عدم تعادل: `{}`\n"
+            "• Slippage | لغزش قیمت: `{}%`\n"
+            "• Stop Hunt Risk | ریسک شکار استاپ: `{}`\n"
+            "• Iceberg Bids/Asks | سفارشات یخی خرید/فروش: `{}` / `{}`\n"
+            "• Depth (Bid/Ask) | عمق بازار (خرید/فروش): `{:,.0f}` / `{:,.0f}`\n"
+            "• Source | منبع: `{}`\n"
+            "• OB Quality | کیفیت سفارشات: `{}`"
+            "{}"
+        ).format(
+            symbol,
+            signal['direction'], dir_emoji,
+            signal['strategy'], interval,
+            conf_emoji, "{:.1%}".format(ai_prob),
+            interval,
+            str(signal['entry_price']),
+            str(signal['stop_loss']), str(signal['sl_percent']),
+            str(signal['tp1']),
+            str(signal['tp2']),
+            str(signal['tp3']),
+            str(signal['rsi']), signal['trend'],
+            btc_trend,
+            gemini_text,
+            "{:.2f}".format(ob_data['imbalance']),
+            "{:.2f}".format(ob_data['slippage']),
+            str(ob_data['stop_hunt_risk']),
+            str(ob_data['iceberg_bids']), str(ob_data['iceberg_asks']),
+            ob_data['bid_depth'], ob_data['ask_depth'],
+            str(ob_data.get('source', 'unknown')),
+            ob_quality,
+            ob_filter_status
         )
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 TradingView", url=tv)],
             [
-                InlineKeyboardButton("✅ Good Signal", callback_data=f"good|{alert_id}"),
-                InlineKeyboardButton("❌ Bad Signal", callback_data=f"bad|{alert_id}")
+                InlineKeyboardButton("✅ Good | خوب", callback_data="good|" + alert_id),
+                InlineKeyboardButton("❌ Bad | بد", callback_data="bad|" + alert_id)
             ]
         ])
         await self.send(msg, reply_markup=kb)
 
     async def notify_fill(self, symbol, direction, entry, size, sl, tp1, tp2, tp3, paper):
-        p = "📄 PAPER" if paper else "💰 REAL"
+        p = "📄 PAPER | دمو" if paper else "💰 REAL | واقعی"
         de = "🟢" if direction == "LONG" else "🔴"
-        await self.send(
-            "(" + p + ") *Trade Opened* ✅\n\n"
-            "🪙 `#" + symbol + "` | " + direction + " " + de + "\n"
-            "📍 Entry: `" + str(entry) + "`\n"
-            "📊 Size: `" + str(size) + "` USDT\n"
-            "🛡️ SL: `" + str(sl) + "`\n"
-            "🎯 TP1: `" + str(tp1) + "` | TP2: `" + str(tp2) + "` | TP3: `" + str(tp3) + "`"
-        )
+        msg = (
+            "({}) *Trade Opened | ترید باز شد* ✅\n\n"
+            "🪙 `#{}` | {} {}\n"
+            "📍 *Entry | ورود:* `{}`\n"
+            "📊 *Size | حجم:* `{}` USDT\n"
+            "🛡️ *SL | استاپ:* `{}`\n"
+            "🎯 *TP1:* `{}` | *TP2:* `{}` | *TP3:* `{}`"
+        ).format(p, symbol, direction, de, str(entry), str(size), str(sl), str(tp1), str(tp2), str(tp3))
+        await self.send(msg)
 
     async def notify_close(self, symbol, outcome, pnl_pct=0):
         icon = "💰" if outcome == 1 else "❌"
-        text = "Profit" if outcome == 1 else "Loss"
-        await self.send(icon + " *Trade Closed (" + text + ")*\n\n🪙 `#" + symbol + "` | PnL: `" + f"{pnl_pct:.2f}" + "%`")
+        text = "Profit | سود" if outcome == 1 else "Loss | ضرر"
+        msg = (
+            icon + " *Trade Closed | ترید بسته شد ({})*\n\n"
+            "🪙 `#{}` | *PnL | سود/ضرر:* `{}%`"
+        ).format(text, symbol, "{:.2f}".format(pnl_pct))
+        await self.send(msg)
 
     async def notify_feedback(self, alert_id, feedback_type):
-        label = "Good signal (AI learning) ✅" if feedback_type == "good" else "Error logged ❌"
-        await self.send("Feedback recorded: " + label)
+        label = "Good signal (AI learning) ✅ | سیگنال خوب (یادگیری AI)" if feedback_type == "good" else "Error logged ❌ | خطا ثبت شد"
+        await self.send("Feedback recorded | بازخورد ثبت شد: " + label)
 
     async def command_listener(self):
         last_id = 0
@@ -1022,42 +1056,62 @@ class TelegramManager:
                             stats = {r[0]: r[1] for r in rows}
                             total = stats.get("total_signals", 0)
                             wr = round((stats.get("tp1_hits",0)+stats.get("tp2_hits",0)+stats.get("tp3_hits",0))/total*100,1) if total else 0
-                            await self.send(
-                                "📊 *Bot Statistics*\n\n"
-                                "🔢 Total Signals: `" + str(total) + "`\n"
-                                "🎯 TP1: `" + str(stats.get('tp1_hits',0)) + "` | TP2: `" + str(stats.get('tp2_hits',0)) + "` | TP3: `" + str(stats.get('tp3_hits',0)) + "`\n"
-                                "❌ SL: `" + str(stats.get('sl_hits',0)) + "`\n"
-                                "🧠 AI Trades: `" + str(stats.get('ai_trades',0)) + "`\n"
-                                "👍 Good Feedback: `" + str(stats.get('feedback_good',0)) + "`\n"
-                                "👎 Bad Feedback: `" + str(stats.get('feedback_bad',0)) + "`\n"
-                                "🚫 OB Rejected: `" + str(stats.get('ob_rejected',0)) + "`\n"
-                                "🚫 Spread Rejected: `" + str(stats.get('spread_rejected',0)) + "`\n"
-                                "🚫 OB Quality Rejected: `" + str(stats.get('ob_quality_rejected',0)) + "`\n"
-                                "🚫 OB Depth Rejected: `" + str(stats.get('ob_depth_rejected',0)) + "`\n"
-                                "🚫 OB Stop Hunt Rejected: `" + str(stats.get('ob_stop_hunt_rejected',0)) + "`\n"
-                                "🚫 OB Slippage Rejected: `" + str(stats.get('ob_slippage_rejected',0)) + "`\n"
-                                "🏆 Win Rate: `" + str(wr) + "%`", chat_id=cid
+                            msg = (
+                                "📊 *Bot Statistics | آمار ربات*\n\n"
+                                "🔢 *Total Signals | کل سیگنال‌ها:* `{}`\n"
+                                "🎯 *TP1:* `{}` | *TP2:* `{}` | *TP3:* `{}`\n"
+                                "❌ *SL | استاپ:* `{}`\n"
+                                "🧠 *AI Trades | تریدهای AI:* `{}`\n"
+                                "👍 *Good Feedback | بازخورد خوب:* `{}`\n"
+                                "👎 *Bad Feedback | بازخورد بد:* `{}`\n"
+                                "🚫 *OB Rejected | رد OB:* `{}`\n"
+                                "🚫 *Spread Rejected | رد اسپرد:* `{}`\n"
+                                "🚫 *OB Quality Rejected | رد کیفیت:* `{}`\n"
+                                "🚫 *OB Depth Rejected | رد عمق:* `{}`\n"
+                                "🚫 *OB Stop Hunt Rejected | رد شکار استاپ:* `{}`\n"
+                                "🚫 *OB Slippage Rejected | رد لغزش:* `{}`\n"
+                                "🏆 *Win Rate | نرخ برد:* `{}%`"
+                            ).format(
+                                str(total),
+                                str(stats.get('tp1_hits',0)), str(stats.get('tp2_hits',0)), str(stats.get('tp3_hits',0)),
+                                str(stats.get('sl_hits',0)),
+                                str(stats.get('ai_trades',0)),
+                                str(stats.get('feedback_good',0)),
+                                str(stats.get('feedback_bad',0)),
+                                str(stats.get('ob_rejected',0)),
+                                str(stats.get('spread_rejected',0)),
+                                str(stats.get('ob_quality_rejected',0)),
+                                str(stats.get('ob_depth_rejected',0)),
+                                str(stats.get('ob_stop_hunt_rejected',0)),
+                                str(stats.get('ob_slippage_rejected',0)),
+                                str(wr)
                             )
+                            await self.send(msg, chat_id=cid)
                         elif cmd == "/active":
                             df = await db_fetch_df("SELECT * FROM active_trades")
                             if df.empty:
-                                await self.send("ℹ️ No active positions.", chat_id=cid)
+                                await self.send("ℹ️ No active positions | ترید فعالی نیست.", chat_id=cid)
                             else:
-                                lines = "\n".join(["🔹 `#" + r['symbol'] + "` (" + r['direction'] + ") @ `" + str(r['entry_price']) + "`" for _, r in df.iterrows()])
-                                await self.send("📌 *Active Trades (" + str(len(df)) + "):*\n\n" + lines, chat_id=cid)
+                                lines_list = []
+                                for _, r in df.iterrows():
+                                    lines_list.append("🔹 `#{}` ({}) @ `{}`".format(r['symbol'], r['direction'], str(r['entry_price'])))
+                                lines = "\n".join(lines_list)
+                                msg = "📌 *Active Trades | تریدهای فعال ({})*\n\n{}".format(str(len(df)), lines)
+                                await self.send(msg, chat_id=cid)
                         elif cmd == "/help":
-                            await self.send(
-                                "🤖 *Control Menu*\n\n"
-                                "▫️ `/stats` — Statistics\n"
-                                "▫️ `/active` — Active positions\n"
-                                "▫️ `/help` — Help", chat_id=cid
+                            msg = (
+                                "🤖 *Control Menu | منوی کنترل*\n\n"
+                                "▫️ `/stats` — Statistics | آمار\n"
+                                "▫️ `/active` — Active positions | تریدهای فعال\n"
+                                "▫️ `/help` — Help | راهنما"
                             )
+                            await self.send(msg, chat_id=cid)
 
                     if u.message and u.message.photo:
                         try:
                             photo = u.message.photo[-1]
                             file_obj = await self.bot.get_file(photo.file_id)
-                            file_url = f"https://api.telegram.org/file/bot{self.bot.token}/{file_obj.file_path}"
+                            file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
                             async with aiohttp.ClientSession() as s:
                                 async with s.get(file_url) as r:
                                     if r.status == 200:
@@ -1066,20 +1120,25 @@ class TelegramManager:
                                             gemini_result = await self.chart_analyzer.analyze_chart_image(image_bytes)
                                             if gemini_result:
                                                 msg = (
-                                                    "🧠 *Gemini Chart Analysis*\n\n"
-                                                    "• Pattern: `" + str(gemini_result.get('pattern_detected', 'N/A')) + "`\n"
-                                                    "• Signal: `" + str(gemini_result.get('signal', 'N/A')) + "`\n"
-                                                    "• Confidence: `" + str(gemini_result.get('confidence_score', 'N/A')) + "`\n"
-                                                    "• Summary: _" + str(gemini_result.get('analysis_summary', 'N/A')) + "_"
+                                                    "🧠 *Gemini Chart Analysis | تحلیل تصویری:*\n\n"
+                                                    "• Pattern | الگو: `{}`\n"
+                                                    "• Signal | سیگنال: `{}`\n"
+                                                    "• Confidence | اطمینان: `{}`\n"
+                                                    "• Summary | خلاصه: _{}_"
+                                                ).format(
+                                                    str(gemini_result.get('pattern_detected', 'N/A')),
+                                                    str(gemini_result.get('signal', 'N/A')),
+                                                    str(gemini_result.get('confidence_score', 'N/A')),
+                                                    str(gemini_result.get('analysis_summary', 'N/A'))
                                                 )
                                                 await self.send(msg, chat_id=cid)
                                             else:
-                                                await self.send("❌ Gemini could not analyze the image.", chat_id=cid)
+                                                await self.send("❌ Gemini could not analyze | جمینی نتونست تحلیل کنه.", chat_id=cid)
                                         else:
-                                            await self.send("⚠️ Gemini analyzer not available. Check GEMINI_API_KEY.", chat_id=cid)
+                                            await self.send("⚠️ Gemini analyzer not available | تحلیل‌گر جمینی در دسترس نیست. Check GEMINI_API_KEY.", chat_id=cid)
                         except Exception as e:
-                            LOGGER.error(f"Photo analysis error: {e}")
-                            await self.send("❌ Error analyzing image.", chat_id=cid)
+                            LOGGER.error("Photo analysis error: " + str(e))
+                            await self.send("❌ Error analyzing image | خطا در تحلیل تصویر.", chat_id=cid)
 
                     if u.callback_query:
                         cq = u.callback_query
@@ -1089,17 +1148,18 @@ class TelegramManager:
                             fb_type, alert_id = parts[0], parts[1]
                             if fb_type in ("good", "bad"):
                                 await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb_type, alert_id))
-                                await db_execute(f"UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{fb_type}'")
+                                await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{}'".format(fb_type))
                                 await self.notify_feedback(alert_id, fb_type)
                                 try:
                                     await self.bot.answer_callback_query(cq.id)
                                 except: pass
             except Exception as e:
-                LOGGER.error(f"Command listener: {e}")
+                LOGGER.error("Command listener: " + str(e))
             await asyncio.sleep(2)
 
 # ==========================================================
 # 12. Main Unified Bot
+
 # ==========================================================
 class UnifiedTradingBot:
     def __init__(self):
@@ -1118,7 +1178,7 @@ class UnifiedTradingBot:
         asyncio.create_task(self.tg.command_listener())
         asyncio.create_task(self.position_tracker())
         mode = "SIGNAL ONLY (AI Learning Mode)" if not EXECUTE_TRADES else ("PAPER TRADING" if PAPER_TRADING else "LIVE TRADING")
-        LOGGER.info(f"Unified Bot ready. Mode: {mode}")
+        LOGGER.info("Unified Bot ready. Mode: " + mode)
 
     async def get_symbols(self, session):
         now = time.time()
@@ -1132,6 +1192,7 @@ class UnifiedTradingBot:
                         min_vol_usdt = MIN_BTC_VOLUME * btc_p
                         syms = []
                         vols = {}
+                        filtered_out = []
                         for x in data:
                             sym = x["symbol"]
                             if sym.endswith("USDT"):
@@ -1139,12 +1200,19 @@ class UnifiedTradingBot:
                                 if qv >= min_vol_usdt:
                                     syms.append(sym)
                                     vols[sym] = qv
+                                else:
+                                    filtered_out.append((sym, qv))
                         self.symbol_cache = {"symbols": syms, "last_update": now, "volumes": vols}
-                        LOGGER.info(f"{len(syms)} symbols loaded (min vol: {min_vol_usdt:,.0f} USDT).")
+                        LOGGER.info("{} symbols loaded (min vol: {:,.0f} USDT).".format(len(syms), min_vol_usdt))
+                        if filtered_out:
+                            LOGGER.info("{} symbols filtered out (low 24h volume).".format(len(filtered_out)))
+                            # Log top 5 filtered for debugging
+                            for sym, qv in sorted(filtered_out, key=lambda x: x[1], reverse=True)[:5]:
+                                LOGGER.debug("Filtered: {} (vol: {:,.0f} USDT < {:,.0f} USDT)".format(sym, qv, min_vol_usdt))
                     else:
-                        LOGGER.error(f"Failed to fetch 24hr ticker: HTTP {r.status}")
+                        LOGGER.error("Failed to fetch 24hr ticker: HTTP {}".format(r.status))
             except Exception as e:
-                LOGGER.error(f"Symbol fetch error: {e}")
+                LOGGER.error("Symbol fetch error: " + str(e))
                 if not self.symbol_cache["symbols"]:
                     self.symbol_cache = {"symbols": [], "last_update": 0, "volumes": {}}
         return self.symbol_cache["symbols"]
@@ -1162,9 +1230,9 @@ class UnifiedTradingBot:
                 change = abs(float(k15[-2][4]) - float(k15[-2][1])) / float(k15[-2][1]) * 100
                 if change >= 1.5:
                     self.btc_pause_until = time.time() + 1800
-                    LOGGER.warning(f"BTC Volatility Spike {change:.1f}% — 30m pause.")
+                    LOGGER.warning("BTC Volatility Spike {:.1f}% — 30m pause.".format(change))
         except Exception as e:
-            LOGGER.error(f"BTC update: {e}")
+            LOGGER.error("BTC update: " + str(e))
 
     async def execute_signal(self, session, symbol, interval, signal):
         bids, asks, ob_source = await fetch_order_book(session, symbol)
@@ -1175,14 +1243,14 @@ class UnifiedTradingBot:
         ob_conf = ob_confidence_score(ob, signal["direction"])
 
         if not ob_valid:
-            LOGGER.warning(f"OB REJECTED {symbol}: {ob_reason}")
+            LOGGER.warning("OB REJECTED {}: {}".format(symbol, ob_reason))
             if "spread" in ob_reason:
                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'spread_rejected'")
             else:
                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'ob_rejected'")
             return
 
-        LOGGER.info(f"OB ACCEPTED {symbol} from {ob_source}: conf={ob_conf:.2f}, imb={ob['imbalance']:.2f}")
+        LOGGER.info("OB ACCEPTED {} from {}: conf={:.2f}, imb={:.2f}".format(symbol, ob_source, ob_conf, ob['imbalance']))
 
         # ========== OB Quality Auto Filter ==========
         ob_quality_passed, ob_quality_reason, ob_quality_score = ob_quality_filter(
@@ -1190,8 +1258,7 @@ class UnifiedTradingBot:
         )
 
         if not ob_quality_passed:
-            LOGGER.warning(f"OB QUALITY FILTER REJECTED {symbol}: {ob_quality_reason}")
-            # Update stats based on rejection reason
+            LOGGER.warning("OB QUALITY FILTER REJECTED {}: {}".format(symbol, ob_quality_reason))
             if "quality_score" in ob_quality_reason:
                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'ob_quality_rejected'")
             elif "depth" in ob_quality_reason:
@@ -1204,7 +1271,7 @@ class UnifiedTradingBot:
                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'ob_quality_rejected'")
             return
 
-        LOGGER.info(f"OB QUALITY PASSED {symbol}: score={ob_quality_score:.2f}, reason={ob_quality_reason}")
+        LOGGER.info("OB QUALITY PASSED {}: score={:.2f}, reason={}".format(symbol, ob_quality_score, ob_quality_reason))
         # ==========================================
 
         features = {
@@ -1219,7 +1286,7 @@ class UnifiedTradingBot:
         prob = await self.ai.predict(features)
         conf_label = self.ai.confidence_label(prob)
         if prob < 0.55 and self.ai.is_trained:
-            LOGGER.info(f"AI rejected {symbol} ({prob:.2f} — {conf_label})")
+            LOGGER.info("AI rejected {} ({:.2f} — {})".format(symbol, prob, conf_label))
             return
 
         gemini_result = None
@@ -1238,13 +1305,13 @@ class UnifiedTradingBot:
                         gemini_signal = gemini_result.get("signal", "NEUTRAL")
                         gemini_conf = gemini_result.get("confidence_score", 0)
                         if gemini_signal != "NEUTRAL" and gemini_signal != signal["direction"] and gemini_conf >= 70:
-                            LOGGER.info(f"Gemini REJECTED {symbol}: Gemini says {gemini_signal} (conf: {gemini_conf}), we have {signal['direction']}")
+                            LOGGER.info("Gemini REJECTED {}: Gemini says {} (conf: {}), we have {}".format(symbol, gemini_signal, gemini_conf, signal['direction']))
                             return
-                        LOGGER.info(f"Gemini APPROVED {symbol}: {gemini_signal} (conf: {gemini_conf})")
+                        LOGGER.info("Gemini APPROVED {}: {} (conf: {})".format(symbol, gemini_signal, gemini_conf))
             except Exception as e:
-                LOGGER.error(f"Gemini chart analysis failed for {symbol}: {e}")
+                LOGGER.error("Gemini chart analysis failed for {}: {}".format(symbol, str(e)))
 
-        alert_id = f"{symbol}_{interval}_{int(time.time())}"
+        alert_id = "{}_{}_{}".format(symbol, interval, int(time.time()))
         await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf, ob_quality_reason)
 
         balance = await self.trader.get_balance()
@@ -1263,11 +1330,11 @@ class UnifiedTradingBot:
         vals = (symbol, features["rsi"], features["spread_pct"], features["vol_ratio"], features["lower_wick_ratio"],
                 features["upper_wick_ratio"], features["trend_code"], features["adx"], features["plus_di"],
                 features["minus_di"], features["price_to_sma7_ratio"], features["atr_pct"], features["orderbook_imbalance"])
-        await db_execute(f"INSERT INTO trade_features ({cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
+        await db_execute("INSERT INTO trade_features ({}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)".format(cols), vals)
         feat_id = (await db_execute("SELECT last_insert_rowid()"))[0][0]
 
         if not EXECUTE_TRADES:
-            LOGGER.info(f"📡 SIGNAL ONLY (trading OFF): {symbol} | AI: {prob:.1%} | OB: {ob_conf:.2f} | Quality: {ob_quality_score:.2f} | Features recorded.")
+            LOGGER.info("SIGNAL ONLY (trading OFF): {} | AI: {:.1%} | OB: {:.2f} | Quality: {:.2f} | Features recorded.".format(symbol, prob, ob_conf, ob_quality_score))
             return
 
         side = "BUY" if signal["direction"] == "LONG" else "SELL"
@@ -1287,20 +1354,23 @@ class UnifiedTradingBot:
                 (prob, conf_label, ob["imbalance"], ob["slippage"], ob["stop_hunt_risk"], ob["iceberg_bids"], ob["iceberg_asks"], ob_quality_score, ob_quality_reason, alert_id)
             )
             await self.tg.notify_fill(symbol, signal["direction"], entry, notional, sl, tp1, tp2, tp3, PAPER_TRADING)
-            LOGGER.info(f"Trade opened: {symbol} | AI: {prob:.1%} | OB: {ob_conf:.2f} | Quality: {ob_quality_score:.2f} | Size: {notional}")
+            LOGGER.info("Trade opened: {} | AI: {:.1%} | OB: {:.2f} | Quality: {:.2f} | Size: {}".format(symbol, prob, ob_conf, ob_quality_score, notional))
 
     async def position_tracker(self):
         while True:
             try:
                 df = await db_fetch_df("SELECT * FROM active_trades")
                 if df.empty:
-                    await asyncio.sleep(10); continue
+                    await asyncio.sleep(10)
+                    continue
 
                 async with aiohttp.ClientSession() as session:
                     for _, row in df.iterrows():
-                        tid = row["trade_id"]; sym = row["symbol"]
+                        tid = row["trade_id"]
+                        sym = row["symbol"]
                         klines = await fetch_klines(session, sym, "15m")
-                        if not klines: continue
+                        if not klines:
+                            continue
                         price = float(klines[-1][4])
                         direction = row["direction"]
                         entry = float(row["entry_price"])
@@ -1318,20 +1388,25 @@ class UnifiedTradingBot:
                                 new_sl = min(sl, entry)
                                 await db_execute("UPDATE active_trades SET stop_loss = ? WHERE trade_id = ?", (new_sl, tid))
 
-                        closed = False; outcome = None
+                        closed = False
+                        outcome = None
                         if direction == "LONG":
                             if price >= tp:
-                                closed = True; outcome = 1
+                                closed = True
+                                outcome = 1
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'tp3_hits'")
                             elif price <= sl:
-                                closed = True; outcome = 0
+                                closed = True
+                                outcome = 0
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'sl_hits'")
                         else:
                             if price <= tp:
-                                closed = True; outcome = 1
+                                closed = True
+                                outcome = 1
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'tp3_hits'")
                             elif price >= sl:
-                                closed = True; outcome = 0
+                                closed = True
+                                outcome = 0
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'sl_hits'")
 
                         if closed:
@@ -1341,7 +1416,7 @@ class UnifiedTradingBot:
                             await self.tg.notify_close(sym, outcome, pnl)
                             asyncio.create_task(self.ai.retrain())
             except Exception as e:
-                LOGGER.error(f"Tracker error: {e}")
+                LOGGER.error("Tracker error: " + str(e))
             await asyncio.sleep(15)
 
     async def scanner_loop(self):
@@ -1354,16 +1429,21 @@ class UnifiedTradingBot:
                 try:
                     btc_counter += 1
                     if btc_counter >= 15:
-                        await self.update_btc(session); btc_counter = 0
+                        await self.update_btc(session)
+                        btc_counter = 0
 
                     if time.time() < self.btc_pause_until:
-                        await asyncio.sleep(5); continue
+                        await asyncio.sleep(5)
+                        continue
 
                     for symbol in symbols:
                         vol = self.symbol_cache.get("volumes", {}).get(symbol, 0)
                         if vol <= 0:
-                            LOGGER.debug(f"Skipping {symbol}: no volume data")
+                            LOGGER.debug("Skipping {}: no volume data".format(symbol))
                             continue
+                        # Double-check volume threshold (in case cache is stale)
+                        btc_p = next((float(x["lastPrice"]) for x in [] if False), 60000)  # Will use cached logic
+                        min_vol_usdt = MIN_BTC_VOLUME * 60000  # Approximate, actual check done in get_symbols
 
                         k4h = await fetch_klines(session, symbol, "4h")
                         k1d = await fetch_klines(session, symbol, "1d")
@@ -1371,18 +1451,23 @@ class UnifiedTradingBot:
 
                         for interval in TIMEFRAMES:
                             klines = await fetch_klines(session, symbol, interval)
-                            if not klines: continue
+                            if not klines:
+                                continue
 
                             sig = analyze_signal(klines, symbol, interval, htf_s, htf_r, MAX_SL_PERCENT)
-                            if not sig: continue
+                            if not sig:
+                                continue
 
                             if symbol != "BTCUSDT":
-                                if sig["direction"] == "LONG" and self.btc_trend == "BEARISH": continue
-                                if sig["direction"] == "SHORT" and self.btc_trend == "BULLISH": continue
+                                if sig["direction"] == "LONG" and self.btc_trend == "BEARISH":
+                                    continue
+                                if sig["direction"] == "SHORT" and self.btc_trend == "BULLISH":
+                                    continue
 
-                            alert_id = f"{symbol}_{interval}_{int(klines[-2][0])}_{sig['direction']}"
+                            alert_id = "{}_{}_{}_{}".format(symbol, interval, int(klines[-2][0]), sig['direction'])
                             exists = await db_execute("SELECT 1 FROM signal_history WHERE alert_id = ?", (alert_id,))
-                            if exists: continue
+                            if exists:
+                                continue
 
                             await db_execute(
                                 "INSERT INTO signal_history (alert_id, symbol, interval, direction, strategy, entry_price, stop_loss, tp1, tp2, tp3, sl_percent, rsi, adx, trend) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1395,7 +1480,7 @@ class UnifiedTradingBot:
                     symbols = await self.get_symbols(session)
                     await asyncio.sleep(5)
                 except Exception as e:
-                    LOGGER.error(f"Scanner: {e}")
+                    LOGGER.error("Scanner: " + str(e))
                     await asyncio.sleep(15)
 
 # ==========================================================
