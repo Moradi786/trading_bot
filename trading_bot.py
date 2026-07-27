@@ -1244,15 +1244,15 @@ class TelegramManager:
     async def analyze_user_chart(self, photo, chat_id):
         LOGGER.info("=" * 50)
         LOGGER.info("analyze_user_chart STARTED for chat_id={}".format(chat_id))
-
+        
         try:
             LOGGER.info("Step 1: Getting file from Telegram...")
             LOGGER.info("photo.file_id={}".format(photo.file_id))
             LOGGER.info("photo.file_size={}".format(getattr(photo, 'file_size', 'unknown')))
-
+            
             file_obj = await self.bot.get_file(photo.file_id)
             LOGGER.info("Step 1 OK: file_path={}".format(file_obj.file_path))
-
+            
             # Method 1: Use bot.download_file (v20+ compatible)
             LOGGER.info("Step 2: Downloading file...")
             try:
@@ -1311,10 +1311,10 @@ class TelegramManager:
                 try:
                     await db_execute(
                         "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
-                        ("USER_UPLOAD", 
-                         gemini_result.get("pattern_detected"), 
+                        ("USER_UPLOAD",
+                         gemini_result.get("pattern_detected"),
                          gemini_result.get("signal"),
-                         gemini_result.get("confidence_score"), 
+                         gemini_result.get("confidence_score"),
                          gemini_result.get("analysis_summary"))
                     )
                 except Exception as db_e:
@@ -1357,7 +1357,9 @@ class TelegramManager:
                     chat_id=chat_id
                 )
             except Exception as send_e:
-                LOGGER.error("Failed to send error message: {}".format(send_e))    async def command_listener(self):
+                LOGGER.error("Failed to send error message: {}".format(send_e))
+
+    async def command_listener(self):
         last_id = 0
         while True:
             try:
@@ -1482,31 +1484,8 @@ class TelegramManager:
                             )
                             await self.send(msg, chat_id=cid)
 
-                    # Handle photos - THIS IS THE CRITICAL PART
-                    if u.message:
-                        LOGGER.info("Message has photo={}".format(bool(u.message.photo)))
-                        LOGGER.info("Message has document={}".format(bool(u.message.document)))
-
-                        if u.message.photo:
-                            LOGGER.info("Photo detected! Count={}".format(len(u.message.photo)))
-                            LOGGER.info("Photo sizes: {}".format([p.file_size for p in u.message.photo]))
-                            # Use the largest photo (last one)
-                            photo = u.message.photo[-1]
-                            LOGGER.info("Selected photo: file_id={}, width={}, height={}, size={}".format(
-                                photo.file_id, photo.width, photo.height, photo.file_size
-                            ))
-                            await self.analyze_user_chart(photo, cid)
-                        elif u.message.document:
-                            LOGGER.info("Document detected: mime_type={}".format(u.message.document.mime_type))
-                            # Check if it's an image
-                            if u.message.document.mime_type and 'image' in u.message.document.mime_type:
-                                LOGGER.info("Document is an image, treating as photo")
-                                # Create a simple object with file_id
-                                class FakePhoto:
-                                    def __init__(self, file_id, file_size=0):
-                                        self.file_id = file_id
-                                        self.file_size = file_size
-                                await self.analyze_user_chart(FakePhoto(u.message.document.file_id, u.message.document.file_size), cid)
+                    if u.message and u.message.photo:
+                        await self.analyze_user_chart(u.message.photo[-1], cid)
 
                     if u.callback_query:
                         cq = u.callback_query
