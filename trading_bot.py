@@ -1111,12 +1111,18 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
 # 9. Telegram Manager (Signal Only + Feedback + Chart Analysis)
 # ==========================================================
 class TelegramManager:
-    def __init__(self, token, chat_id, chart_analyzer=None, ai_engine=None):
+    def __init__(self, token, chat_id, chart_analyzer=None, ai_engine=None, allowed_users=None):
         self.bot = Bot(token=token)
         self.chat_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
         self.sent_alerts = {}
         self.chart_analyzer = chart_analyzer
         self.ai_engine = ai_engine
+        self.allowed_users = allowed_users or []
+
+    def is_authorized(self, user_id):
+        if not self.allowed_users:
+            return True
+        return user_id in self.allowed_users
 
     async def send(self, text, reply_markup=None, chat_id=None, retries=3):
         target = chat_id if chat_id is not None else self.chat_id
@@ -1223,39 +1229,71 @@ class TelegramManager:
         await self.send("Feedback recorded | بازخورد ثبت شد: " + label)
 
     async def analyze_user_chart(self, photo, chat_id):
+        LOGGER.info("=" * 50)
+        LOGGER.info("analyze_user_chart STARTED for chat_id={}".format(chat_id))
+        LOGGER.info("photo type={}".format(type(photo)))
+        LOGGER.info("photo.file_id={}".format(getattr(photo, 'file_id', 'NO_FILE_ID')))
+        LOGGER.info("photo.file_size={}".format(getattr(photo, 'file_size', 'NO_SIZE')))
+        
         try:
+            LOGGER.info("Step 1: Getting file from Telegram...")
             file_obj = await self.bot.get_file(photo.file_id)
+            LOGGER.info("Step 1 OK: file_path={}".format(file_obj.file_path))
+            
             file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
+            LOGGER.info("Step 2: file_url built (len={})".format(len(file_url)))
+
+            if not self.chart_analyzer:
+                LOGGER.error("Step 2 FAILED: chart_analyzer is None!")
+                await self.send(
+                    "⚠️ *Chart analyzer not initialized | تحلیل‌گر چارت راه‌اندازی نشده*",
+                    chat_id=chat_id
+                )
+                return
+
+            if not self.chart_analyzer.client:
+                LOGGER.error("Step 2 FAILED: chart_analyzer.client is None!")
+                LOGGER.error("GEMINI_AVAILABLE={}".format(GEMINI_AVAILABLE))
+                LOGGER.error("GEMINI_API_KEY set={}".format(bool(os.getenv('GEMINI_API_KEY', ''))))
+                await self.send(
+                    "⚠️ *Gemini analyzer not available | تحلیل‌گر جمینی در دسترس نیست*\n\n"
+                    "Check GEMINI_API_KEY | کلید API رو چک کن",
+                    chat_id=chat_id
+                )
+                return
 
             async with aiohttp.ClientSession() as s:
-                async with s.get(file_url) as r:
+                LOGGER.info("Step 3: Downloading image from Telegram...")
+                async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    LOGGER.info("Step 3: HTTP status={}".format(r.status))
                     if r.status == 200:
                         image_bytes = await r.read()
-
-                        if not self.chart_analyzer or not self.chart_analyzer.client:
-                            await self.send(
-                                "⚠️ *Gemini analyzer not available | تحلیل‌گر جمینی در دسترس نیست*\n\n"
-                                "Check GEMINI_API_KEY | کلید API رو چک کن",
-                                chat_id=chat_id
-                            )
-                            return
-
+                        LOGGER.info("Step 3 OK: downloaded {} bytes".format(len(image_bytes)))
+                        
                         await self.send(
-                            "🧠 *Analyzing chart... | در حال تحلیل چارت...*",
+                            "🧠 *Analyzing chart... | در حال تحلیل چارت...*\n"
+                            "_Image size: {} bytes_".format(len(image_bytes)),
                             chat_id=chat_id
                         )
 
+                        LOGGER.info("Step 4: Calling Gemini API...")
                         gemini_result = await self.chart_analyzer.analyze_chart_image(image_bytes)
+                        LOGGER.info("Step 4: Gemini result={}".format(gemini_result))
 
                         if gemini_result:
-                            await db_execute(
-                                "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
-                                ("USER_UPLOAD", 
-                                 gemini_result.get("pattern_detected"), 
-                                 gemini_result.get("signal"),
-                                 gemini_result.get("confidence_score"), 
-                                 gemini_result.get("analysis_summary"))
-                            )
+                            LOGGER.info("Step 5: Saving to database...")
+                            try:
+                                await db_execute(
+                                    "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
+                                    ("USER_UPLOAD", 
+                                     gemini_result.get("pattern_detected"), 
+                                     gemini_result.get("signal"),
+                                     gemini_result.get("confidence_score"), 
+                                     gemini_result.get("analysis_summary"))
+                                )
+                                LOGGER.info("Step 5 OK: saved to DB")
+                            except Exception as db_e:
+                                LOGGER.error("Step 5 DB error: {}".format(db_e))
 
                             msg = (
                                 "🧠 *Gemini Chart Analysis | تحلیل تصویری چارت*\n\n"
@@ -1272,30 +1310,78 @@ class TelegramManager:
                                 str(gemini_result.get('analysis_summary', 'N/A'))
                             )
                         else:
-                            msg = "❌ *Analysis failed | تحلیل ناموفق*\n\nGemini could not analyze the image."
+                            LOGGER.error("Step 4 FAILED: Gemini returned None")
+                            msg = "❌ *Analysis failed | تحلیل ناموفق*\n\nGemini could not analyze the image.\n\nPossible reasons:\n• Image too large\n• API rate limit\n• Invalid API key"
 
+                        LOGGER.info("Step 6: Sending result to user...")
                         await self.send(msg, chat_id=chat_id)
-
+                        LOGGER.info("Step 6 OK")
+                    else:
+                        LOGGER.error("Step 3 FAILED: HTTP {}".format(r.status))
+                        await self.send(
+                            "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}".format(r.status),
+                            chat_id=chat_id
+                        )
+                        
         except Exception as e:
-            LOGGER.error("User chart analysis error: " + str(e))
-            await self.send(
-                "❌ *Error | خطا*\n\n"
-                "Could not analyze image | نمی‌تونم عکس رو تحلیل کنم",
-                chat_id=chat_id
-            )
+            LOGGER.error("=" * 50)
+            LOGGER.error("analyze_user_chart CRASHED!")
+            LOGGER.error("Error type: {}".format(type(e).__name__))
+            LOGGER.error("Error message: {}".format(str(e)))
+            import traceback
+            LOGGER.error("Traceback:\n{}".format(traceback.format_exc()))
+            LOGGER.error("=" * 50)
+            try:
+                await self.send(
+                    "❌ *Error | خطا*\n\n"
+                    "Could not analyze image | نمی‌تونم عکس رو تحلیل کنم\n\n"
+                    "Error: `{}`".format(str(e)[:100]),
+                    chat_id=chat_id
+                )
+            except Exception as send_e:
+                LOGGER.error("Failed to send error message: {}".format(send_e))
 
     async def command_listener(self):
         last_id = 0
+        LOGGER.info("Command listener started. Waiting for messages...")
         while True:
             try:
+                LOGGER.debug("Polling for updates... last_id={}".format(last_id))
                 updates = await self.bot.get_updates(offset=last_id + 1, timeout=5)
+                LOGGER.debug("Got {} updates".format(len(updates)))
+                
                 for u in updates:
                     last_id = u.update_id
-                    cid = u.message.chat_id if u.message else (u.callback_query.message.chat_id if u.callback_query else self.chat_id)
+                    LOGGER.info("Processing update_id={}".format(u.update_id))
 
+                    # Authorization check
+                    user_id = None
+                    if u.message and u.message.from_user:
+                        user_id = u.message.from_user.id
+                        LOGGER.info("Message from user_id={}".format(user_id))
+                    elif u.callback_query and u.callback_query.from_user:
+                        user_id = u.callback_query.from_user.id
+                        LOGGER.info("Callback from user_id={}".format(user_id))
+
+                    if user_id and not self.is_authorized(user_id):
+                        LOGGER.warning("Unauthorized access from user: {}".format(user_id))
+                        if u.message:
+                            try:
+                                await self.bot.send_message(
+                                    chat_id=u.message.chat_id, 
+                                    text="⛔ Access denied. You are not authorized to use this bot."
+                                )
+                            except: pass
+                        continue
+
+                    cid = u.message.chat_id if u.message else (u.callback_query.message.chat_id if u.callback_query else self.chat_id)
+                    LOGGER.info("Chat ID: {}".format(cid))
+
+                    # Handle text messages
                     if u.message and u.message.text:
                         cmd = u.message.text.strip().split("@")[0].lower()
                         parts = cmd.split()
+                        LOGGER.info("Text command: {}".format(parts[0]))
 
                         if parts[0] == "/stats":
                             rows = await db_execute("SELECT key, value FROM bot_stats")
@@ -1338,16 +1424,11 @@ class TelegramManager:
                                 outcome = 1 if result == "win" else 0
                                 fb_type = "good" if result == "win" else "bad"
 
-                                # Update signal_history feedback
                                 await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb_type, alert_id))
-
-                                # Update trade_features outcome
                                 await db_execute(
                                     "UPDATE trade_features SET outcome = ? WHERE id = (SELECT id FROM signal_history WHERE alert_id = ?)",
                                     (outcome, alert_id)
                                 )
-
-                                # Update stats
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{}'".format(fb_type))
 
                                 await self.send(
@@ -1358,7 +1439,6 @@ class TelegramManager:
                                     chat_id=cid
                                 )
 
-                                # Trigger AI retrain
                                 asyncio.create_task(self.ai_engine.retrain())
                             else:
                                 await self.send(
@@ -1390,13 +1470,38 @@ class TelegramManager:
                             )
                             await self.send(msg, chat_id=cid)
 
-                    if u.message and u.message.photo:
-                        await self.analyze_user_chart(u.message.photo[-1], cid)
+                    # Handle photos - THIS IS THE CRITICAL PART
+                    if u.message:
+                        LOGGER.info("Message has photo={}".format(bool(u.message.photo)))
+                        LOGGER.info("Message has document={}".format(bool(u.message.document)))
+                        
+                        if u.message.photo:
+                            LOGGER.info("Photo detected! Count={}".format(len(u.message.photo)))
+                            LOGGER.info("Photo sizes: {}".format([p.file_size for p in u.message.photo]))
+                            # Use the largest photo (last one)
+                            photo = u.message.photo[-1]
+                            LOGGER.info("Selected photo: file_id={}, width={}, height={}, size={}".format(
+                                photo.file_id, photo.width, photo.height, photo.file_size
+                            ))
+                            await self.analyze_user_chart(photo, cid)
+                        elif u.message.document:
+                            LOGGER.info("Document detected: mime_type={}".format(u.message.document.mime_type))
+                            # Check if it's an image
+                            if u.message.document.mime_type and 'image' in u.message.document.mime_type:
+                                LOGGER.info("Document is an image, treating as photo")
+                                # Create a simple object with file_id
+                                class FakePhoto:
+                                    def __init__(self, file_id):
+                                        self.file_id = file_id
+                                        self.file_size = 0
+                                await self.analyze_user_chart(FakePhoto(u.message.document.file_id), cid)
 
+                    # Handle callback queries
                     if u.callback_query:
                         cq = u.callback_query
                         data = cq.data or ""
                         parts = data.split("|")
+                        LOGGER.info("Callback query: data={}".format(data))
                         if len(parts) == 2:
                             fb_type, alert_id = parts[0], parts[1]
                             if fb_type in ("good", "bad"):
@@ -1410,14 +1515,15 @@ class TelegramManager:
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{}'".format(fb_type))
                                 await self.notify_feedback(alert_id, fb_type)
 
-                                # Trigger AI retrain
                                 asyncio.create_task(self.ai_engine.retrain())
 
                                 try:
                                     await self.bot.answer_callback_query(cq.id)
                                 except: pass
             except Exception as e:
-                LOGGER.error("Command listener: " + str(e))
+                LOGGER.error("Command listener error: {}".format(str(e)))
+                import traceback
+                LOGGER.error(traceback.format_exc())
             await asyncio.sleep(2)
 
 # ==========================================================
