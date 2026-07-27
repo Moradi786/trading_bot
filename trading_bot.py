@@ -1228,31 +1228,56 @@ class TelegramManager:
         label = "Good signal (AI learning) ✅ | سیگنال خوب (یادگیری AI)" if feedback_type == "good" else "Bad signal (AI learning) ❌ | سیگنال بد (یادگیری AI)"
         await self.send("Feedback recorded | بازخورد ثبت شد: " + label)
 
-    async def analyze_user_chart(self, photo, chat_id):
+        async def analyze_user_chart(self, photo, chat_id):
         LOGGER.info("=" * 50)
         LOGGER.info("analyze_user_chart STARTED for chat_id={}".format(chat_id))
-        LOGGER.info("photo type={}".format(type(photo)))
-        LOGGER.info("photo.file_id={}".format(getattr(photo, 'file_id', 'NO_FILE_ID')))
-        LOGGER.info("photo.file_size={}".format(getattr(photo, 'file_size', 'NO_SIZE')))
         
         try:
             LOGGER.info("Step 1: Getting file from Telegram...")
+            LOGGER.info("photo.file_id={}".format(photo.file_id))
+            LOGGER.info("photo.file_size={}".format(getattr(photo, 'file_size', 'unknown')))
+            
             file_obj = await self.bot.get_file(photo.file_id)
             LOGGER.info("Step 1 OK: file_path={}".format(file_obj.file_path))
             
-            file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
-            LOGGER.info("Step 2: file_url built (len={})".format(len(file_url)))
+            # Method 1: Use bot.download_file (v20+ compatible)
+            LOGGER.info("Step 2: Downloading file...")
+            try:
+                # In v20+, download_file returns bytes directly
+                file_bytes = await self.bot.download_file(file_obj.file_path, read_timeout=30)
+                if isinstance(file_bytes, bytes):
+                    image_bytes = file_bytes
+                else:
+                    # If it returns a file object, read it
+                    image_bytes = bytes(file_bytes)
+                LOGGER.info("Step 2 OK: downloaded {} bytes".format(len(image_bytes)))
+            except Exception as dl_e:
+                LOGGER.error("bot.download_file failed: {}".format(dl_e))
+                # Fallback: try aiohttp with correct URL
+                file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
+                LOGGER.info("Fallback URL: {}".format(file_url))
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                        LOGGER.info("Fallback HTTP status: {}".format(r.status))
+                        if r.status != 200:
+                            await self.send(
+                                "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}\n\nError: {}".format(r.status, str(dl_e)),
+                                chat_id=chat_id
+                            )
+                            return
+                        image_bytes = await r.read()
+                        LOGGER.info("Fallback OK: {} bytes".format(len(image_bytes)))
 
             if not self.chart_analyzer:
-                LOGGER.error("Step 2 FAILED: chart_analyzer is None!")
+                LOGGER.error("chart_analyzer is None!")
                 await self.send(
-                    "⚠️ *Chart analyzer not initialized | تحلیل‌گر چارت راه‌اندازی نشده*",
+                    "⚠️ *Analyzer not initialized | تحلیل‌گر راه‌اندازی نشده*",
                     chat_id=chat_id
                 )
                 return
 
             if not self.chart_analyzer.client:
-                LOGGER.error("Step 2 FAILED: chart_analyzer.client is None!")
+                LOGGER.error("chart_analyzer.client is None!")
                 LOGGER.error("GEMINI_AVAILABLE={}".format(GEMINI_AVAILABLE))
                 LOGGER.error("GEMINI_API_KEY set={}".format(bool(os.getenv('GEMINI_API_KEY', ''))))
                 await self.send(
@@ -1262,67 +1287,49 @@ class TelegramManager:
                 )
                 return
 
-            async with aiohttp.ClientSession() as s:
-                LOGGER.info("Step 3: Downloading image from Telegram...")
-                async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                    LOGGER.info("Step 3: HTTP status={}".format(r.status))
-                    if r.status == 200:
-                        image_bytes = await r.read()
-                        LOGGER.info("Step 3 OK: downloaded {} bytes".format(len(image_bytes)))
-                        
-                        await self.send(
-                            "🧠 *Analyzing chart... | در حال تحلیل چارت...*\n"
-                            "_Image size: {} bytes_".format(len(image_bytes)),
-                            chat_id=chat_id
-                        )
+            await self.send(
+                "🧠 *Analyzing chart... | در حال تحلیل چارت...*",
+                chat_id=chat_id
+            )
 
-                        LOGGER.info("Step 4: Calling Gemini API...")
-                        gemini_result = await self.chart_analyzer.analyze_chart_image(image_bytes)
-                        LOGGER.info("Step 4: Gemini result={}".format(gemini_result))
+            LOGGER.info("Step 3: Calling Gemini API with {} bytes...".format(len(image_bytes)))
+            gemini_result = await self.chart_analyzer.analyze_chart_image(image_bytes)
+            LOGGER.info("Step 3: Gemini result={}".format(gemini_result))
 
-                        if gemini_result:
-                            LOGGER.info("Step 5: Saving to database...")
-                            try:
-                                await db_execute(
-                                    "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
-                                    ("USER_UPLOAD", 
-                                     gemini_result.get("pattern_detected"), 
-                                     gemini_result.get("signal"),
-                                     gemini_result.get("confidence_score"), 
-                                     gemini_result.get("analysis_summary"))
-                                )
-                                LOGGER.info("Step 5 OK: saved to DB")
-                            except Exception as db_e:
-                                LOGGER.error("Step 5 DB error: {}".format(db_e))
+            if gemini_result:
+                try:
+                    await db_execute(
+                        "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
+                        ("USER_UPLOAD", 
+                         gemini_result.get("pattern_detected"), 
+                         gemini_result.get("signal"),
+                         gemini_result.get("confidence_score"), 
+                         gemini_result.get("analysis_summary"))
+                    )
+                except Exception as db_e:
+                    LOGGER.error("DB save error: {}".format(db_e))
 
-                            msg = (
-                                "🧠 *Gemini Chart Analysis | تحلیل تصویری چارت*\n\n"
-                                "📊 *Pattern Detected | الگوی شناسایی شده:*\n"
-                                "`{}`\n\n"
-                                "📈 *Signal | سیگنال:* `{}`\n\n"
-                                "🎯 *Confidence | اطمینان:* `{}%`\n\n"
-                                "📝 *Summary | خلاصه:*\n"
-                                "_{}_"
-                            ).format(
-                                str(gemini_result.get('pattern_detected', 'N/A')),
-                                str(gemini_result.get('signal', 'N/A')),
-                                str(gemini_result.get('confidence_score', 'N/A')),
-                                str(gemini_result.get('analysis_summary', 'N/A'))
-                            )
-                        else:
-                            LOGGER.error("Step 4 FAILED: Gemini returned None")
-                            msg = "❌ *Analysis failed | تحلیل ناموفق*\n\nGemini could not analyze the image.\n\nPossible reasons:\n• Image too large\n• API rate limit\n• Invalid API key"
+                msg = (
+                    "🧠 *Gemini Chart Analysis | تحلیل تصویری چارت*\n\n"
+                    "📊 *Pattern Detected | الگوی شناسایی شده:*\n"
+                    "`{}`\n\n"
+                    "📈 *Signal | سیگنال:* `{}`\n\n"
+                    "🎯 *Confidence | اطمینان:* `{}%`\n\n"
+                    "📝 *Summary | خلاصه:*\n"
+                    "_{}_"
+                ).format(
+                    str(gemini_result.get('pattern_detected', 'N/A')),
+                    str(gemini_result.get('signal', 'N/A')),
+                    str(gemini_result.get('confidence_score', 'N/A')),
+                    str(gemini_result.get('analysis_summary', 'N/A'))
+                )
+            else:
+                msg = "❌ *Analysis failed | تحلیل ناموفق*\n\nGemini could not analyze the image.\n\nPossible reasons:\n• Image format not supported\n• API rate limit\n• Invalid response from Gemini"
 
-                        LOGGER.info("Step 6: Sending result to user...")
-                        await self.send(msg, chat_id=chat_id)
-                        LOGGER.info("Step 6 OK")
-                    else:
-                        LOGGER.error("Step 3 FAILED: HTTP {}".format(r.status))
-                        await self.send(
-                            "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}".format(r.status),
-                            chat_id=chat_id
-                        )
-                        
+            LOGGER.info("Step 4: Sending result...")
+            await self.send(msg, chat_id=chat_id)
+            LOGGER.info("Step 4 OK")
+
         except Exception as e:
             LOGGER.error("=" * 50)
             LOGGER.error("analyze_user_chart CRASHED!")
@@ -1335,12 +1342,12 @@ class TelegramManager:
                 await self.send(
                     "❌ *Error | خطا*\n\n"
                     "Could not analyze image | نمی‌تونم عکس رو تحلیل کنم\n\n"
-                    "Error: `{}`".format(str(e)[:100]),
+                    "Error: `{}`".format(str(e)[:200]),
                     chat_id=chat_id
                 )
             except Exception as send_e:
                 LOGGER.error("Failed to send error message: {}".format(send_e))
-
+                
     async def command_listener(self):
         last_id = 0
         LOGGER.info("Command listener started. Waiting for messages...")
