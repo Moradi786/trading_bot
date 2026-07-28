@@ -297,7 +297,7 @@ async def fetch_klines(session, symbol, interval):
 # ==========================================================
 # 3b. Multi-Exchange Order Book
 # ==========================================================
-OB_# Note: Exchanges with None URLs will be skipped
+# Note: Exchanges with None URLs will be skipped
 EXCHANGES = [
     {
         "name": "Binance Futures",
