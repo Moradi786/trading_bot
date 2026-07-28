@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -57,6 +56,7 @@ MODEL_PATH = "ai_model.joblib"
 SCALER_PATH = "ai_scaler.joblib"
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+GOLD_SYMBOL = "PAXGUSDT"  # tokenized gold on Binance Futures, tracks XAU/USD
 MAX_SL_PERCENT = 2.0
 MIN_BTC_VOLUME = 1600.0
 MAX_SIGNAL_AGE = 600
@@ -1244,15 +1244,15 @@ class TelegramManager:
     async def analyze_user_chart(self, photo, chat_id):
         LOGGER.info("=" * 50)
         LOGGER.info("analyze_user_chart STARTED for chat_id={}".format(chat_id))
-        
+
         try:
             LOGGER.info("Step 1: Getting file from Telegram...")
             LOGGER.info("photo.file_id={}".format(photo.file_id))
             LOGGER.info("photo.file_size={}".format(getattr(photo, 'file_size', 'unknown')))
-            
+
             file_obj = await self.bot.get_file(photo.file_id)
             LOGGER.info("Step 1 OK: file_path={}".format(file_obj.file_path))
-            
+
             # Method 1: Use bot.download_file (v20+ compatible)
             LOGGER.info("Step 2: Downloading file...")
             try:
@@ -1311,10 +1311,10 @@ class TelegramManager:
                 try:
                     await db_execute(
                         "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
-                        ("USER_UPLOAD",
-                         gemini_result.get("pattern_detected"),
+                        ("USER_UPLOAD", 
+                         gemini_result.get("pattern_detected"), 
                          gemini_result.get("signal"),
-                         gemini_result.get("confidence_score"),
+                         gemini_result.get("confidence_score"), 
                          gemini_result.get("analysis_summary"))
                     )
                 except Exception as db_e:
@@ -1484,8 +1484,31 @@ class TelegramManager:
                             )
                             await self.send(msg, chat_id=cid)
 
-                    if u.message and u.message.photo:
-                        await self.analyze_user_chart(u.message.photo[-1], cid)
+                    # Handle photos - THIS IS THE CRITICAL PART
+                    if u.message:
+                        LOGGER.info("Message has photo={}".format(bool(u.message.photo)))
+                        LOGGER.info("Message has document={}".format(bool(u.message.document)))
+
+                        if u.message.photo:
+                            LOGGER.info("Photo detected! Count={}".format(len(u.message.photo)))
+                            LOGGER.info("Photo sizes: {}".format([p.file_size for p in u.message.photo]))
+                            # Use the largest photo (last one)
+                            photo = u.message.photo[-1]
+                            LOGGER.info("Selected photo: file_id={}, width={}, height={}, size={}".format(
+                                photo.file_id, photo.width, photo.height, photo.file_size
+                            ))
+                            await self.analyze_user_chart(photo, cid)
+                        elif u.message.document:
+                            LOGGER.info("Document detected: mime_type={}".format(u.message.document.mime_type))
+                            # Check if it's an image
+                            if u.message.document.mime_type and 'image' in u.message.document.mime_type:
+                                LOGGER.info("Document is an image, treating as photo")
+                                # Create a simple object with file_id
+                                class FakePhoto:
+                                    def __init__(self, file_id, file_size=0):
+                                        self.file_id = file_id
+                                        self.file_size = file_size
+                                await self.analyze_user_chart(FakePhoto(u.message.document.file_id, u.message.document.file_size), cid)
 
                     if u.callback_query:
                         cq = u.callback_query
@@ -1526,16 +1549,49 @@ class SignalBot:
         self.btc_pause_until = 0
         self.symbol_cache = {"symbols": [], "last_update": 0, "volumes": {}}
         self.check_interval = CHECK_INTERVAL_SECONDS
+        self.crypto_type_cache = {"coin_symbols": set(), "last_update": 0}
 
     async def start(self):
         await init_database()
         asyncio.create_task(self.tg.command_listener())
         LOGGER.info("Signal Bot ready. Mode: SIGNAL ONLY + AI Learning from Feedback")
 
+    async def get_coin_symbols(self, session) -> set:
+        """
+        Returns the set of symbols on Binance Futures whose underlyingType is "COIN"
+        (real crypto). Binance now also lists USDT-margined perpetuals on US stocks,
+        leveraged ETFs, and treasury products (e.g. underlyingType "INDEX"/"STOCK") —
+        this filters those out so the bot only ever considers actual crypto + gold.
+        Cached for 1 hour since this list changes rarely.
+        """
+        now = time.time()
+        if now - self.crypto_type_cache["last_update"] < 3600 and self.crypto_type_cache["coin_symbols"]:
+            return self.crypto_type_cache["coin_symbols"]
+        try:
+            url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+            async with session.get(url, timeout=15) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    coin_syms = set()
+                    for s in data.get("symbols", []):
+                        if s.get("underlyingType") == "COIN" and s.get("status") == "TRADING":
+                            coin_syms.add(s.get("symbol"))
+                    if coin_syms:
+                        self.crypto_type_cache = {"coin_symbols": coin_syms, "last_update": now}
+                        LOGGER.info("{} COIN-type symbols loaded from exchangeInfo (non-crypto perpetuals excluded).".format(len(coin_syms)))
+                    else:
+                        LOGGER.warning("exchangeInfo returned 0 COIN-type symbols; keeping previous cache.")
+                else:
+                    LOGGER.error("Failed to fetch exchangeInfo: HTTP {}".format(r.status))
+        except Exception as e:
+            LOGGER.error("exchangeInfo fetch error: " + str(e))
+        return self.crypto_type_cache["coin_symbols"]
+
     async def get_symbols(self, session):
         now = time.time()
         if now - self.symbol_cache["last_update"] > 300 or not self.symbol_cache["symbols"]:
             try:
+                coin_symbols = await self.get_coin_symbols(session)
                 url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
                 async with session.get(url, timeout=15) as r:
                     if r.status == 200:
@@ -1546,13 +1602,30 @@ class SignalBot:
                         vols = {}
                         for x in data:
                             sym = x["symbol"]
-                            if sym.endswith("USDT"):
-                                qv = float(x.get("quoteVolume", 0))
-                                if qv >= min_vol_usdt:
-                                    syms.append(sym)
-                                    vols[sym] = qv
+                            if not sym.endswith("USDT"):
+                                continue
+                            # Only real crypto (excludes US-stock/ETF/treasury perpetuals),
+                            # gold (PAXG) is allowed through separately below.
+                            if coin_symbols and sym not in coin_symbols and sym != GOLD_SYMBOL:
+                                continue
+                            qv = float(x.get("quoteVolume", 0))
+                            if qv >= min_vol_usdt:
+                                syms.append(sym)
+                                vols[sym] = qv
+
+                        # Always include gold (PAXG = tokenized gold, tracks XAU/USD),
+                        # even if it doesn't clear the crypto volume filter.
+                        if GOLD_SYMBOL not in syms:
+                            gold_row = next((x for x in data if x.get("symbol") == GOLD_SYMBOL), None)
+                            if gold_row:
+                                syms.append(GOLD_SYMBOL)
+                                vols[GOLD_SYMBOL] = float(gold_row.get("quoteVolume", 0))
+                                LOGGER.info("Gold ({}) added to symbol list.".format(GOLD_SYMBOL))
+                            else:
+                                LOGGER.warning("Gold symbol {} not found on Binance Futures ticker.".format(GOLD_SYMBOL))
+
                         self.symbol_cache = {"symbols": syms, "last_update": now, "volumes": vols}
-                        LOGGER.info("{} symbols loaded (min vol: {:,.0f} USDT).".format(len(syms), min_vol_usdt))
+                        LOGGER.info("{} symbols loaded (min vol: {:,.0f} USDT, crypto+gold only).".format(len(syms), min_vol_usdt))
                     else:
                         LOGGER.error("Failed to fetch 24hr ticker: HTTP {}".format(r.status))
             except Exception as e:
@@ -1721,7 +1794,7 @@ class SignalBot:
                             if not sig:
                                 continue
 
-                            if symbol != "BTCUSDT":
+                            if symbol != "BTCUSDT" and symbol != GOLD_SYMBOL:
                                 if sig["direction"] == "LONG" and self.btc_trend == "BEARISH":
                                     continue
                                 if sig["direction"] == "SHORT" and self.btc_trend == "BULLISH":
