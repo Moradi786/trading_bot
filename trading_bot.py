@@ -115,6 +115,14 @@ else:
 # استراتژی‌های مجاز — اگر خالی باشد همه مجازند
 ALLOWED_STRATEGIES_STR = os.getenv("ALLOWED_STRATEGIES", "")
 ALLOWED_STRATEGIES = [s.strip() for s in ALLOWED_STRATEGIES_STR.split(",") if s.strip()] if ALLOWED_STRATEGIES_STR else []
+# فیلتر حجم نسبت به بیت‌کوین (0 = غیرفعال، مثلاً 0.01 = حداقل ۱٪ حجم BTC)
+MIN_VOLUME_RATIO_TO_BTC = float(os.getenv("MIN_VOLUME_RATIO_TO_BTC", "0"))
+# حداقل حجم ۲۴ ساعته به دلار (0 = غیرفعال)
+MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "0"))
+# فیلتر RSI: سیگنال LONG فقط اگر RSI بالای این مقدار (0 = غیرفعال)
+MIN_RSI_LONG = float(os.getenv("MIN_RSI_LONG", "0"))
+# فیلتر RSI: سیگنال SHORT فقط اگر RSI پایین این مقدار (0 = غیرفعال)
+MAX_RSI_SHORT = float(os.getenv("MAX_RSI_SHORT", "0"))
 
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
