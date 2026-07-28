@@ -59,8 +59,7 @@ SCALER_PATH = "ai_scaler.joblib"
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 1200.0
-MAX_BTC_VOLUME = 1400.0
+MIN_BTC_VOLUME = 1600.0
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -74,6 +73,36 @@ OB_AUTO_FILTER_ENABLED = os.getenv("OB_AUTO_FILTER_ENABLED", "true").lower() == 
 OB_MIN_DEPTH_USDT = float(os.getenv("OB_MIN_DEPTH_USDT", "50000"))
 OB_MAX_STOP_HUNT_RISK = float(os.getenv("OB_MAX_STOP_HUNT_RISK", "0.6"))
 OB_MAX_SLIPPAGE_PCT = float(os.getenv("OB_MAX_SLIPPAGE_PCT", "0.3"))
+
+# ==========================================================
+# SIGNAL FILTERING CONFIG - فیلتر سیگنال‌ها
+# ==========================================================
+# حداکثر تعداد سیگنال در روز (0 = نامحدود)
+MAX_DAILY_SIGNALS = int(os.getenv("MAX_DAILY_SIGNALS", "10"))
+
+# حداقل AI Confidence برای ارسال سیگنال (0.0 تا 1.0)
+MIN_AI_CONFIDENCE = float(os.getenv("MIN_AI_CONFIDENCE", "0.60"))
+
+# تایم‌فریم‌های مجاز (با کاما جدا کنید، خالی = همه)
+ALLOWED_TIMEFRAMES_STR = os.getenv("ALLOWED_TIMEFRAMES", "")
+ALLOWED_TIMEFRAMES = [t.strip() for t in ALLOWED_TIMEFRAMES_STR.split(",") if t.strip()] if ALLOWED_TIMEFRAMES_STR else TIMEFRAMES
+
+# استراتژی‌های مجاز (با کاما جدا کنید، خالی = همه)
+# مثال: "RSI+DMI Breakout,HH/LL Breakout,Advanced Candle"
+ALLOWED_STRATEGIES_STR = os.getenv("ALLOWED_STRATEGIES", "")
+ALLOWED_STRATEGIES = [s.strip() for s in ALLOWED_STRATEGIES_STR.split(",") if s.strip()] if ALLOWED_STRATEGIES_STR else []
+
+# حداقل RSI برای سیگنال LONG (0 = غیرفعال)
+MIN_RSI_LONG = float(os.getenv("MIN_RSI_LONG", "30"))
+
+# حداکثر RSI برای سیگنال SHORT (0 = غیرفعال)
+MAX_RSI_SHORT = float(os.getenv("MAX_RSI_SHORT", "70"))
+
+# حداقل ADX برای سیگنال (0 = غیرفعال)
+MIN_ADX = float(os.getenv("MIN_ADX", "20"))
+
+# فقط سیگنال در جهت ترند BTC (true/false)
+FILTER_BTC_TREND = os.getenv("FILTER_BTC_TREND", "true").lower() == "true"
 
 # ==========================================================
 # SYMBOL FILTERING - فقط کریپتو و طلا
@@ -1584,6 +1613,10 @@ class SignalBot:
         self.btc_pause_until = 0
         self.symbol_cache = {"symbols": [], "last_update": 0, "volumes": {}}
         self.check_interval = CHECK_INTERVAL_SECONDS
+        # Signal filtering counters
+        self._daily_signals_count = 0
+        self._last_signal_date = ""
+        self._sent_signals_today = set()
 
     async def start(self):
         await init_database()
@@ -1713,6 +1746,32 @@ class SignalBot:
             return
 
         LOGGER.info("OB ACCEPTED {} from {}: conf={:.2f}, imb={:.2f}".format(symbol, ob_source, ob_conf, ob['imbalance']))
+        
+        # Filter: allowed strategies only
+        if ALLOWED_STRATEGIES:
+            signal_strategies = signal.get("strategy", "").split(" + ")
+            if not any(s in ALLOWED_STRATEGIES for s in signal_strategies):
+                LOGGER.info("Strategy filter rejected {}: {} not in allowed list".format(
+                    symbol, signal.get("strategy", "")))
+                return
+        
+        # Filter: RSI range check
+        if signal["direction"] == "LONG" and MIN_RSI_LONG > 0:
+            if signal["rsi"] < MIN_RSI_LONG:
+                LOGGER.info("RSI filter rejected LONG {}: RSI {:.1f} < {:.1f}".format(
+                    symbol, signal["rsi"], MIN_RSI_LONG))
+                return
+        if signal["direction"] == "SHORT" and MAX_RSI_SHORT > 0:
+            if signal["rsi"] > MAX_RSI_SHORT:
+                LOGGER.info("RSI filter rejected SHORT {}: RSI {:.1f} > {:.1f}".format(
+                    symbol, signal["rsi"], MAX_RSI_SHORT))
+                return
+        
+        # Filter: minimum ADX
+        if MIN_ADX > 0 and signal["adx"] < MIN_ADX:
+            LOGGER.info("ADX filter rejected {}: ADX {:.1f} < {:.1f}".format(
+                symbol, signal["adx"], MIN_ADX))
+            return
 
         ob_quality_passed, ob_quality_reason, ob_quality_score = ob_quality_filter(
             ob, signal["direction"], symbol, signal["entry_price"]
@@ -1751,6 +1810,12 @@ class SignalBot:
         base_prob = await self.ai.predict(features)
         prob = min(1.0, max(0.0, base_prob + mtf_adjustment))
         conf_label = self.ai.confidence_label(prob)
+        
+        # Filter: minimum AI confidence
+        if prob < MIN_AI_CONFIDENCE:
+            LOGGER.info("AI confidence too low for {}: {:.1%} < {:.1%} (min required)".format(
+                symbol, prob, MIN_AI_CONFIDENCE))
+            return
 
         if mtf_reasons:
             LOGGER.info("MTF {}: {} | Adjustment: {:+.2f}".format(symbol, ", ".join(mtf_reasons), mtf_adjustment))
@@ -1798,6 +1863,11 @@ class SignalBot:
             (alert_id, symbol, interval, signal["direction"], signal["strategy"], signal["entry_price"], signal["stop_loss"], signal["tp1"], signal["tp2"], signal["tp3"], signal["sl_percent"], signal["rsi"], signal["adx"], signal["trend"], prob, conf_label, ob["imbalance"], ob["slippage"], ob["stop_hunt_risk"], ob["iceberg_bids"], ob["iceberg_asks"], ob_quality_score, ob_quality_reason)
         )
         await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'total_signals'")
+        
+        # Increment daily counter
+        self._daily_signals_count += 1
+        self._sent_signals_today.add(symbol)
+        LOGGER.info("Daily signals: {}/{}".format(self._daily_signals_count, MAX_DAILY_SIGNALS if MAX_DAILY_SIGNALS > 0 else "unlimited"))
 
         LOGGER.info("SIGNAL SENT: {} | Strategy: {} | AI: {:.1%} (base: {:.1%}, mtf: {:+.1%}) | 4H: {} | 1H: {} | OB: {:.2f} | Quality: {:.2f} | Features recorded.".format(symbol, signal["strategy"], prob, base_prob if "base_prob" in dir() else prob, mtf_adjustment if "mtf_adjustment" in dir() else 0, h4_trend, h1_trend, ob_conf, ob_quality_score))
         
@@ -1805,6 +1875,12 @@ class SignalBot:
         if not hasattr(self, "_last_signal_time"):
             self._last_signal_time = {}
         self._last_signal_time[symbol] = time.time()
+        
+        # Check daily signal limit
+        if MAX_DAILY_SIGNALS > 0 and self._daily_signals_count >= MAX_DAILY_SIGNALS:
+            LOGGER.info("Daily signal limit reached ({}/{}). Skipping {}.".format(
+                self._daily_signals_count, MAX_DAILY_SIGNALS, symbol))
+            return
 
         await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf, ob_quality_reason)
 
@@ -1817,6 +1893,14 @@ class SignalBot:
             while True:
                 try:
                     btc_counter += 1
+                    
+                    # Reset daily signal counter
+                    today = time.strftime("%Y-%m-%d")
+                    if today != self._last_signal_date:
+                        self._daily_signals_count = 0
+                        self._sent_signals_today = set()
+                        self._last_signal_date = today
+                        LOGGER.info("New day - signal counter reset to 0")
                     if btc_counter >= 15:
                         await self.update_btc(session)
                         btc_counter = 0
@@ -1835,7 +1919,8 @@ class SignalBot:
                         k1d = await fetch_klines(session, symbol, "1d")
                         htf_s, htf_r = htf_sr(k4h, k1d)
 
-                        for interval in TIMEFRAMES:
+                        # Filter: allowed timeframes only
+                        for interval in ALLOWED_TIMEFRAMES:
                             klines = await fetch_klines(session, symbol, interval)
                             if not klines:
                                 continue
