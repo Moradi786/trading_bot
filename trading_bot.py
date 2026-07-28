@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -43,6 +42,7 @@ LOGGER = logging.getLogger("SignalBot")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
 
 # Allowed users (comma-separated Telegram IDs). Empty = allow all.
@@ -59,7 +59,7 @@ SCALER_PATH = "ai_scaler.joblib"
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
 MIN_BTC_VOLUME = 1500.0
-MAX_BTC_VOLUME = 1600.0
+MAX_BTC_VOLUME = 1900.0
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -73,6 +73,20 @@ OB_AUTO_FILTER_ENABLED = os.getenv("OB_AUTO_FILTER_ENABLED", "true").lower() == 
 OB_MIN_DEPTH_USDT = float(os.getenv("OB_MIN_DEPTH_USDT", "50000"))
 OB_MAX_STOP_HUNT_RISK = float(os.getenv("OB_MAX_STOP_HUNT_RISK", "0.6"))
 OB_MAX_SLIPPAGE_PCT = float(os.getenv("OB_MAX_SLIPPAGE_PCT", "0.3"))
+
+# ==========================================================
+# SYMBOL FILTERING - فقط کریپتو و طلا
+# ==========================================================
+# نمادهای طلا که از CoinMarketCap گرفته می‌شوند
+GOLD_SYMBOLS = ["PAXGUSDT", "XAUTUSDT"]
+
+# اگر ALLOWED_SYMBOLS خالی باشد = همه کریپتوها + طلا
+# اگر پر باشد = فقط این نمادها
+ALLOWED_SYMBOLS_STR = os.getenv("ALLOWED_SYMBOLS", "")
+if ALLOWED_SYMBOLS_STR:
+    ALLOWED_SYMBOLS = [s.strip().upper() for s in ALLOWED_SYMBOLS_STR.split(",") if s.strip()]
+else:
+    ALLOWED_SYMBOLS = []
 
 # ==========================================================
 # 1. Async Database
@@ -173,6 +187,14 @@ EXCHANGES = [
      "parser": lambda d: _parse_okx(d)}
 ]
 
+# Spot exchanges for PAXG and other gold tokens
+SPOT_EXCHANGES = [
+    {"name":"Binance Spot","weight":10,"limiter":binance_limiter,
+     "url":"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100",
+     "interval_map":{"15m":"15m","1h":"1h","4h":"4h","1d":"1d"},
+     "parser": lambda d: d if isinstance(d, list) else None}
+]
+
 def _parse_bybit(data):
     try:
         if data.get("retCode") != 0: return None
@@ -200,7 +222,14 @@ def validate_klines(klines, symbol):
     return True, "ok"
 
 async def fetch_klines(session, symbol, interval):
-    for ex in sorted(EXCHANGES, key=lambda x: x["weight"], reverse=True):
+    # اگر نماد طلا باشد، از Spot exchanges استفاده کن
+    if symbol in GOLD_SYMBOLS:
+        exchanges_to_try = SPOT_EXCHANGES
+        LOGGER.info("Using Spot API for {}".format(symbol))
+    else:
+        exchanges_to_try = EXCHANGES
+
+    for ex in sorted(exchanges_to_try, key=lambda x: x["weight"], reverse=True):
         try:
             await ex["limiter"].acquire()
             mi = ex["interval_map"].get(interval, interval)
@@ -211,9 +240,17 @@ async def fetch_klines(session, symbol, interval):
                     klines = ex["parser"](data)
                     if klines and len(klines) >= 50:
                         ok, _ = validate_klines(klines, symbol)
-                        if ok: return klines
-        except: pass
+                        if ok: 
+                            LOGGER.info("Klines for {} from {}: {} candles".format(symbol, ex['name'], len(klines)))
+                            return klines
+                elif r.status in [400, 451]:
+                    LOGGER.warning("{} not available on {}, trying next...".format(symbol, ex['name']))
+                    break
+        except Exception as e:
+            LOGGER.warning("Error fetching {} from {}: {}".format(symbol, ex['name'], str(e)))
         await asyncio.sleep(0.05)
+
+    LOGGER.error("All kline sources failed for {}".format(symbol))
     return None
 
 # ==========================================================
@@ -264,6 +301,16 @@ OB_EXCHANGES = [
     }
 ]
 
+# Spot OB exchanges for PAXG
+SPOT_OB_EXCHANGES = [
+    {
+        "name": "Binance Spot",
+        "limiter": binance_limiter,
+        "url": "https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}",
+        "parser": lambda d: (d.get("bids", []), d.get("asks", []))
+    }
+]
+
 def _parse_bybit_ob(data):
     try:
         if data.get("retCode") != 0: return [], []
@@ -300,7 +347,14 @@ def _parse_bitget_spot_ob(data):
     except: return [], []
 
 async def fetch_order_book(session, symbol, limit=50):
-    for ex in OB_EXCHANGES:
+    # اگر نماد طلا باشد، از Spot OB استفاده کن
+    if symbol in GOLD_SYMBOLS:
+        ob_to_try = SPOT_OB_EXCHANGES
+        LOGGER.info("Using Spot OB for {}".format(symbol))
+    else:
+        ob_to_try = OB_EXCHANGES
+
+    for ex in ob_to_try:
         for attempt in range(2):
             try:
                 await ex["limiter"].acquire()
@@ -319,9 +373,9 @@ async def fetch_order_book(session, symbol, limit=50):
             except Exception as e:
                 LOGGER.warning("{} OB error {} (attempt {}): {}".format(ex['name'], symbol, attempt+1, e))
             await asyncio.sleep(0.3)
+
     LOGGER.error("All OB sources failed for {}".format(symbol))
     return [], [], None
-
 # ==========================================================
 # 4. Order Book Quality Validator
 # ==========================================================
@@ -686,7 +740,6 @@ class OrderBookAnalyzer:
             "ask_depth": round(float(av20), 2),
             "source": "multi"
         }
-
 # ==========================================================
 # 7. AI Engine
 # ==========================================================
@@ -848,7 +901,6 @@ class AIEngine:
             LOGGER.error("Retrain error: " + str(e)); return False
         finally:
             self._training = False
-
 # ==========================================================
 # 8. Signal Analysis
 # ==========================================================
@@ -1163,15 +1215,21 @@ class TelegramManager:
 
         ob_filter_status = ""
         if ob_quality_status:
-            ob_filter_status = "\n🔍 *OB Auto Filter | فیلتر خودکار:* `{}`".format(ob_quality_status)
+            ob_filter_status = "
+🔍 *OB Auto Filter | فیلتر خودکار:* `{}`".format(ob_quality_status)
 
         gemini_text = ""
         if gemini_result:
             gemini_text = (
-                "\n🧠 *Gemini Vision Analysis | تحلیل تصویری:*\n"
-                "• Pattern | الگو: `{}`\n"
-                "• Signal | سیگنال: `{}`\n"
-                "• Confidence | اطمینان: `{}`\n"
+                "
+🧠 *Gemini Vision Analysis | تحلیل تصویری:*
+"
+                "• Pattern | الگو: `{}`
+"
+                "• Signal | سیگنال: `{}`
+"
+                "• Confidence | اطمینان: `{}`
+"
                 "• Summary | خلاصه: _{}_"
             ).format(
                 str(gemini_result.get('pattern_detected', 'N/A')),
@@ -1181,28 +1239,54 @@ class TelegramManager:
             )
 
         msg = (
-            "🚨 *NEW TRADING SIGNAL | سیگنال جدید ترید* 🚨\n\n"
-            "🪙 *Symbol | ارز:* `#{}`\n"
-            "📊 *Direction | جهت:* {} {}\n"
-            "🎯 *Strategy | استراتژی:* {} ({})\n"
-            "{} *AI Score | امتیاز AI:* `{}` Confidence | اطمینان\n"
-            "⏱️ *Timeframe | تایم‌فریم:* {}\n\n"
-            "💵 *Entry Price | قیمت ورود:* `{}`\n"
-            "🛡️ *Stop Loss | استاپ لاس:* `{}` (`{}%`)\n\n"
-            "🎯 *Take Profit Targets | اهداف سود:*\n"
-            "🔹 *TP1:* `{}`\n"
-            "🔹 *TP2:* `{}`\n"
-            "🔹 *TP3:* `{}`\n\n"
-            "📉 *RSI:* `{}` | *Trend | ترند:* `{}`\n"
+            "🚨 *NEW TRADING SIGNAL | سیگنال جدید ترید* 🚨
+
+"
+            "🪙 *Symbol | ارز:* `#{}`
+"
+            "📊 *Direction | جهت:* {} {}
+"
+            "🎯 *Strategy | استراتژی:* {} ({})
+"
+            "{} *AI Score | امتیاز AI:* `{}` Confidence | اطمینان
+"
+            "⏱️ *Timeframe | تایم‌فریم:* {}
+
+"
+            "💵 *Entry Price | قیمت ورود:* `{}`
+"
+            "🛡️ *Stop Loss | استاپ لاس:* `{}` (`{}%`)
+
+"
+            "🎯 *Take Profit Targets | اهداف سود:*
+"
+            "🔹 *TP1:* `{}`
+"
+            "🔹 *TP2:* `{}`
+"
+            "🔹 *TP3:* `{}`
+
+"
+            "📉 *RSI:* `{}` | *Trend | ترند:* `{}`
+"
             "🌐 *BTC Trend | ترند بیت‌کوین:* `{}`"
-            "{}\n\n"
-            "📖 *Order Book Microstructure | سفارشات کتاب:*\n"
-            "• Imbalance Ratio | نسبت عدم تعادل: `{}`\n"
-            "• Slippage | لغزش قیمت: `{}%`\n"
-            "• Stop Hunt Risk | ریسک شکار استاپ: `{}`\n"
-            "• Iceberg Bids/Asks | سفارشات یخی خرید/فروش: `{}` / `{}`\n"
-            "• Depth (Bid/Ask) | عمق بازار (خرید/فروش): `{:,.0f}` / `{:,.0f}`\n"
-            "• Source | منبع: `{}`\n"
+            "{}
+
+"
+            "📖 *Order Book Microstructure | سفارشات کتاب:*
+"
+            "• Imbalance Ratio | نسبت عدم تعادل: `{}`
+"
+            "• Slippage | لغزش قیمت: `{}%`
+"
+            "• Stop Hunt Risk | ریسک شکار استاپ: `{}`
+"
+            "• Iceberg Bids/Asks | سفارشات یخی خرید/فروش: `{}` / `{}`
+"
+            "• Depth (Bid/Ask) | عمق بازار (خرید/فروش): `{:,.0f}` / `{:,.0f}`
+"
+            "• Source | منبع: `{}`
+"
             "• OB Quality | کیفیت سفارشات: `{}`"
             "{}"
         ).format(
@@ -1273,7 +1357,9 @@ class TelegramManager:
                         LOGGER.info("Fallback HTTP status: {}".format(r.status))
                         if r.status != 200:
                             await self.send(
-                                "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}".format(r.status),
+                                "❌ *Download failed | دانلود ناموفق*
+
+HTTP {}".format(r.status),
                                 chat_id=chat_id
                             )
                             return
@@ -1293,7 +1379,9 @@ class TelegramManager:
                 LOGGER.error("GEMINI_AVAILABLE={}".format(GEMINI_AVAILABLE))
                 LOGGER.error("GEMINI_API_KEY set={}".format(bool(os.getenv('GEMINI_API_KEY', ''))))
                 await self.send(
-                    "⚠️ *Gemini analyzer not available | تحلیل‌گر جمینی در دسترس نیست*\n\n"
+                    "⚠️ *Gemini analyzer not available | تحلیل‌گر جمینی در دسترس نیست*
+
+"
                     "Check GEMINI_API_KEY | کلید API رو چک کن",
                     chat_id=chat_id
                 )
@@ -1322,12 +1410,22 @@ class TelegramManager:
                     LOGGER.error("DB save error: {}".format(db_e))
 
                 msg = (
-                    "🧠 *Gemini Chart Analysis | تحلیل تصویری چارت*\n\n"
-                    "📊 *Pattern Detected | الگوی شناسایی شده:*\n"
-                    "`{}`\n\n"
-                    "📈 *Signal | سیگنال:* `{}`\n\n"
-                    "🎯 *Confidence | اطمینان:* `{}%`\n\n"
-                    "📝 *Summary | خلاصه:*\n"
+                    "🧠 *Gemini Chart Analysis | تحلیل تصویری چارت*
+
+"
+                    "📊 *Pattern Detected | الگوی شناسایی شده:*
+"
+                    "`{}`
+
+"
+                    "📈 *Signal | سیگنال:* `{}`
+
+"
+                    "🎯 *Confidence | اطمینان:* `{}%`
+
+"
+                    "📝 *Summary | خلاصه:*
+"
                     "_{}_"
                 ).format(
                     str(gemini_result.get('pattern_detected', 'N/A')),
@@ -1336,7 +1434,14 @@ class TelegramManager:
                     str(gemini_result.get('analysis_summary', 'N/A'))
                 )
             else:
-                msg = "❌ *Analysis failed | تحلیل ناموفق*\n\nGemini could not analyze the image.\n\nPossible reasons:\n• Image format not supported\n• API rate limit\n• Invalid response from Gemini"
+                msg = "❌ *Analysis failed | تحلیل ناموفق*
+
+Gemini could not analyze the image.
+
+Possible reasons:
+• Image format not supported
+• API rate limit
+• Invalid response from Gemini"
 
             LOGGER.info("Step 4: Sending result...")
             await self.send(msg, chat_id=chat_id)
@@ -1348,17 +1453,24 @@ class TelegramManager:
             LOGGER.error("Error type: {}".format(type(e).__name__))
             LOGGER.error("Error message: {}".format(str(e)))
             import traceback
-            LOGGER.error("Traceback:\n{}".format(traceback.format_exc()))
+            LOGGER.error("Traceback:
+{}".format(traceback.format_exc()))
             LOGGER.error("=" * 50)
             try:
                 await self.send(
-                    "❌ *Error | خطا*\n\n"
-                    "Could not analyze image | نمی‌تونم عکس رو تحلیل کنم\n\n"
+                    "❌ *Error | خطا*
+
+"
+                    "Could not analyze image | نمی‌تونم عکس رو تحلیل کنم
+
+"
                     "Error: `{}`".format(str(e)[:200]),
                     chat_id=chat_id
                 )
             except Exception as send_e:
-                LOGGER.error("Failed to send error message: {}".format(send_e))    async def command_listener(self):
+                LOGGER.error("Failed to send error message: {}".format(send_e))
+
+    async def command_listener(self):
         last_id = 0
         while True:
             try:
@@ -1399,16 +1511,28 @@ class TelegramManager:
                             total_fb = good + bad
                             accuracy = round(good / total_fb * 100, 1) if total_fb > 0 else 0
                             msg = (
-                                "📊 *Bot Statistics | آمار ربات*\n\n"
-                                "🔢 *Total Signals | کل سیگنال‌ها:* `{}`\n"
-                                "👍 *Good Feedback | بازخورد خوب:* `{}`\n"
-                                "👎 *Bad Feedback | بازخورد بد:* `{}`\n"
-                                "🎯 *Accuracy | دقت:* `{}%`\n\n"
-                                "🚫 *OB Rejected | رد OB:* `{}`\n"
-                                "🚫 *Spread Rejected | رد اسپرد:* `{}`\n"
-                                "🚫 *OB Quality Rejected | رد کیفیت:* `{}`\n"
-                                "🚫 *OB Depth Rejected | رد عمق:* `{}`\n"
-                                "🚫 *OB Stop Hunt Rejected | رد شکار استاپ:* `{}`\n"
+                                "📊 *Bot Statistics | آمار ربات*
+
+"
+                                "🔢 *Total Signals | کل سیگنال‌ها:* `{}`
+"
+                                "👍 *Good Feedback | بازخورد خوب:* `{}`
+"
+                                "👎 *Bad Feedback | بازخورد بد:* `{}`
+"
+                                "🎯 *Accuracy | دقت:* `{}%`
+
+"
+                                "🚫 *OB Rejected | رد OB:* `{}`
+"
+                                "🚫 *Spread Rejected | رد اسپرد:* `{}`
+"
+                                "🚫 *OB Quality Rejected | رد کیفیت:* `{}`
+"
+                                "🚫 *OB Depth Rejected | رد عمق:* `{}`
+"
+                                "🚫 *OB Stop Hunt Rejected | رد شکار استاپ:* `{}`
+"
                                 "🚫 *OB Slippage Rejected | رد لغزش:* `{}`"
                             ).format(
                                 str(total),
@@ -1444,9 +1568,14 @@ class TelegramManager:
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{}'".format(fb_type))
 
                                 await self.send(
-                                    "✅ *Result recorded | نتیجه ثبت شد*\n\n"
-                                    "Alert ID: `{}`\n"
-                                    "Result: `{}`\n\n"
+                                    "✅ *Result recorded | نتیجه ثبت شد*
+
+"
+                                    "Alert ID: `{}`
+"
+                                    "Result: `{}`
+
+"
                                     "AI will learn from this feedback. | AI از این بازخورد یاد می‌گیره.".format(alert_id, result.upper()),
                                     chat_id=cid
                                 )
@@ -1455,30 +1584,46 @@ class TelegramManager:
                                 asyncio.create_task(self.ai_engine.retrain())
                             else:
                                 await self.send(
-                                    "❌ *Invalid result | نتیجه نامعتبر*\n\n"
+                                    "❌ *Invalid result | نتیجه نامعتبر*
+
+"
                                     "Usage: `/result ALERT_ID win` or `/result ALERT_ID loss`",
                                     chat_id=cid
                                 )
 
                         elif parts[0] == "/analyze":
                             msg = (
-                                "🖼️ *Chart Analysis | تحلیل چارت*\n\n"
-                                "▫️ عکس چارتت رو بفرست\n"
-                                "▫️ ربات خودکار تحلیل می‌کنه\n"
+                                "🖼️ *Chart Analysis | تحلیل چارت*
+
+"
+                                "▫️ عکس چارتت رو بفرست
+"
+                                "▫️ ربات خودکار تحلیل می‌کنه
+"
                                 "▫️ Gemini AI الگو رو تشخیص می‌ده"
                             )
                             await self.send(msg, chat_id=cid)
 
                         elif parts[0] == "/help":
                             msg = (
-                                "🤖 *Control Menu | منوی کنترل*\n\n"
-                                "▫️ `/stats` — Statistics | آمار\n"
-                                "▫️ `/result ALERT_ID win/loss` — Report result | گزارش نتیجه\n"
-                                "▫️ `/analyze` — Chart analysis | تحلیل چارت\n"
-                                "▫️ `/help` — Help | راهنما\n\n"
-                                "💡 *How to use | نحوه استفاده:*\n"
-                                "1. Wait for signal | منتظر سیگنال بمون\n"
-                                "2. Trade manually | خودت ترید کن\n"
+                                "🤖 *Control Menu | منوی کنترل*
+
+"
+                                "▫️ `/stats` — Statistics | آمار
+"
+                                "▫️ `/result ALERT_ID win/loss` — Report result | گزارش نتیجه
+"
+                                "▫️ `/analyze` — Chart analysis | تحلیل چارت
+"
+                                "▫️ `/help` — Help | راهنما
+
+"
+                                "💡 *How to use | نحوه استفاده:*
+"
+                                "1. Wait for signal | منتظر سیگنال بمون
+"
+                                "2. Trade manually | خودت ترید کن
+"
                                 "3. Report result with `/result` | نتیجه رو گزارش بده"
                             )
                             await self.send(msg, chat_id=cid)
@@ -1535,7 +1680,6 @@ class TelegramManager:
             except Exception as e:
                 LOGGER.error("Command listener: " + str(e))
             await asyncio.sleep(2)
-
 # ==========================================================
 # 10. Main Signal Bot
 # ==========================================================
@@ -1552,11 +1696,15 @@ class SignalBot:
     async def start(self):
         await init_database()
         asyncio.create_task(self.tg.command_listener())
-        LOGGER.info("Signal Bot ready. Mode: SIGNAL ONLY + AI Learning from Feedback")
+        LOGGER.info("Signal Bot ready. Mode: CRYPTO + PAXG GOLD ONLY + AI Learning from Feedback")
 
     async def get_symbols(self, session):
         now = time.time()
         if now - self.symbol_cache["last_update"] > 300 or not self.symbol_cache["symbols"]:
+            syms = []
+            vols = {}
+
+            # === ۱. گرفتن کریپتوها از Binance Futures ===
             try:
                 url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
                 async with session.get(url, timeout=15) as r:
@@ -1564,23 +1712,67 @@ class SignalBot:
                         data = await r.json()
                         btc_p = next((float(x["lastPrice"]) for x in data if x.get("symbol") == "BTCUSDT"), 60000)
                         min_vol_usdt = MIN_BTC_VOLUME * btc_p
-                        syms = []
-                        vols = {}
+
                         for x in data:
                             sym = x["symbol"]
-                            if sym.endswith("USDT"):
-                                qv = float(x.get("quoteVolume", 0))
-                                if qv >= min_vol_usdt:
-                                    syms.append(sym)
-                                    vols[sym] = qv
-                        self.symbol_cache = {"symbols": syms, "last_update": now, "volumes": vols}
-                        LOGGER.info("{} symbols loaded (min vol: {:,.0f} USDT).".format(len(syms), min_vol_usdt))
+                            # فقط کریپتوهای USDT
+                            if not sym.endswith("USDT"):
+                                continue
+
+                            # فیلتر نمادهای مجاز (اگر تنظیم شده باشد)
+                            if ALLOWED_SYMBOLS and sym not in ALLOWED_SYMBOLS:
+                                continue
+
+                            qv = float(x.get("quoteVolume", 0))
+                            if qv >= min_vol_usdt:
+                                syms.append(sym)
+                                vols[sym] = qv
+                        LOGGER.info("{} crypto symbols loaded from Binance.".format(len(syms)))
                     else:
-                        LOGGER.error("Failed to fetch 24hr ticker: HTTP {}".format(r.status))
+                        LOGGER.error("Failed to fetch Binance 24hr ticker: HTTP {}".format(r.status))
             except Exception as e:
-                LOGGER.error("Symbol fetch error: " + str(e))
-                if not self.symbol_cache["symbols"]:
-                    self.symbol_cache = {"symbols": [], "last_update": 0, "volumes": {}}
+                LOGGER.error("Binance symbol fetch error: " + str(e))
+
+            # === ۲. گرفتن PAX Gold از CoinMarketCap ===
+            if COINMARKETCAP_API_KEY:
+                try:
+                    cmc_url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+                    headers = {
+                        "X-CMC_PRO_API_KEY": COINMARKETCAP_API_KEY,
+                        "Accept": "application/json"
+                    }
+                    params = {
+                        "symbol": "PAXG",
+                        "convert": "USD"
+                    }
+                    async with session.get(cmc_url, headers=headers, params=params, timeout=15) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            paxg_data = data.get("data", {}).get("PAXG", {})
+                            quote = paxg_data.get("quote", {}).get("USD", {})
+                            price = quote.get("price", 0)
+                            volume_24h = quote.get("volume_24h", 0)
+
+                            if price > 0:
+                                paxg_symbol = "PAXGUSDT"
+                                if paxg_symbol not in syms:
+                                    # فقط اگر در لیست مجاز باشد یا لیست مجاز خالی باشد
+                                    if not ALLOWED_SYMBOLS or paxg_symbol in ALLOWED_SYMBOLS:
+                                        syms.append(paxg_symbol)
+                                        vols[paxg_symbol] = volume_24h
+                                        LOGGER.info("PAX Gold added from CMC: price=${:,.2f}, vol=${:,.0f}".format(price, volume_24h))
+                        else:
+                            LOGGER.warning("CMC API returned HTTP {}".format(r.status))
+                except Exception as e:
+                    LOGGER.error("CoinMarketCap PAXG fetch error: " + str(e))
+            else:
+                LOGGER.warning("COINMARKETCAP_API_KEY not set, skipping PAXG")
+
+            self.symbol_cache = {"symbols": syms, "last_update": now, "volumes": vols}
+            LOGGER.info("Total symbols loaded: {} (Crypto + PAXG Gold)".format(len(syms)))
+            if syms:
+                LOGGER.info("Symbols: {}".format(", ".join(syms[:10]) + ("..." if len(syms) > 10 else "")))
+
         return self.symbol_cache["symbols"]
 
     async def update_btc(self, session):
@@ -1601,6 +1793,11 @@ class SignalBot:
             LOGGER.error("BTC update: " + str(e))
 
     async def process_signal(self, session, symbol, interval, signal, h4_trend="NEUTRAL", h1_trend="NEUTRAL", h1_ob=[], h1_fvg=[], h1_liq=[]):
+        # فیلتر اضافی: فقط کریپتو و طلا
+        if not (symbol.endswith("USDT") or symbol.endswith("BUSD") or symbol in GOLD_SYMBOLS):
+            LOGGER.info("Skipping non-crypto/gold symbol: {}".format(symbol))
+            return
+
         bids, asks, ob_source = await fetch_order_book(session, symbol)
         ob = OrderBookAnalyzer.analyze(bids, asks, signal["entry_price"], signal["stop_loss"])
         ob["source"] = ob_source or "failed"
@@ -1725,8 +1922,13 @@ class SignalBot:
                         continue
 
                     for symbol in symbols:
+                        # دوباره چک کن که فقط کریپتو و طلا باشد
+                        if not (symbol.endswith("USDT") or symbol.endswith("BUSD") or symbol in GOLD_SYMBOLS):
+                            LOGGER.debug("Skipping non-crypto/gold: {}".format(symbol))
+                            continue
+
                         vol = self.symbol_cache.get("volumes", {}).get(symbol, 0)
-                        if vol <= 0:
+                        if vol <= 0 and symbol not in GOLD_SYMBOLS:
                             LOGGER.debug("Skipping {}: no volume data".format(symbol))
                             continue
 
@@ -1774,7 +1976,7 @@ class SignalBot:
 # 11. Web & Entry
 # ==========================================================
 async def health(request):
-    return web.Response(text="Signal Bot Running", status=200)
+    return web.Response(text="Signal Bot Running - Crypto + PAXG Gold Mode", status=200)
 
 async def main():
     app = web.Application()
