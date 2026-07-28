@@ -58,7 +58,7 @@ SCALER_PATH = "ai_scaler.joblib"
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 GOLD_SYMBOL = "PAXGUSDT"  # tokenized gold on Binance Futures, tracks XAU/USD
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 1600.0
+MIN_BTC_VOLUME = 1200.0
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
