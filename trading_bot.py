@@ -231,18 +231,34 @@ bitget_limiter = RateLimiter(rate=10, per=1)
 # Note: Exchanges with None URLs will be skipped
 EXCHANGES = [
     {"name":"Binance","weight":10,"limiter":binance_limiter,
-     "url": BINANCE_FUTURES_KLINES_URL + "?symbol={symbol}&interval={interval}&limit=100",
+     "url": (BINANCE_FUTURES_KLINES_URL + "?symbol={symbol}&interval={interval}&limit=100") if BINANCE_FUTURES_KLINES_URL else None,
      "interval_map":{"15m":"15m","1h":"1h","4h":"4h","1d":"1d"},
      "parser": lambda d: d if isinstance(d, list) else None},
     {"name":"Bybit","weight":8,"limiter":bybit_limiter,
-     "url": BYBIT_KLINES_URL + "?category=linear&symbol={symbol}&interval={interval}&limit=100",
+     "url": (BYBIT_KLINES_URL + "?category=linear&symbol={symbol}&interval={interval}&limit=100") if BYBIT_KLINES_URL else None,
      "interval_map":{"15m":"15","1h":"60","4h":"240","1d":"D"},
      "parser": lambda d: _parse_bybit(d)},
     {"name":"OKX","weight":8,"limiter":okx_limiter,
-     "url": OKX_KLINES_URL + "?instId={symbol}-SWAP&bar={interval}&limit=100",
+     "url": (OKX_KLINES_URL + "?instId={symbol}-SWAP&bar={interval}&limit=100") if OKX_KLINES_URL else None,
      "interval_map":{"15m":"15m","1h":"1H","4h":"4H","1d":"1D"},
      "parser": lambda d: _parse_okx(d)}
 ]
+
+# Klines exchanges (skip ones without URL)
+KLINES_EXCHANGES = [e for e in EXCHANGES if e.get("url")]
+
+# Spot exchanges for GOLD symbols (PAXGUSDT, XAUTUSDT)
+SPOT_EXCHANGES = [
+    {"name":"Binance Spot","weight":10,"limiter":binance_limiter,
+     "url": (BINANCE_SPOT_KLINES_URL + "?symbol={symbol}&interval={interval}&limit=100") if BINANCE_SPOT_KLINES_URL else None,
+     "interval_map":{"15m":"15m","1h":"1h","4h":"4h","1d":"1d"},
+     "parser": lambda d: d if isinstance(d, list) else None},
+    {"name":"Bybit Spot","weight":8,"limiter":bybit_limiter,
+     "url": (BYBIT_KLINES_URL + "?category=spot&symbol={symbol}&interval={interval}&limit=100") if BYBIT_KLINES_URL else None,
+     "interval_map":{"15m":"15","1h":"60","4h":"240","1d":"D"},
+     "parser": lambda d: _parse_bybit(d)},
+]
+SPOT_EXCHANGES = [e for e in SPOT_EXCHANGES if e.get("url")]
 
 def _parse_bybit(data):
     try:
@@ -276,7 +292,7 @@ async def fetch_klines(session, symbol, interval):
         exchanges_to_try = SPOT_EXCHANGES
         LOGGER.info("Using Spot API for {}".format(symbol))
     else:
-        exchanges_to_try = EXCHANGES
+        exchanges_to_try = KLINES_EXCHANGES
 
     for ex in sorted(exchanges_to_try, key=lambda x: x["weight"], reverse=True):
         try:
@@ -297,51 +313,62 @@ async def fetch_klines(session, symbol, interval):
 # ==========================================================
 # 3b. Multi-Exchange Order Book
 # ==========================================================
-# Note: Exchanges with None URLs will be skipped
+# Note: Exchanges with None URLs are skipped automatically (no crash)
+def _ob_url(base, suffix):
+    """Build order book URL; returns None if base URL is not set in .env"""
+    return (base + suffix) if base else None
+
 EXCHANGES = [
     {
         "name": "Binance Futures",
         "limiter": binance_limiter,
-        "url": BINANCE_FUTURES_DEPTH_URL + "?symbol={symbol}&limit={limit}",
+        "url": _ob_url(BINANCE_FUTURES_DEPTH_URL, "?symbol={symbol}&limit={limit}"),
         "parser": lambda d: (d.get("bids", []), d.get("asks", []))
     },
     {
         "name": "Binance Spot",
         "limiter": binance_limiter,
-        "url": BINANCE_SPOT_DEPTH_URL + "?symbol={symbol}&limit={limit}",
+        "url": _ob_url(BINANCE_SPOT_DEPTH_URL, "?symbol={symbol}&limit={limit}"),
         "parser": lambda d: (d.get("bids", []), d.get("asks", []))
     },
     {
         "name": "Bybit Linear",
         "limiter": bybit_limiter,
-        "url": BYBIT_DEPTH_URL + "?category=linear&symbol={symbol}&limit={limit}",
+        "url": _ob_url(BYBIT_DEPTH_URL, "?category=linear&symbol={symbol}&limit={limit}"),
         "parser": lambda d: _parse_bybit_ob(d)
     },
     {
         "name": "Bybit Spot",
         "limiter": bybit_limiter,
-        "url": BYBIT_DEPTH_URL + "?category=spot&symbol={symbol}&limit={limit}",
+        "url": _ob_url(BYBIT_DEPTH_URL, "?category=spot&symbol={symbol}&limit={limit}"),
         "parser": lambda d: _parse_bybit_ob(d)
     },
     {
         "name": "OKX",
         "limiter": okx_limiter,
-        "url": OKX_DEPTH_URL + "?instId={symbol}-SWAP&sz={limit}",
+        "url": _ob_url(OKX_DEPTH_URL, "?instId={symbol}-SWAP&sz={limit}"),
         "parser": lambda d: _parse_okx_ob(d)
     },
     {
         "name": "Bitget Futures",
         "limiter": bitget_limiter,
-        "url": BITGET_FUTURES_DEPTH_URL + "?symbol={symbol}_UMCBL&limit={limit}&productType=USDT-FUTURES",
+        "url": _ob_url(BITGET_FUTURES_DEPTH_URL, "?symbol={symbol}_UMCBL&limit={limit}&productType=USDT-FUTURES"),
         "parser": lambda d: _parse_bitget_ob(d)
     },
     {
         "name": "Bitget Spot",
         "limiter": bitget_limiter,
-        "url": BITGET_SPOT_DEPTH_URL + "?symbol={symbol}&limit={limit}&type=step0",
+        "url": _ob_url(BITGET_SPOT_DEPTH_URL, "?symbol={symbol}&limit={limit}&type=step0"),
         "parser": lambda d: _parse_bitget_spot_ob(d)
     }
 ]
+
+# Skip exchanges without URL - never crash because of missing .env URLs
+EXCHANGES = [e for e in EXCHANGES if e["url"]]
+# Futures OB exchanges (crypto) and Spot OB exchanges (gold)
+OB_EXCHANGES = [e for e in EXCHANGES if "Spot" not in e["name"]]
+SPOT_OB_EXCHANGES = [e for e in EXCHANGES if "Spot" in e["name"]]
+LOGGER.info("Order book exchanges active: {}".format(", ".join(e["name"] for e in EXCHANGES)))
 
 def _parse_bybit_ob(data):
     try:
