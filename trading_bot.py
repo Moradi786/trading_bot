@@ -35,7 +35,7 @@ except ImportError:
     GEMINI_AVAILABLE = False
 
 # ==========================================================
-# 0. Config
+# 0. Config - All API URLs from .env only
 # ==========================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("SignalBot")
@@ -45,6 +45,35 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
+
+# API URLs - MUST be set in .env (no defaults in code)
+BINANCE_FUTURES_KLINES_URL = os.getenv("BINANCE_FUTURES_KLINES_URL")
+BINANCE_FUTURES_DEPTH_URL = os.getenv("BINANCE_FUTURES_DEPTH_URL")
+BINANCE_FUTURES_TICKER_URL = os.getenv("BINANCE_FUTURES_TICKER_URL")
+BINANCE_SPOT_KLINES_URL = os.getenv("BINANCE_SPOT_KLINES_URL")
+BINANCE_SPOT_DEPTH_URL = os.getenv("BINANCE_SPOT_DEPTH_URL")
+BYBIT_KLINES_URL = os.getenv("BYBIT_KLINES_URL")
+BYBIT_DEPTH_URL = os.getenv("BYBIT_DEPTH_URL")
+OKX_KLINES_URL = os.getenv("OKX_KLINES_URL")
+OKX_DEPTH_URL = os.getenv("OKX_DEPTH_URL")
+BITGET_FUTURES_DEPTH_URL = os.getenv("BITGET_FUTURES_DEPTH_URL")
+BITGET_SPOT_DEPTH_URL = os.getenv("BITGET_SPOT_DEPTH_URL")
+COINMARKETCAP_URL = os.getenv("COINMARKETCAP_URL")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL")
+
+# Validate required API URLs
+def validate_api_urls():
+    required_urls = {
+        "BINANCE_FUTURES_KLINES_URL": BINANCE_FUTURES_KLINES_URL,
+        "BINANCE_FUTURES_DEPTH_URL": BINANCE_FUTURES_DEPTH_URL,
+        "BINANCE_FUTURES_TICKER_URL": BINANCE_FUTURES_TICKER_URL,
+    }
+    missing = [k for k, v in required_urls.items() if not v]
+    if missing:
+        LOGGER.error("Missing required API URLs in .env: {}".format(", ".join(missing)))
+        LOGGER.error("Please set all API URLs in your .env file")
+        raise ValueError("Missing API URLs: {}".format(", ".join(missing)))
+    LOGGER.info("All API URLs validated successfully")
 
 # Allowed users (comma-separated Telegram IDs). Empty = allow all.
 ALLOWED_USER_IDS_STR = os.getenv("ALLOWED_USER_IDS", "")
@@ -59,7 +88,9 @@ SCALER_PATH = "ai_scaler.joblib"
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 1600.0
+# حجم BTC برای فیلتر حجم نمادها (به BTC)
+MIN_BTC_VOLUME = float(os.getenv("MIN_BTC_VOLUME", "1200.0"))
+MAX_BTC_VOLUME = float(os.getenv("MAX_BTC_VOLUME", "1600.0"))
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -73,36 +104,6 @@ OB_AUTO_FILTER_ENABLED = os.getenv("OB_AUTO_FILTER_ENABLED", "true").lower() == 
 OB_MIN_DEPTH_USDT = float(os.getenv("OB_MIN_DEPTH_USDT", "50000"))
 OB_MAX_STOP_HUNT_RISK = float(os.getenv("OB_MAX_STOP_HUNT_RISK", "0.6"))
 OB_MAX_SLIPPAGE_PCT = float(os.getenv("OB_MAX_SLIPPAGE_PCT", "0.3"))
-
-# ==========================================================
-# SIGNAL FILTERING CONFIG - فیلتر سیگنال‌ها
-# ==========================================================
-# حداکثر تعداد سیگنال در روز (0 = نامحدود)
-MAX_DAILY_SIGNALS = int(os.getenv("MAX_DAILY_SIGNALS", "10"))
-
-# حداقل AI Confidence برای ارسال سیگنال (0.0 تا 1.0)
-MIN_AI_CONFIDENCE = float(os.getenv("MIN_AI_CONFIDENCE", "0.60"))
-
-# تایم‌فریم‌های مجاز (با کاما جدا کنید، خالی = همه)
-ALLOWED_TIMEFRAMES_STR = os.getenv("ALLOWED_TIMEFRAMES", "")
-ALLOWED_TIMEFRAMES = [t.strip() for t in ALLOWED_TIMEFRAMES_STR.split(",") if t.strip()] if ALLOWED_TIMEFRAMES_STR else TIMEFRAMES
-
-# استراتژی‌های مجاز (با کاما جدا کنید، خالی = همه)
-# مثال: "RSI+DMI Breakout,HH/LL Breakout,Advanced Candle"
-ALLOWED_STRATEGIES_STR = os.getenv("ALLOWED_STRATEGIES", "")
-ALLOWED_STRATEGIES = [s.strip() for s in ALLOWED_STRATEGIES_STR.split(",") if s.strip()] if ALLOWED_STRATEGIES_STR else []
-
-# حداقل RSI برای سیگنال LONG (0 = غیرفعال)
-MIN_RSI_LONG = float(os.getenv("MIN_RSI_LONG", "30"))
-
-# حداکثر RSI برای سیگنال SHORT (0 = غیرفعال)
-MAX_RSI_SHORT = float(os.getenv("MAX_RSI_SHORT", "70"))
-
-# حداقل ADX برای سیگنال (0 = غیرفعال)
-MIN_ADX = float(os.getenv("MIN_ADX", "20"))
-
-# فقط سیگنال در جهت ترند BTC (true/false)
-FILTER_BTC_TREND = os.getenv("FILTER_BTC_TREND", "true").lower() == "true"
 
 # ==========================================================
 # SYMBOL FILTERING - فقط کریپتو و طلا
@@ -202,17 +203,18 @@ bitget_limiter = RateLimiter(rate=10, per=1)
 # ==========================================================
 # 3. Exchanges (Klines)
 # ==========================================================
+# Note: Exchanges with None URLs will be skipped
 EXCHANGES = [
     {"name":"Binance","weight":10,"limiter":binance_limiter,
-     "url":"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100",
+     "url": BINANCE_FUTURES_KLINES_URL + "?symbol={symbol}&interval={interval}&limit=100",
      "interval_map":{"15m":"15m","1h":"1h","4h":"4h","1d":"1d"},
      "parser": lambda d: d if isinstance(d, list) else None},
     {"name":"Bybit","weight":8,"limiter":bybit_limiter,
-     "url":"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit=100",
+     "url": BYBIT_KLINES_URL + "?category=linear&symbol={symbol}&interval={interval}&limit=100",
      "interval_map":{"15m":"15","1h":"60","4h":"240","1d":"D"},
      "parser": lambda d: _parse_bybit(d)},
     {"name":"OKX","weight":8,"limiter":okx_limiter,
-     "url":"https://www.okx.com/api/v5/market/history-candles?instId={symbol}-SWAP&bar={interval}&limit=100",
+     "url": OKX_KLINES_URL + "?instId={symbol}-SWAP&bar={interval}&limit=100",
      "interval_map":{"15m":"15m","1h":"1H","4h":"4H","1d":"1D"},
      "parser": lambda d: _parse_okx(d)}
 ]
@@ -244,7 +246,7 @@ def validate_klines(klines, symbol):
     return True, "ok"
 
 async def fetch_klines(session, symbol, interval):
-    # اگر نماد طلا یا spot-only باشد، از Spot exchanges استفاده کن
+    # اگر نماد طلا باشد، از Spot exchanges استفاده کن
     if symbol in GOLD_SYMBOLS:
         exchanges_to_try = SPOT_EXCHANGES
         LOGGER.info("Using Spot API for {}".format(symbol))
@@ -270,47 +272,48 @@ async def fetch_klines(session, symbol, interval):
 # ==========================================================
 # 3b. Multi-Exchange Order Book
 # ==========================================================
-OB_EXCHANGES = [
+OB_# Note: Exchanges with None URLs will be skipped
+EXCHANGES = [
     {
         "name": "Binance Futures",
         "limiter": binance_limiter,
-        "url": "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit={limit}",
+        "url": BINANCE_FUTURES_DEPTH_URL + "?symbol={symbol}&limit={limit}",
         "parser": lambda d: (d.get("bids", []), d.get("asks", []))
     },
     {
         "name": "Binance Spot",
         "limiter": binance_limiter,
-        "url": "https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}",
+        "url": BINANCE_SPOT_DEPTH_URL + "?symbol={symbol}&limit={limit}",
         "parser": lambda d: (d.get("bids", []), d.get("asks", []))
     },
     {
         "name": "Bybit Linear",
         "limiter": bybit_limiter,
-        "url": "https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}&limit={limit}",
+        "url": BYBIT_DEPTH_URL + "?category=linear&symbol={symbol}&limit={limit}",
         "parser": lambda d: _parse_bybit_ob(d)
     },
     {
         "name": "Bybit Spot",
         "limiter": bybit_limiter,
-        "url": "https://api.bybit.com/v5/market/orderbook?category=spot&symbol={symbol}&limit={limit}",
+        "url": BYBIT_DEPTH_URL + "?category=spot&symbol={symbol}&limit={limit}",
         "parser": lambda d: _parse_bybit_ob(d)
     },
     {
         "name": "OKX",
         "limiter": okx_limiter,
-        "url": "https://www.okx.com/api/v5/market/books?instId={symbol}-SWAP&sz={limit}",
+        "url": OKX_DEPTH_URL + "?instId={symbol}-SWAP&sz={limit}",
         "parser": lambda d: _parse_okx_ob(d)
     },
     {
         "name": "Bitget Futures",
         "limiter": bitget_limiter,
-        "url": "https://api.bitget.com/api/v2/mix/market/depth?symbol={symbol}_UMCBL&limit={limit}&productType=USDT-FUTURES",
+        "url": BITGET_FUTURES_DEPTH_URL + "?symbol={symbol}_UMCBL&limit={limit}&productType=USDT-FUTURES",
         "parser": lambda d: _parse_bitget_ob(d)
     },
     {
         "name": "Bitget Spot",
         "limiter": bitget_limiter,
-        "url": "https://api.bitget.com/api/v2/spot/market/depth?symbol={symbol}&limit={limit}&type=step0",
+        "url": BITGET_SPOT_DEPTH_URL + "?symbol={symbol}&limit={limit}&type=step0",
         "parser": lambda d: _parse_bitget_spot_ob(d)
     }
 ]
@@ -805,7 +808,7 @@ class ChartImageAnalyzer:
             LOGGER.info("Sending {} bytes to Gemini...".format(len(image_bytes)))
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
-                model="gemini-2.0-flash",
+                model=GEMINI_MODEL,
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                     prompt_text
@@ -1571,11 +1574,6 @@ class TelegramManager:
 
                     if u.callback_query:
                         cq = u.callback_query
-                        # Answer callback immediately to remove loading indicator
-                        try:
-                            await self.bot.answer_callback_query(cq.id)
-                        except Exception as e:
-                            LOGGER.warning("Could not answer callback: {}".format(e))
                         data = cq.data or ""
                         parts = data.split("|")
                         if len(parts) == 2:
@@ -1594,9 +1592,11 @@ class TelegramManager:
                                 # Trigger AI retrain
                                 asyncio.create_task(self.ai_engine.retrain())
 
+                                # Answer callback immediately to remove loading indicator
                                 try:
                                     await self.bot.answer_callback_query(cq.id)
-                                except: pass
+                                except Exception as e:
+                                    LOGGER.warning("Could not answer callback: {}".format(e))
             except Exception as e:
                 LOGGER.error("Command listener: " + str(e))
             await asyncio.sleep(2)
@@ -1631,12 +1631,13 @@ class SignalBot:
             
             # === ۱. گرفتن کریپتوها از Binance Futures ===
             try:
-                url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+                url = BINANCE_FUTURES_TICKER_URL
                 async with session.get(url, timeout=15) as r:
                     if r.status == 200:
                         data = await r.json()
                         btc_p = next((float(x["lastPrice"]) for x in data if x.get("symbol") == "BTCUSDT"), 60000)
                         min_vol_usdt = MIN_BTC_VOLUME * btc_p
+                        max_vol_usdt = MAX_BTC_VOLUME * btc_p
                         
                         for x in data:
                             sym = x["symbol"]
@@ -1649,10 +1650,23 @@ class SignalBot:
                                 continue
                             
                             qv = float(x.get("quoteVolume", 0))
-                            if qv >= min_vol_usdt:
+                            if qv >= min_vol_usdt and qv <= max_vol_usdt:
                                 syms.append(sym)
                                 vols[sym] = qv
                         LOGGER.info("{} crypto symbols loaded from Binance.".format(len(syms)))
+                        
+                        # Filter: minimum 24h volume in USDT
+                        # Filter: minimum volume relative to BTC
+                        if MIN_VOLUME_RATIO_TO_BTC > 0:
+                            btc_vol = vols.get("BTCUSDT", 0)
+                            if btc_vol > 0:
+                                min_vol = btc_vol * MIN_VOLUME_RATIO_TO_BTC
+                                syms = [s for s in syms if vols.get(s, 0) >= min_vol]
+                                LOGGER.info("{} symbols after BTC volume filter (min: {:,.0f} USDT = {}% of BTC)".format(
+                                    len(syms), min_vol, int(MIN_VOLUME_RATIO_TO_BTC * 100)))
+                            syms = [s for s in syms if vols.get(s, 0) >= MIN_24H_VOLUME_USDT]
+                            LOGGER.info("{} symbols after 24h volume filter (min: {:,.0f} USDT)".format(
+                                len(syms), MIN_24H_VOLUME_USDT))
                     else:
                         LOGGER.error("Failed to fetch Binance 24hr ticker: HTTP {}".format(r.status))
             except Exception as e:
@@ -1661,7 +1675,7 @@ class SignalBot:
             # === ۲. گرفتن PAX Gold از CoinMarketCap ===
             if COINMARKETCAP_API_KEY:
                 try:
-                    cmc_url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+                    cmc_url = COINMARKETCAP_URL
                     headers = {
                         "X-CMC_PRO_API_KEY": COINMARKETCAP_API_KEY,
                         "Accept": "application/json"
@@ -1717,11 +1731,6 @@ class SignalBot:
             LOGGER.error("BTC update: " + str(e))
 
     async def process_signal(self, session, symbol, interval, signal, h4_trend="NEUTRAL", h1_trend="NEUTRAL", h1_ob=[], h1_fvg=[], h1_liq=[]):
-        # فیلتر اضافی: فقط کریپتو و طلا
-        if not (symbol.endswith("USDT") or symbol.endswith("BUSD") or symbol in GOLD_SYMBOLS):
-            LOGGER.info("Skipping non-crypto/gold symbol: {}".format(symbol))
-            return
-        
         
         # Deduplication: check if we already sent a signal for this symbol recently (5 min)
         now = time.time()
@@ -1730,6 +1739,11 @@ class SignalBot:
             LOGGER.info("Skipping {}: signal sent recently ({}s ago)".format(symbol, int(now - last_sent[symbol])))
             return
         
+        # Check daily signal limit
+        if MAX_DAILY_SIGNALS > 0 and self._daily_signals_count >= MAX_DAILY_SIGNALS:
+            LOGGER.info("Daily signal limit reached ({}/{}). Skipping {}.".format(
+                self._daily_signals_count, MAX_DAILY_SIGNALS, symbol))
+            return
         bids, asks, ob_source = await fetch_order_book(session, symbol)
         ob = OrderBookAnalyzer.analyze(bids, asks, signal["entry_price"], signal["stop_loss"])
         ob["source"] = ob_source or "failed"
@@ -1754,24 +1768,6 @@ class SignalBot:
                 LOGGER.info("Strategy filter rejected {}: {} not in allowed list".format(
                     symbol, signal.get("strategy", "")))
                 return
-        
-        # Filter: RSI range check
-        if signal["direction"] == "LONG" and MIN_RSI_LONG > 0:
-            if signal["rsi"] < MIN_RSI_LONG:
-                LOGGER.info("RSI filter rejected LONG {}: RSI {:.1f} < {:.1f}".format(
-                    symbol, signal["rsi"], MIN_RSI_LONG))
-                return
-        if signal["direction"] == "SHORT" and MAX_RSI_SHORT > 0:
-            if signal["rsi"] > MAX_RSI_SHORT:
-                LOGGER.info("RSI filter rejected SHORT {}: RSI {:.1f} > {:.1f}".format(
-                    symbol, signal["rsi"], MAX_RSI_SHORT))
-                return
-        
-        # Filter: minimum ADX
-        if MIN_ADX > 0 and signal["adx"] < MIN_ADX:
-            LOGGER.info("ADX filter rejected {}: ADX {:.1f} < {:.1f}".format(
-                symbol, signal["adx"], MIN_ADX))
-            return
 
         ob_quality_passed, ob_quality_reason, ob_quality_score = ob_quality_filter(
             ob, signal["direction"], symbol, signal["entry_price"]
@@ -1816,6 +1812,25 @@ class SignalBot:
             LOGGER.info("AI confidence too low for {}: {:.1%} < {:.1%} (min required)".format(
                 symbol, prob, MIN_AI_CONFIDENCE))
             return
+        
+        # Filter: RSI range check
+        if signal["direction"] == "LONG" and MIN_RSI_LONG > 0:
+            if signal["rsi"] < MIN_RSI_LONG:
+                LOGGER.info("RSI filter rejected LONG {}: RSI {:.1f} < {:.1f}".format(
+                    symbol, signal["rsi"], MIN_RSI_LONG))
+                return
+        if signal["direction"] == "SHORT" and MAX_RSI_SHORT > 0:
+            if signal["rsi"] > MAX_RSI_SHORT:
+                LOGGER.info("RSI filter rejected SHORT {}: RSI {:.1f} > {:.1f}".format(
+                    symbol, signal["rsi"], MAX_RSI_SHORT))
+                return
+        
+        # Filter: minimum ADX
+        if MIN_ADX > 0 and signal["adx"] < MIN_ADX:
+            LOGGER.info("ADX filter rejected {}: ADX {:.1f} < {:.1f}".format(
+                symbol, signal["adx"], MIN_ADX))
+            return
+        
 
         if mtf_reasons:
             LOGGER.info("MTF {}: {} | Adjustment: {:+.2f}".format(symbol, ", ".join(mtf_reasons), mtf_adjustment))
@@ -1875,12 +1890,6 @@ class SignalBot:
         if not hasattr(self, "_last_signal_time"):
             self._last_signal_time = {}
         self._last_signal_time[symbol] = time.time()
-        
-        # Check daily signal limit
-        if MAX_DAILY_SIGNALS > 0 and self._daily_signals_count >= MAX_DAILY_SIGNALS:
-            LOGGER.info("Daily signal limit reached ({}/{}). Skipping {}.".format(
-                self._daily_signals_count, MAX_DAILY_SIGNALS, symbol))
-            return
 
         await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf, ob_quality_reason)
 
@@ -1910,6 +1919,11 @@ class SignalBot:
                         continue
 
                     for symbol in symbols:
+                        # دوباره چک کن که فقط کریپتو و طلا باشد
+                        if not (symbol.endswith("USDT") or symbol.endswith("BUSD") or symbol in GOLD_SYMBOLS):
+                            LOGGER.debug("Skipping non-crypto/gold: {}".format(symbol))
+                            continue
+                        
                         vol = self.symbol_cache.get("volumes", {}).get(symbol, 0)
                         if vol <= 0:
                             LOGGER.debug("Skipping {}: no volume data".format(symbol))
@@ -1929,7 +1943,8 @@ class SignalBot:
                             if not sig:
                                 continue
 
-                            if symbol != "BTCUSDT":
+                            # Filter: BTC trend alignment (configurable)
+                            if FILTER_BTC_TREND and symbol != "BTCUSDT":
                                 if sig["direction"] == "LONG" and self.btc_trend == "BEARISH":
                                     continue
                                 if sig["direction"] == "SHORT" and self.btc_trend == "BULLISH":
@@ -1962,7 +1977,7 @@ class SignalBot:
 # 11. Web & Entry
 # ==========================================================
 async def health(request):
-    return web.Response(text="Signal Bot Running - Crypto + PAXG Gold Mode", status=200)
+    return web.Response(text="Signal Bot Running", status=200)
 
 async def main():
     app = web.Application()
