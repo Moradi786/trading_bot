@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import os
@@ -56,9 +57,9 @@ MODEL_PATH = "ai_model.joblib"
 SCALER_PATH = "ai_scaler.joblib"
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
-GOLD_SYMBOL = "PAXGUSDT"  # tokenized gold on Binance Futures, tracks XAU/USD
 MAX_SL_PERCENT = 2.0
-MIN_BTC_VOLUME = 1200.0
+MIN_BTC_VOLUME = 1500.0
+MAX_BTC_VOLUME = 1600.0
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -1357,9 +1358,7 @@ class TelegramManager:
                     chat_id=chat_id
                 )
             except Exception as send_e:
-                LOGGER.error("Failed to send error message: {}".format(send_e))
-
-    async def command_listener(self):
+                LOGGER.error("Failed to send error message: {}".format(send_e))    async def command_listener(self):
         last_id = 0
         while True:
             try:
@@ -1549,49 +1548,16 @@ class SignalBot:
         self.btc_pause_until = 0
         self.symbol_cache = {"symbols": [], "last_update": 0, "volumes": {}}
         self.check_interval = CHECK_INTERVAL_SECONDS
-        self.crypto_type_cache = {"coin_symbols": set(), "last_update": 0}
 
     async def start(self):
         await init_database()
         asyncio.create_task(self.tg.command_listener())
         LOGGER.info("Signal Bot ready. Mode: SIGNAL ONLY + AI Learning from Feedback")
 
-    async def get_coin_symbols(self, session) -> set:
-        """
-        Returns the set of symbols on Binance Futures whose underlyingType is "COIN"
-        (real crypto). Binance now also lists USDT-margined perpetuals on US stocks,
-        leveraged ETFs, and treasury products (e.g. underlyingType "INDEX"/"STOCK") —
-        this filters those out so the bot only ever considers actual crypto + gold.
-        Cached for 1 hour since this list changes rarely.
-        """
-        now = time.time()
-        if now - self.crypto_type_cache["last_update"] < 3600 and self.crypto_type_cache["coin_symbols"]:
-            return self.crypto_type_cache["coin_symbols"]
-        try:
-            url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-            async with session.get(url, timeout=15) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    coin_syms = set()
-                    for s in data.get("symbols", []):
-                        if s.get("underlyingType") == "COIN" and s.get("status") == "TRADING":
-                            coin_syms.add(s.get("symbol"))
-                    if coin_syms:
-                        self.crypto_type_cache = {"coin_symbols": coin_syms, "last_update": now}
-                        LOGGER.info("{} COIN-type symbols loaded from exchangeInfo (non-crypto perpetuals excluded).".format(len(coin_syms)))
-                    else:
-                        LOGGER.warning("exchangeInfo returned 0 COIN-type symbols; keeping previous cache.")
-                else:
-                    LOGGER.error("Failed to fetch exchangeInfo: HTTP {}".format(r.status))
-        except Exception as e:
-            LOGGER.error("exchangeInfo fetch error: " + str(e))
-        return self.crypto_type_cache["coin_symbols"]
-
     async def get_symbols(self, session):
         now = time.time()
         if now - self.symbol_cache["last_update"] > 300 or not self.symbol_cache["symbols"]:
             try:
-                coin_symbols = await self.get_coin_symbols(session)
                 url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
                 async with session.get(url, timeout=15) as r:
                     if r.status == 200:
@@ -1602,30 +1568,13 @@ class SignalBot:
                         vols = {}
                         for x in data:
                             sym = x["symbol"]
-                            if not sym.endswith("USDT"):
-                                continue
-                            # Only real crypto (excludes US-stock/ETF/treasury perpetuals),
-                            # gold (PAXG) is allowed through separately below.
-                            if coin_symbols and sym not in coin_symbols and sym != GOLD_SYMBOL:
-                                continue
-                            qv = float(x.get("quoteVolume", 0))
-                            if qv >= min_vol_usdt:
-                                syms.append(sym)
-                                vols[sym] = qv
-
-                        # Always include gold (PAXG = tokenized gold, tracks XAU/USD),
-                        # even if it doesn't clear the crypto volume filter.
-                        if GOLD_SYMBOL not in syms:
-                            gold_row = next((x for x in data if x.get("symbol") == GOLD_SYMBOL), None)
-                            if gold_row:
-                                syms.append(GOLD_SYMBOL)
-                                vols[GOLD_SYMBOL] = float(gold_row.get("quoteVolume", 0))
-                                LOGGER.info("Gold ({}) added to symbol list.".format(GOLD_SYMBOL))
-                            else:
-                                LOGGER.warning("Gold symbol {} not found on Binance Futures ticker.".format(GOLD_SYMBOL))
-
+                            if sym.endswith("USDT"):
+                                qv = float(x.get("quoteVolume", 0))
+                                if qv >= min_vol_usdt:
+                                    syms.append(sym)
+                                    vols[sym] = qv
                         self.symbol_cache = {"symbols": syms, "last_update": now, "volumes": vols}
-                        LOGGER.info("{} symbols loaded (min vol: {:,.0f} USDT, crypto+gold only).".format(len(syms), min_vol_usdt))
+                        LOGGER.info("{} symbols loaded (min vol: {:,.0f} USDT).".format(len(syms), min_vol_usdt))
                     else:
                         LOGGER.error("Failed to fetch 24hr ticker: HTTP {}".format(r.status))
             except Exception as e:
@@ -1794,7 +1743,7 @@ class SignalBot:
                             if not sig:
                                 continue
 
-                            if symbol != "BTCUSDT" and symbol != GOLD_SYMBOL:
+                            if symbol != "BTCUSDT":
                                 if sig["direction"] == "LONG" and self.btc_trend == "BEARISH":
                                     continue
                                 if sig["direction"] == "SHORT" and self.btc_trend == "BULLISH":
