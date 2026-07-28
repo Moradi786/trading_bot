@@ -91,6 +91,31 @@ MAX_SL_PERCENT = 2.0
 # حجم BTC برای فیلتر حجم نمادها (به BTC)
 MIN_BTC_VOLUME = float(os.getenv("MIN_BTC_VOLUME", "1200.0"))
 MAX_BTC_VOLUME = float(os.getenv("MAX_BTC_VOLUME", "1600.0"))
+
+# ==========================================================
+# SIGNAL FILTERS - همه از .env خوانده می‌شوند
+# فقط .env را عوض کن، به کد دست نزن
+# ==========================================================
+# حداکثر تعداد سیگنال در روز (0 = نامحدود)
+MAX_DAILY_SIGNALS = int(os.getenv("MAX_DAILY_SIGNALS", "0"))
+# حداقل اطمینان AI برای ارسال سیگنال (0.0 - 1.0)
+MIN_AI_CONFIDENCE = float(os.getenv("MIN_AI_CONFIDENCE", "0.55"))
+# حداقل ADX (قدرت ترند) — 0 = غیرفعال
+MIN_ADX = float(os.getenv("MIN_ADX", "0"))
+# فیلتر جهت ترند بیت‌کوین (true/false)
+FILTER_BTC_TREND = os.getenv("FILTER_BTC_TREND", "true").lower() == "true"
+# فاصله بین دو سیگنال یک کوین (به دقیقه)
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "240"))
+# تایم‌فریم‌های مجاز — اگر خالی باشد همه استفاده می‌شوند
+ALLOWED_TIMEFRAMES_STR = os.getenv("ALLOWED_TIMEFRAMES", "")
+if ALLOWED_TIMEFRAMES_STR:
+    ALLOWED_TIMEFRAMES = [t.strip() for t in ALLOWED_TIMEFRAMES_STR.split(",") if t.strip()]
+else:
+    ALLOWED_TIMEFRAMES = TIMEFRAMES
+# استراتژی‌های مجاز — اگر خالی باشد همه مجازند
+ALLOWED_STRATEGIES_STR = os.getenv("ALLOWED_STRATEGIES", "")
+ALLOWED_STRATEGIES = [s.strip() for s in ALLOWED_STRATEGIES_STR.split(",") if s.strip()] if ALLOWED_STRATEGIES_STR else []
+
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -1732,11 +1757,14 @@ class SignalBot:
 
     async def process_signal(self, session, symbol, interval, signal, h4_trend="NEUTRAL", h1_trend="NEUTRAL", h1_ob=[], h1_fvg=[], h1_liq=[]):
         
-        # Deduplication: check if we already sent a signal for this symbol recently (5 min)
+        # Deduplication: cooldown per symbol+direction (from .env, default 240 min)
         now = time.time()
         last_sent = getattr(self, "_last_signal_time", {})
-        if symbol in last_sent and (now - last_sent[symbol]) < 300:
-            LOGGER.info("Skipping {}: signal sent recently ({}s ago)".format(symbol, int(now - last_sent[symbol])))
+        dedup_key = "{}_{}".format(symbol, signal["direction"])
+        cooldown_sec = SIGNAL_COOLDOWN_MINUTES * 60
+        if dedup_key in last_sent and (now - last_sent[dedup_key]) < cooldown_sec:
+            LOGGER.info("Skipping {} {}: signal sent {}min ago (cooldown {}min)".format(
+                symbol, signal["direction"], int((now - last_sent[dedup_key]) / 60), SIGNAL_COOLDOWN_MINUTES))
             return
         
         # Check daily signal limit
@@ -1889,7 +1917,7 @@ class SignalBot:
         # Record signal time for deduplication
         if not hasattr(self, "_last_signal_time"):
             self._last_signal_time = {}
-        self._last_signal_time[symbol] = time.time()
+        self._last_signal_time["{}_{}".format(symbol, signal["direction"])] = time.time()
 
         await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf, ob_quality_reason)
 
