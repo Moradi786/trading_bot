@@ -2078,6 +2078,18 @@ class SignalBot:
             LOGGER.info("Skipping {} {}: signal sent {}min ago (cooldown {}min)".format(
                 symbol, signal["direction"], int((now - last_sent[dedup_key]) / 60), SIGNAL_COOLDOWN_MINUTES))
             return
+
+        # Persistent dedup via DB - survives restarts and duplicate deploys
+        try:
+            _dd = await db_execute(
+                "SELECT (julianday('now') - julianday(timestamp)) * 1440.0 FROM signal_history WHERE symbol = ? AND direction = ? ORDER BY id DESC LIMIT 1",
+                (symbol, signal["direction"]))
+            if _dd and _dd[0][0] is not None and _dd[0][0] < SIGNAL_COOLDOWN_MINUTES:
+                LOGGER.info("Skipping {} {}: DB signal sent {:.0f}min ago (cooldown {}min)".format(
+                    symbol, signal["direction"], _dd[0][0], SIGNAL_COOLDOWN_MINUTES))
+                return
+        except Exception as _e:
+            LOGGER.error("Dedup DB check error: " + str(_e))
         
         # Check daily signal limit
         if MAX_DAILY_SIGNALS > 0 and self._daily_signals_count >= MAX_DAILY_SIGNALS:
