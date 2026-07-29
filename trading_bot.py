@@ -162,6 +162,45 @@ S9_SMA7_FILTER = os.getenv("S9_SMA7_FILTER", "true").lower() == "true"  # فقط
 S9_PIVOT_ORDER = int(os.getenv("S9_PIVOT_ORDER", "3"))                  # قدرت پیوت
 S9_MAX_PIVOT_AGE = int(os.getenv("S9_MAX_PIVOT_AGE", "60"))             # حداکثر قدمت آخرین پیوت (کندل)
 
+# ==========================================================
+# Strategy 4 (Advanced Candle / Engulfing) - قابل تنظیم از .env
+# ==========================================================
+S4_SR_FILTER = os.getenv("S4_SR_FILTER", "true").lower() == "true"      # فقط نزدیک حمایت/مقاومت
+S4_SR_PROXIMITY_PCT = float(os.getenv("S4_SR_PROXIMITY_PCT", "1.5"))    # فاصله مجاز از سطح (٪)
+S4_TREND_FILTER = os.getenv("S4_TREND_FILTER", "false").lower() == "true"  # فقط در جهت SMA7
+S4_MIN_BODY_ATR = float(os.getenv("S4_MIN_BODY_ATR", "0.8"))            # حداقل اندازه بدنه نسبت به ATR
+S4_VOLUME_RATIO = float(os.getenv("S4_VOLUME_RATIO", "1.2"))            # حداقل ضریب حجم
+
+# ==========================================================
+# Strategy 5 (ATR Breakout) - قابل تنظیم از .env
+# ==========================================================
+S5_ATR_EXPANSION = float(os.getenv("S5_ATR_EXPANSION", "1.5"))          # انبساط ATR حداقل چند برابر
+S5_MIN_MOVE_PCT = float(os.getenv("S5_MIN_MOVE_PCT", "1.0"))            # حداقل حرکت قیمت (٪)
+S5_TREND_FILTER = os.getenv("S5_TREND_FILTER", "true").lower() == "true"  # فقط در جهت EMA ترند
+S5_VOLUME_RATIO = float(os.getenv("S5_VOLUME_RATIO", "1.2"))            # حداقل ضریب حجم
+
+# ==========================================================
+# Strategy 6 (SMC EQ Sweep) - قابل تنظیم از .env
+# ==========================================================
+S6_LOOKBACK = int(os.getenv("S6_LOOKBACK", "10"))                       # تعداد کندل‌های جستجو
+S6_EQ_TOLERANCE_PCT = float(os.getenv("S6_EQ_TOLERANCE_PCT", "0.3"))    # تلرانس برابری سقف/کف‌ها (٪)
+S6_SWEEP_MAX_PCT = float(os.getenv("S6_SWEEP_MAX_PCT", "0.5"))          # حداکثر عمق سوییپ (٪)
+S6_VOLUME_RATIO = float(os.getenv("S6_VOLUME_RATIO", "1.2"))            # حداقل ضریب حجم
+S6_WICK_REJECT = os.getenv("S6_WICK_REJECT", "true").lower() == "true"  # فتیله برگشت الزامی
+
+# ==========================================================
+# Strategy 7 (OB Imbalance) - قابل تنظیم از .env
+# ==========================================================
+S7_MIN_BODY_ATR = float(os.getenv("S7_MIN_BODY_ATR", "0.8"))            # حداقل بدنه نسبت به ATR
+S7_VOLUME_RATIO = float(os.getenv("S7_VOLUME_RATIO", "1.2"))            # حداقل ضریب حجم
+S7_DISPLACEMENT = os.getenv("S7_DISPLACEMENT", "true").lower() == "true"  # شکست سقف/کف بلاک الزامی
+
+# ==========================================================
+# Strategy 8 (Hidden Divergence) - قابل تنظیم از .env
+# ==========================================================
+S8_TREND_FILTER = os.getenv("S8_TREND_FILTER", "true").lower() == "true"  # فقط در جهت SMA7
+S8_RSI_FILTER = os.getenv("S8_RSI_FILTER", "true").lower() == "true"      # فیلتر ناحیه RSI
+
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -1272,16 +1311,31 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
         prev_green = C[-2] > O[-2]
         prev_red = C[-2] < O[-2]
 
+        # --- Upgrade: body must be significant vs ATR (filter tiny candles) ---
+        body_ok = (atr <= 0) or (body >= S4_MIN_BODY_ATR * atr)
+        # --- Upgrade: volume with configurable ratio ---
+        s4_vol_ok = (avg_v20 > 0 and cv >= S4_VOLUME_RATIO * avg_v20)
+        # --- Upgrade: S/R proximity (engulfing only matters at levels) ---
+        s4_near_support = _near_level(cl, htf_s) if S4_SR_FILTER else True
+        s4_near_resistance = _near_level(ch, htf_r) if S4_SR_FILTER else True
+
         # Bullish Engulfing
-        s4_long = (prev_red and prev_body > 0 and 
-                   body > prev_body * 1.5 and 
+        s4_long = (prev_red and prev_body > 0 and
+                   body > prev_body * 1.5 and
                    cc > O[-2] and co < C[-2] and
-                   vol_spike)
+                   s4_vol_ok and body_ok and s4_near_support)
         # Bearish Engulfing
-        s4_short = (prev_green and prev_body > 0 and 
-                    body > prev_body * 1.5 and 
+        s4_short = (prev_green and prev_body > 0 and
+                    body > prev_body * 1.5 and
                     cc < O[-2] and co > C[-2] and
-                    vol_spike)
+                    s4_vol_ok and body_ok and s4_near_resistance)
+
+        # --- Upgrade: optional trend filter (with SMA7) ---
+        if S4_TREND_FILTER and (s4_long or s4_short):
+            if s4_long and cc < sma7:
+                s4_long = False
+            if s4_short and cc > sma7:
+                s4_short = False
     else:
         s4_long = s4_short = False
 
@@ -1290,29 +1344,64 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     # ==========================================================
     if len(C) >= 20:
         atr_20 = calc_atr(H[-20:], L[-20:], C[-20:])
-        atr_current = atr
-        atr_expansion = atr_current > atr_20 * 1.5 if atr_20 > 0 else False
+        atr_expansion = atr > atr_20 * S5_ATR_EXPANSION if atr_20 > 0 else False
+        s5_vol_ok = (avg_v20 > 0 and cv >= S5_VOLUME_RATIO * avg_v20)
 
-        s5_long = (atr_expansion and cc > sma7 and 
-                   (cc - C[-5]) / C[-5] * 100 > 1.0 and vol_spike)
-        s5_short = (atr_expansion and cc < sma7 and 
-                    (C[-5] - cc) / C[-5] * 100 > 1.0 and vol_spike)
+        s5_long = (atr_expansion and cc > sma7 and
+                   (cc - C[-5]) / C[-5] * 100 > S5_MIN_MOVE_PCT and s5_vol_ok)
+        s5_short = (atr_expansion and cc < sma7 and
+                    (C[-5] - cc) / C[-5] * 100 > S5_MIN_MOVE_PCT and s5_vol_ok)
+
+        # --- Upgrade: EMA big-trend filter (volatility breakout only with trend) ---
+        if S5_TREND_FILTER and (s5_long or s5_short):
+            ema_period = min(200, max(50, len(C) - 10))
+            ema_t5 = calc_ema(C, ema_period)
+            if ema_t5 is not None:
+                if s5_long and cc < ema_t5:
+                    s5_long = False
+                if s5_short and cc > ema_t5:
+                    s5_short = False
     else:
         s5_long = s5_short = False
 
     # ==========================================================
     # Strategy 6: SMC EQ Sweep (Equal High/Low sweep)
     # ==========================================================
-    if len(H) >= 10 and len(L) >= 10:
-        eq_high = max(H[-10:-1])
-        eq_low = min(L[-10:-1])
+    if len(H) >= S6_LOOKBACK + 8 and len(L) >= S6_LOOKBACK + 8:
+        # --- Upgrade: detect REAL equal highs/lows via pivots (tolerance-based) ---
+        ph6, pl6 = _pivot_points(H[:-1], L[:-1], 3)
+        eq_high = None
+        if len(ph6) >= 2:
+            _, ep1 = ph6[-2]
+            _, ep2 = ph6[-1]
+            if abs(ep2 - ep1) / ep1 * 100 <= S6_EQ_TOLERANCE_PCT:
+                eq_high = max(ep1, ep2)
+        if eq_high is None:
+            eq_high = max(H[-S6_LOOKBACK:-1])
+        eq_low = None
+        if len(pl6) >= 2:
+            _, ep1 = pl6[-2]
+            _, ep2 = pl6[-1]
+            if abs(ep2 - ep1) / ep1 * 100 <= S6_EQ_TOLERANCE_PCT:
+                eq_low = min(ep1, ep2)
+        if eq_low is None:
+            eq_low = min(L[-S6_LOOKBACK:-1])
+
+        s6_vol_ok = (avg_v20 > 0 and cv >= S6_VOLUME_RATIO * avg_v20)
 
         # Equal High sweep (price goes above then back below)
-        s6_short = (ch > eq_high * 1.002 and cc < eq_high and 
-                    abs(ch - eq_high) / eq_high * 100 < 0.5 and vol_spike)
+        s6_short = (ch > eq_high * 1.002 and cc < eq_high and
+                    abs(ch - eq_high) / eq_high * 100 < S6_SWEEP_MAX_PCT and s6_vol_ok)
         # Equal Low sweep (price goes below then back above)
-        s6_long = (cl < eq_low * 0.998 and cc > eq_low and 
-                   abs(eq_low - cl) / eq_low * 100 < 0.5 and vol_spike)
+        s6_long = (cl < eq_low * 0.998 and cc > eq_low and
+                   abs(eq_low - cl) / eq_low * 100 < S6_SWEEP_MAX_PCT and s6_vol_ok)
+
+        # --- Upgrade: rejection wick required (sweep must leave a wick) ---
+        if S6_WICK_REJECT and body > 0:
+            if s6_short and uw < 1.0 * body:
+                s6_short = False
+            if s6_long and lw < 1.0 * body:
+                s6_long = False
     else:
         s6_long = s6_short = False
 
@@ -1320,14 +1409,24 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     # Strategy 7: OB Imbalance (Order Block detection)
     # ==========================================================
     if len(C) >= 5:
+        # --- Upgrade: displacement (strong candle must break the block's high/low) ---
+        block_hi = max(H[-4:-1])
+        block_lo = min(L[-4:-1])
+        s7_body_ok = (atr <= 0) or (body >= S7_MIN_BODY_ATR * atr)
+        s7_vol_ok = (avg_v20 > 0 and cv >= S7_VOLUME_RATIO * avg_v20)
+        disp_bull = (not S7_DISPLACEMENT) or (cc > block_hi)
+        disp_bear = (not S7_DISPLACEMENT) or (cc < block_lo)
+
         # Bullish OB: last 3 candles down, then strong green with volume
-        ob_bull = (C[-3] < O[-3] and C[-4] < O[-4] and 
-                   C[-2] < O[-2] and cc > co and 
-                   body > abs(C[-2] - O[-2]) * 1.5 and vol_spike)
+        ob_bull = (C[-3] < O[-3] and C[-4] < O[-4] and
+                   C[-2] < O[-2] and cc > co and
+                   body > abs(C[-2] - O[-2]) * 1.5 and
+                   s7_vol_ok and s7_body_ok and disp_bull)
         # Bearish OB: last 3 candles up, then strong red with volume
-        ob_bear = (C[-3] > O[-3] and C[-4] > O[-4] and 
-                   C[-2] > O[-2] and cc < co and 
-                   body > abs(C[-2] - O[-2]) * 1.5 and vol_spike)
+        ob_bear = (C[-3] > O[-3] and C[-4] > O[-4] and
+                   C[-2] > O[-2] and cc < co and
+                   body > abs(C[-2] - O[-2]) * 1.5 and
+                   s7_vol_ok and s7_body_ok and disp_bear)
 
         s7_long = ob_bull
         s7_short = ob_bear
@@ -1338,6 +1437,20 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     # Strategy 8: Hidden Divergence (kept from original)
     # ==========================================================
     hidden_long, hidden_short = detect_hidden_divergence(H, L, C)
+
+    # --- Upgrades: hidden divergence is a CONTINUATION pattern ---
+    # LONG only in uptrend (above SMA7) + RSI pullback zone; SHORT mirror
+    if hidden_long or hidden_short:
+        if S8_TREND_FILTER:
+            if hidden_long and cc < sma7:
+                hidden_long = False
+            if hidden_short and cc > sma7:
+                hidden_short = False
+        if S8_RSI_FILTER:
+            if hidden_long and rsi > 55:
+                hidden_long = False
+            if hidden_short and rsi < 45:
+                hidden_short = False
 
     # ==========================================================
     # Voting System (votes_needed=1 - any strategy triggers)
