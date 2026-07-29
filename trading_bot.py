@@ -1652,31 +1652,35 @@ class TelegramManager:
             file_obj = await self.bot.get_file(photo.file_id)
             LOGGER.info("Step 1 OK: file_path={}".format(file_obj.file_path))
 
-            # Method 1: Use bot.download_file (v20+ compatible)
+            # Method 1: Use File.download_to_memory (official PTB method - most reliable)
             LOGGER.info("Step 2: Downloading file...")
             try:
-                file_bytes = await self.bot.download_file(file_obj.file_path, read_timeout=30)
-                if isinstance(file_bytes, bytes):
-                    image_bytes = file_bytes
-                else:
-                    image_bytes = bytes(file_bytes)
+                buf = await file_obj.download_to_memory(read_timeout=30)
+                image_bytes = buf.getvalue()
                 LOGGER.info("Step 2 OK: downloaded {} bytes".format(len(image_bytes)))
             except Exception as dl_e:
-                LOGGER.error("bot.download_file failed: {}".format(dl_e))
-                # Fallback: try aiohttp with correct URL
-                file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
-                LOGGER.info("Fallback URL: {}".format(file_url))
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                        LOGGER.info("Fallback HTTP status: {}".format(r.status))
-                        if r.status != 200:
-                            await self.send(
-                                "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}".format(r.status),
-                                chat_id=chat_id
-                            )
-                            return
-                        image_bytes = await r.read()
-                        LOGGER.info("Fallback OK: {} bytes".format(len(image_bytes)))
+                LOGGER.error("download_to_memory failed: {}".format(dl_e))
+                # Method 2: bot.download_file
+                try:
+                    file_bytes = await self.bot.download_file(file_obj.file_path, read_timeout=30)
+                    image_bytes = bytes(file_bytes) if not isinstance(file_bytes, bytes) else file_bytes
+                    LOGGER.info("Method 2 OK: {} bytes".format(len(image_bytes)))
+                except Exception as dl_e2:
+                    LOGGER.error("bot.download_file failed: {}".format(dl_e2))
+                    # Fallback: try aiohttp with correct URL (only if both methods failed)
+                    file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
+                    LOGGER.info("Fallback URL: {}".format(file_url))
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                            LOGGER.info("Fallback HTTP status: {}".format(r.status))
+                            if r.status != 200:
+                                await self.send(
+                                    "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}".format(r.status),
+                                    chat_id=chat_id
+                                )
+                                return
+                            image_bytes = await r.read()
+                            LOGGER.info("Fallback OK: {} bytes".format(len(image_bytes)))
 
             if not self.chart_analyzer:
                 LOGGER.error("chart_analyzer is None!")
