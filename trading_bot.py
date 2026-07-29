@@ -145,6 +145,12 @@ S2_VOLUME_RATIO = float(os.getenv("S2_VOLUME_RATIO", "1.2"))    # حداقل ض�
 S2_SR_FILTER = os.getenv("S2_SR_FILTER", "true").lower() == "true"  # فقط نزدیک حمایت/مقاومت
 S2_SR_PROXIMITY_PCT = float(os.getenv("S2_SR_PROXIMITY_PCT", "1.5"))  # فاصله مجاز به S/R (٪)
 
+# ==========================================================
+# Strategy 3 (HH/LL Breakout) - قابل تنظیم از .env
+# ==========================================================
+S3_SMA7_FILTER = os.getenv("S3_SMA7_FILTER", "true").lower() == "true"  # شکست فقط در جهت SMA7
+S3_VOLUME_RATIO = float(os.getenv("S3_VOLUME_RATIO", "1.5"))            # حداقل ضریب حجم شکست
+
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -1171,16 +1177,23 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     # ==========================================================
     swing_order = 5
     vol_period = 20
-    vol_ratio = 1.5
 
     if len(C) >= swing_order * 2 + 1 and len(V) >= vol_period:
         hh = _swing_high(H, swing_order)
         ll = _swing_low(L, swing_order)
         avg_vol = sum(V[-vol_period:]) / vol_period
-        vol_ok = cv >= vol_ratio * avg_vol
+        vol_ok = cv >= S3_VOLUME_RATIO * avg_vol
 
         s3_long = (hh is not None and cc > hh and vol_ok)
         s3_short = (ll is not None and cc < ll and vol_ok)
+
+        # --- Upgrade: SMA7 direction filter (breakout only with short-term trend) ---
+        # LONG only above SMA7, SHORT only below SMA7 - reduces fakeouts
+        if S3_SMA7_FILTER and (s3_long or s3_short):
+            if s3_long and cc < sma7:
+                s3_long = False
+            if s3_short and cc > sma7:
+                s3_short = False
     else:
         s3_long = s3_short = False
 
