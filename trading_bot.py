@@ -136,6 +136,15 @@ S1_ANTI_CHASE_ATR = float(os.getenv("S1_ANTI_CHASE_ATR", "2.0"))             # �
 S1_MTF_CONFIRM = os.getenv("S1_MTF_CONFIRM", "true").lower() == "true"       # 5) تأیید DMI تایم 4h
 S1_DI_EXIT_ALERT = os.getenv("S1_DI_EXIT_ALERT", "true").lower() == "true"   # 6) هشدار خروج با DI کراس
 
+# ==========================================================
+# Strategy 2 (Candle Setup) - قابل تنظیم از .env
+# ==========================================================
+S2_SHADOW_BIG = float(os.getenv("S2_SHADOW_BIG", "2.0"))        # سایه حداقل چند برابر بدنه
+S2_SHADOW_SMALL = float(os.getenv("S2_SHADOW_SMALL", "0.25"))   # سایه سمت دیگر حداکثر
+S2_VOLUME_RATIO = float(os.getenv("S2_VOLUME_RATIO", "1.2"))    # حداقل ضریب حجم
+S2_SR_FILTER = os.getenv("S2_SR_FILTER", "true").lower() == "true"  # فقط نزدیک حمایت/مقاومت
+S2_SR_PROXIMITY_PCT = float(os.getenv("S2_SR_PROXIMITY_PCT", "1.5"))  # فاصله مجاز به S/R (٪)
+
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -1129,21 +1138,31 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
         s1_long = s1_short = False
 
     # ==========================================================
-    # Strategy 2: Candle Setup (Enhanced with shadow_big=4.0)
+    # Strategy 2: Candle Setup (configurable + S/R proximity filter)
     # ==========================================================
-    shadow_big = 4.0
-    shadow_small = 0.25
+    shadow_big = S2_SHADOW_BIG
+    shadow_small = S2_SHADOW_SMALL
+    s2_vol_ok = (avg_v20 > 0 and cv >= S2_VOLUME_RATIO * avg_v20)
+
+    # S/R proximity: LONG only near support, SHORT only near resistance
+    def _near_level(price, levels):
+        if not S2_SR_FILTER or not levels:
+            return True  # filter off or no levels found -> allow
+        return any(abs(price - lvl) / lvl * 100 <= S2_SR_PROXIMITY_PCT for lvl in levels if lvl > 0)
+
+    s2_near_support = _near_level(cl, htf_s)
+    s2_near_resistance = _near_level(ch, htf_r)
 
     if body > 0:
         lower_shadow = lw
         upper_shadow = uw
 
-        s2_long = (lower_shadow >= shadow_big * body and 
+        s2_long = (lower_shadow >= shadow_big * body and
                    upper_shadow <= shadow_small * body and
-                   cl < sma7 < bb and vol_spike)
-        s2_short = (upper_shadow >= shadow_big * body and 
+                   cl < sma7 < bb and s2_vol_ok and s2_near_support)
+        s2_short = (upper_shadow >= shadow_big * body and
                     lower_shadow <= shadow_small * body and
-                    bt < sma7 < ch and vol_spike)
+                    bt < sma7 < ch and s2_vol_ok and s2_near_resistance)
     else:
         s2_long = s2_short = False
 
