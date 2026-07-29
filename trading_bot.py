@@ -124,6 +124,18 @@ MIN_RSI_LONG = float(os.getenv("MIN_RSI_LONG", "0"))
 # فیلتر RSI: سیگنال SHORT فقط اگر RSI پایین این مقدار (0 = غیرفعال)
 MAX_RSI_SHORT = float(os.getenv("MAX_RSI_SHORT", "0"))
 
+# ==========================================================
+# Strategy 1 (RSI+DMI) Advanced Upgrades - همه از .env
+# ==========================================================
+S1_EMA200_FILTER = os.getenv("S1_EMA200_FILTER", "true").lower() == "true"   # 1) فیلتر EMA ترند بزرگ
+S1_VOLUME_CONFIRM = os.getenv("S1_VOLUME_CONFIRM", "true").lower() == "true" # 2) تأیید حجم
+S1_VOLUME_RATIO = float(os.getenv("S1_VOLUME_RATIO", "1.5"))                 # حجم > 1.5x میانگین
+S1_DYNAMIC_ADX = os.getenv("S1_DYNAMIC_ADX", "true").lower() == "true"       # 3) ADX داینامیک
+S1_ANTI_CHASE = os.getenv("S1_ANTI_CHASE", "true").lower() == "true"         # 4) جلوگیری از خرید سقف
+S1_ANTI_CHASE_ATR = float(os.getenv("S1_ANTI_CHASE_ATR", "2.0"))             # حداکثر 2 ATR از EMA20
+S1_MTF_CONFIRM = os.getenv("S1_MTF_CONFIRM", "true").lower() == "true"       # 5) تأیید DMI تایم 4h
+S1_DI_EXIT_ALERT = os.getenv("S1_DI_EXIT_ALERT", "true").lower() == "true"   # 6) هشدار خروج با DI کراس
+
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -239,15 +251,15 @@ bitget_limiter = RateLimiter(rate=10, per=1)
 # Note: Exchanges with None URLs will be skipped
 EXCHANGES = [
     {"name":"Binance","weight":10,"limiter":binance_limiter,
-     "url": (BINANCE_FUTURES_KLINES_URL + "?symbol={symbol}&interval={interval}&limit=100") if BINANCE_FUTURES_KLINES_URL else None,
+     "url": (BINANCE_FUTURES_KLINES_URL + "?symbol={symbol}&interval={interval}&limit=200") if BINANCE_FUTURES_KLINES_URL else None,
      "interval_map":{"15m":"15m","1h":"1h","4h":"4h","1d":"1d"},
      "parser": lambda d: d if isinstance(d, list) else None},
     {"name":"Bybit","weight":8,"limiter":bybit_limiter,
-     "url": (BYBIT_KLINES_URL + "?category=linear&symbol={symbol}&interval={interval}&limit=100") if BYBIT_KLINES_URL else None,
+     "url": (BYBIT_KLINES_URL + "?category=linear&symbol={symbol}&interval={interval}&limit=200") if BYBIT_KLINES_URL else None,
      "interval_map":{"15m":"15","1h":"60","4h":"240","1d":"D"},
      "parser": lambda d: _parse_bybit(d)},
     {"name":"OKX","weight":8,"limiter":okx_limiter,
-     "url": (OKX_KLINES_URL + "?instId={symbol}-SWAP&bar={interval}&limit=100") if OKX_KLINES_URL else None,
+     "url": (OKX_KLINES_URL + "?instId={symbol}-SWAP&bar={interval}&limit=200") if OKX_KLINES_URL else None,
      "interval_map":{"15m":"15m","1h":"1H","4h":"4H","1d":"1D"},
      "parser": lambda d: _parse_okx(d)}
 ]
@@ -258,11 +270,11 @@ KLINES_EXCHANGES = [e for e in EXCHANGES if e.get("url")]
 # Spot exchanges for GOLD symbols (PAXGUSDT, XAUTUSDT)
 SPOT_EXCHANGES = [
     {"name":"Binance Spot","weight":10,"limiter":binance_limiter,
-     "url": (BINANCE_SPOT_KLINES_URL + "?symbol={symbol}&interval={interval}&limit=100") if BINANCE_SPOT_KLINES_URL else None,
+     "url": (BINANCE_SPOT_KLINES_URL + "?symbol={symbol}&interval={interval}&limit=200") if BINANCE_SPOT_KLINES_URL else None,
      "interval_map":{"15m":"15m","1h":"1h","4h":"4h","1d":"1d"},
      "parser": lambda d: d if isinstance(d, list) else None},
     {"name":"Bybit Spot","weight":8,"limiter":bybit_limiter,
-     "url": (BYBIT_KLINES_URL + "?category=spot&symbol={symbol}&interval={interval}&limit=100") if BYBIT_KLINES_URL else None,
+     "url": (BYBIT_KLINES_URL + "?category=spot&symbol={symbol}&interval={interval}&limit=200") if BYBIT_KLINES_URL else None,
      "interval_map":{"15m":"15","1h":"60","4h":"240","1d":"D"},
      "parser": lambda d: _parse_bybit(d)},
 ]
@@ -1000,6 +1012,16 @@ def _swing_low(L, order=5):
     return None
 
 
+def calc_ema(values, period):
+    """Exponential Moving Average; returns None if not enough data"""
+    if not values or len(values) < period or period < 1:
+        return None
+    k = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
 def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h1_trend="NEUTRAL", h1_ob=[], h1_fvg=[], h1_liq=[], max_sl=2.0):
     if len(klines) < 50: return None
     closed = klines[:-1]
@@ -1036,7 +1058,9 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     vol_spike = cv >= 1.2 * avg_v20
 
     # ==========================================================
-    # Strategy 1: RSI+DMI Breakout (Enhanced)
+    # Strategy 1: RSI+DMI Breakout (Advanced v2)
+    # Upgrades: EMA trend + Volume confirm + Dynamic ADX + Anti-Chase
+    # (MTF confirm in scanner, DI exit alert after signal)
     # ==========================================================
     rsi_len = 14
     dmi_len = 14
@@ -1058,8 +1082,47 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
             if len(C) > di_lookback + dmi_len * 2:
                 _, pdi_prev, mdi_prev = calc_dmi(H[:-di_lookback], L[:-di_lookback], C[:-di_lookback])
 
-            s1_long = (adx >= adx_min and pdi > mdi and pdi > pdi_prev and rsi > rsi_hi)
-            s1_short = (adx >= adx_min and mdi > pdi and mdi > mdi_prev and rsi < rsi_lo)
+            # --- Upgrade 3: Dynamic ADX (adapts to market, must be rising) ---
+            if S1_DYNAMIC_ADX:
+                adx_hist = []
+                start_i = max(dmi_len * 2 + 1, len(C) - 50)
+                for i in range(start_i, len(C)):
+                    _, _, _a = calc_dmi(H[:i+1], L[:i+1], C[:i+1])
+                    adx_hist.append(_a)
+                adx_avg = sum(adx_hist) / len(adx_hist) if adx_hist else float(adx_min)
+                adx_prev = adx_hist[-2] if len(adx_hist) >= 2 else adx
+                adx_thresh = max(20.0, min(adx_avg, 35.0))
+                adx_ok = (adx >= adx_thresh) and (adx >= adx_prev)
+            else:
+                adx_ok = adx >= adx_min
+
+            s1_long = (adx_ok and pdi > mdi and pdi > pdi_prev and rsi > rsi_hi)
+            s1_short = (adx_ok and mdi > pdi and mdi > mdi_prev and rsi < rsi_lo)
+
+            # --- Upgrade 1: EMA big-trend filter (no LONG below trend EMA) ---
+            if S1_EMA200_FILTER and (s1_long or s1_short):
+                ema_period = min(200, max(50, len(C) - 10))
+                ema_t = calc_ema(C, ema_period)
+                if ema_t is not None:
+                    if s1_long and cc < ema_t:
+                        s1_long = False
+                    if s1_short and cc > ema_t:
+                        s1_short = False
+
+            # --- Upgrade 2: Volume confirmation (breakout must have volume) ---
+            if S1_VOLUME_CONFIRM and (s1_long or s1_short):
+                if avg_v20 <= 0 or cv < S1_VOLUME_RATIO * avg_v20:
+                    s1_long = False
+                    s1_short = False
+
+            # --- Upgrade 4: Anti-Chase (don't buy the top / sell the bottom) ---
+            if S1_ANTI_CHASE and (s1_long or s1_short):
+                ema20 = calc_ema(C, 20)
+                if ema20 is not None and atr > 0:
+                    if s1_long and (cc - ema20) > S1_ANTI_CHASE_ATR * atr:
+                        s1_long = False
+                    if s1_short and (ema20 - cc) > S1_ANTI_CHASE_ATR * atr:
+                        s1_short = False
         else:
             s1_long = s1_short = False
     else:
@@ -1871,10 +1934,15 @@ class SignalBot:
         conf_label = self.ai.confidence_label(prob)
         
         # Filter: minimum AI confidence
-        if prob < MIN_AI_CONFIDENCE:
+        # AI filter only applies when the model is actually trained
+        # (untrained model always returns 0.50 and would block everything)
+        if self.ai.is_trained and prob < MIN_AI_CONFIDENCE:
             LOGGER.info("AI confidence too low for {}: {:.1%} < {:.1%} (min required)".format(
                 symbol, prob, MIN_AI_CONFIDENCE))
             return
+        if not self.ai.is_trained:
+            LOGGER.info("AI not trained yet ({}). Skipping AI confidence filter for {}.".format(
+                "need {} feedbacks".format(self.ai.min_samples), symbol))
         
         # Filter: RSI range check
         if signal["direction"] == "LONG" and MIN_RSI_LONG > 0:
@@ -1954,6 +2022,12 @@ class SignalBot:
             self._last_signal_time = {}
         self._last_signal_time["{}_{}".format(symbol, signal["direction"])] = time.time()
 
+        # Register for DI-cross early exit alert (Strategy 1 upgrade 6)
+        if S1_DI_EXIT_ALERT and "RSI+DMI" in signal.get("strategy", ""):
+            if not hasattr(self, "_di_watch"):
+                self._di_watch = {}
+            self._di_watch[symbol] = {"direction": signal["direction"], "time": time.time(), "alerted": False}
+
         await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf, ob_quality_reason)
 
     async def scanner_loop(self):
@@ -1996,6 +2070,33 @@ class SignalBot:
                         k1d = await fetch_klines(session, symbol, "1d")
                         htf_s, htf_r = htf_sr(k4h, k1d)
 
+                        # DI-cross early exit alert for open Strategy-1 signals
+                        watch = getattr(self, "_di_watch", {}).get(symbol)
+                        if S1_DI_EXIT_ALERT and watch and k4h and len(k4h) > 40:
+                            if time.time() - watch["time"] > 86400:
+                                self._di_watch.pop(symbol, None)
+                            elif not watch["alerted"]:
+                                _wH = [float(k[2]) for k in k4h[:-1]]
+                                _wL = [float(k[3]) for k in k4h[:-1]]
+                                _wC = [float(k[4]) for k in k4h[:-1]]
+                                _wp, _wm, _wa = calc_dmi(_wH, _wL, _wC)
+                                crossed = (watch["direction"] == "LONG" and _wm > _wp) or \
+                                          (watch["direction"] == "SHORT" and _wp > _wm)
+                                if crossed:
+                                    try:
+                                        await self.tg.send(
+                                            "⚠️ *Early Exit Alert | هشدار خروج زودهنگام*\n\n"
+                                            "Symbol: `{}`\n"
+                                            "Direction: *{}*\n"
+                                            "DI Cross on 4H — momentum reversed!\n"
+                                            "+DI: `{:.1f}` | -DI: `{:.1f}`\n\n"
+                                            "کراس DI در تایم ۴ ساعته — مومنتوم برگشته. خروج دستی را بررسی کن.".format(
+                                                symbol, watch["direction"], _wp, _wm))
+                                        watch["alerted"] = True
+                                        LOGGER.info("DI exit alert sent for {} {}".format(symbol, watch["direction"]))
+                                    except Exception as e:
+                                        LOGGER.error("DI exit alert error: " + str(e))
+
                         # Filter: allowed timeframes only
                         for interval in ALLOWED_TIMEFRAMES:
                             klines = await fetch_klines(session, symbol, interval)
@@ -2026,6 +2127,19 @@ class SignalBot:
 
                             h4_trend, h4_levels, h4_ob = analyze_4h_direction(k4h_data)
                             h1_trend, h1_breaks, h1_fvg, h1_liq, h1_ob = analyze_1h_structure(k1h_data)
+
+                            # Filter: MTF DMI confirmation for Strategy 1 (RSI+DMI)
+                            if S1_MTF_CONFIRM and "RSI+DMI" in sig.get("strategy", "") and k4h_data and len(k4h_data) > 40:
+                                _H4 = [float(k[2]) for k in k4h_data[:-1]]
+                                _L4 = [float(k[3]) for k in k4h_data[:-1]]
+                                _C4 = [float(k[4]) for k in k4h_data[:-1]]
+                                _p4, _m4, _a4 = calc_dmi(_H4, _L4, _C4)
+                                if sig["direction"] == "LONG" and _p4 <= _m4:
+                                    LOGGER.info("MTF filter rejected LONG {}: 4h DMI bearish".format(symbol))
+                                    continue
+                                if sig["direction"] == "SHORT" and _m4 <= _p4:
+                                    LOGGER.info("MTF filter rejected SHORT {}: 4h DMI bullish".format(symbol))
+                                    continue
 
                             await self.process_signal(session, symbol, interval, sig, h4_trend, h1_trend, h1_ob, h1_fvg, h1_liq)
                             await asyncio.sleep(0.02)
