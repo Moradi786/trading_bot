@@ -1640,127 +1640,6 @@ class TelegramManager:
         label = "Good signal (AI learning) ✅ | سیگنال خوب (یادگیری AI)" if feedback_type == "good" else "Bad signal (AI learning) ❌ | سیگنال بد (یادگیری AI)"
         await self.send("Feedback recorded | بازخورد ثبت شد: " + label)
 
-    async def analyze_user_chart(self, photo, chat_id):
-        LOGGER.info("=" * 50)
-        LOGGER.info("analyze_user_chart STARTED for chat_id={}".format(chat_id))
-
-        try:
-            LOGGER.info("Step 1: Getting file from Telegram...")
-            LOGGER.info("photo.file_id={}".format(photo.file_id))
-            LOGGER.info("photo.file_size={}".format(getattr(photo, 'file_size', 'unknown')))
-
-            file_obj = await self.bot.get_file(photo.file_id)
-            LOGGER.info("Step 1 OK: file_path={}".format(file_obj.file_path))
-
-            # Method 1: Use File.download_to_memory (official PTB method - most reliable)
-            LOGGER.info("Step 2: Downloading file...")
-            try:
-                buf = await file_obj.download_to_memory(read_timeout=30)
-                image_bytes = buf.getvalue()
-                LOGGER.info("Step 2 OK: downloaded {} bytes".format(len(image_bytes)))
-            except Exception as dl_e:
-                LOGGER.error("download_to_memory failed: {}".format(dl_e))
-                # Method 2: bot.download_file
-                try:
-                    file_bytes = await self.bot.download_file(file_obj.file_path, read_timeout=30)
-                    image_bytes = bytes(file_bytes) if not isinstance(file_bytes, bytes) else file_bytes
-                    LOGGER.info("Method 2 OK: {} bytes".format(len(image_bytes)))
-                except Exception as dl_e2:
-                    LOGGER.error("bot.download_file failed: {}".format(dl_e2))
-                    # Fallback: try aiohttp with correct URL (only if both methods failed)
-                    file_url = "https://api.telegram.org/file/bot{}/{}".format(self.bot.token, file_obj.file_path)
-                    LOGGER.info("Fallback URL: {}".format(file_url))
-                    async with aiohttp.ClientSession() as s:
-                        async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                            LOGGER.info("Fallback HTTP status: {}".format(r.status))
-                            if r.status != 200:
-                                await self.send(
-                                    "❌ *Download failed | دانلود ناموفق*\n\nHTTP {}".format(r.status),
-                                    chat_id=chat_id
-                                )
-                                return
-                            image_bytes = await r.read()
-                            LOGGER.info("Fallback OK: {} bytes".format(len(image_bytes)))
-
-            if not self.chart_analyzer:
-                LOGGER.error("chart_analyzer is None!")
-                await self.send(
-                    "⚠️ *Analyzer not initialized | تحلیل‌گر راه‌اندازی نشده*",
-                    chat_id=chat_id
-                )
-                return
-
-            if not self.chart_analyzer.client:
-                LOGGER.error("chart_analyzer.client is None!")
-                LOGGER.error("GEMINI_AVAILABLE={}".format(GEMINI_AVAILABLE))
-                LOGGER.error("GEMINI_API_KEY set={}".format(bool(os.getenv('GEMINI_API_KEY', ''))))
-                await self.send(
-                    "⚠️ *Gemini analyzer not available | تحلیل‌گر جمینی در دسترس نیست*\n\n"
-                    "Check GEMINI_API_KEY | کلید API رو چک کن",
-                    chat_id=chat_id
-                )
-                return
-
-            await self.send(
-                "🧠 *Analyzing chart... | در حال تحلیل چارت...*",
-                chat_id=chat_id
-            )
-
-            LOGGER.info("Step 3: Calling Gemini API with {} bytes...".format(len(image_bytes)))
-            gemini_result = await self.chart_analyzer.analyze_chart_image(image_bytes)
-            LOGGER.info("Step 3: Gemini result={}".format(gemini_result))
-
-            if gemini_result:
-                try:
-                    await db_execute(
-                        "INSERT INTO gemini_analysis (symbol, pattern_detected, signal, confidence_score, analysis_summary) VALUES (?,?,?,?,?)",
-                        ("USER_UPLOAD", 
-                         gemini_result.get("pattern_detected"), 
-                         gemini_result.get("signal"),
-                         gemini_result.get("confidence_score"), 
-                         gemini_result.get("analysis_summary"))
-                    )
-                except Exception as db_e:
-                    LOGGER.error("DB save error: {}".format(db_e))
-
-                msg = (
-                    "🧠 *Gemini Chart Analysis | تحلیل تصویری چارت*\n\n"
-                    "📊 *Pattern Detected | الگوی شناسایی شده:*\n"
-                    "`{}`\n\n"
-                    "📈 *Signal | سیگنال:* `{}`\n\n"
-                    "🎯 *Confidence | اطمینان:* `{}%`\n\n"
-                    "📝 *Summary | خلاصه:*\n"
-                    "_{}_"
-                ).format(
-                    str(gemini_result.get('pattern_detected', 'N/A')),
-                    str(gemini_result.get('signal', 'N/A')),
-                    str(gemini_result.get('confidence_score', 'N/A')),
-                    str(gemini_result.get('analysis_summary', 'N/A'))
-                )
-            else:
-                msg = "❌ *Analysis failed | تحلیل ناموفق*\n\nGemini could not analyze the image.\n\nPossible reasons:\n• Image format not supported\n• API rate limit\n• Invalid response from Gemini"
-
-            LOGGER.info("Step 4: Sending result...")
-            await self.send(msg, chat_id=chat_id)
-            LOGGER.info("Step 4 OK")
-
-        except Exception as e:
-            LOGGER.error("=" * 50)
-            LOGGER.error("analyze_user_chart CRASHED!")
-            LOGGER.error("Error type: {}".format(type(e).__name__))
-            LOGGER.error("Error message: {}".format(str(e)))
-            import traceback
-            LOGGER.error("Traceback:\n{}".format(traceback.format_exc()))
-            LOGGER.error("=" * 50)
-            try:
-                await self.send(
-                    "❌ *Error | خطا*\n\n"
-                    "Could not analyze image | نمی‌تونم عکس رو تحلیل کنم\n\n"
-                    "Error: `{}`".format(str(e)[:200]),
-                    chat_id=chat_id
-                )
-            except Exception as send_e:
-                LOGGER.error("Failed to send error message: {}".format(send_e))
 
     async def command_listener(self):
         last_id = 0
@@ -1887,31 +1766,9 @@ class TelegramManager:
                             )
                             await self.send(msg, chat_id=cid)
 
-                    # Handle photos - THIS IS THE CRITICAL PART
-                    if u.message:
-                        LOGGER.info("Message has photo={}".format(bool(u.message.photo)))
-                        LOGGER.info("Message has document={}".format(bool(u.message.document)))
-
-                        if u.message.photo:
-                            LOGGER.info("Photo detected! Count={}".format(len(u.message.photo)))
-                            LOGGER.info("Photo sizes: {}".format([p.file_size for p in u.message.photo]))
-                            # Use the largest photo (last one)
-                            photo = u.message.photo[-1]
-                            LOGGER.info("Selected photo: file_id={}, width={}, height={}, size={}".format(
-                                photo.file_id, photo.width, photo.height, photo.file_size
-                            ))
-                            await self.analyze_user_chart(photo, cid)
-                        elif u.message.document:
-                            LOGGER.info("Document detected: mime_type={}".format(u.message.document.mime_type))
-                            # Check if it's an image
-                            if u.message.document.mime_type and 'image' in u.message.document.mime_type:
-                                LOGGER.info("Document is an image, treating as photo")
-                                # Create a simple object with file_id
-                                class FakePhoto:
-                                    def __init__(self, file_id, file_size=0):
-                                        self.file_id = file_id
-                                        self.file_size = file_size
-                                await self.analyze_user_chart(FakePhoto(u.message.document.file_id, u.message.document.file_size), cid)
+                    # Photo/image analysis removed per user request - images are ignored
+                    if u.message and (u.message.photo or u.message.document):
+                        LOGGER.info("Image received - image analysis is disabled, ignoring.")
 
                     if u.callback_query:
                         cq = u.callback_query
