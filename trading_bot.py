@@ -134,6 +134,10 @@ WEEKLY_REPORT_DAY = int(os.getenv("WEEKLY_REPORT_DAY", "0"))      # 0=دوشنب
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "6"))    # ساعت ارسال (UTC)
 WEEKLY_TOP_N = int(os.getenv("WEEKLY_TOP_N", "10"))               # چند کوین در لیست باشه
 
+# ============ TWO-TIER SMART SCANNER | اسکنر دولایه هوشمند ============
+SCAN_FAST_TOP_N = int(os.getenv("SCAN_FAST_TOP_N", "60"))    # 60 کوین فعال (حجم بالا) = هر اسکن
+SCAN_SLOW_EVERY = int(os.getenv("SCAN_SLOW_EVERY", "12"))    # بقیه هر 12 اسکن (≈ هر 1 دقیقه با اینتروال 5ثانیه)
+
 # تقویم FOMC 2026 (ساعت ۱۸:۰۰ UTC = اعلان نرخ بهره)
 FOMC_DATES_2026 = [
     "2026-01-28 18:00", "2026-03-18 17:00", "2026-04-29 18:00",
@@ -2308,10 +2312,24 @@ class SignalBot:
                         await asyncio.sleep(5)
                         continue
 
+                    # 🚀 Two-tier smart scanner: top-volume coins every cycle, rest every SCAN_SLOW_EVERY cycles
+                    self._scan_cycle = getattr(self, "_scan_cycle", 0) + 1
+                    _vols_map = self.symbol_cache.get("volumes", {})
+                    _sorted_syms = sorted(symbols, key=lambda s: _vols_map.get(s, 0), reverse=True)
+                    _fast_set = set(_sorted_syms[:SCAN_FAST_TOP_N])
+                    _slow_cycle = (self._scan_cycle % SCAN_SLOW_EVERY == 0)
+                    if _slow_cycle:
+                        LOGGER.info("Scan cycle {}: FULL scan (fast {} + slow {})".format(
+                            self._scan_cycle, len(_fast_set), len(symbols) - len(_fast_set)))
+
                     for symbol in symbols:
                         # دوباره چک کن که فقط کریپتو و طلا باشد
                         if not (symbol.endswith("USDT") or symbol.endswith("BUSD") or symbol in GOLD_SYMBOLS):
                             LOGGER.debug("Skipping non-crypto/gold: {}".format(symbol))
+                            continue
+
+                        # Slow-tier coins: only scanned on slow cycles
+                        if symbol not in _fast_set and not _slow_cycle:
                             continue
                         
                         vol = self.symbol_cache.get("volumes", {}).get(symbol, 0)
