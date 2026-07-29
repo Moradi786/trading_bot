@@ -16,6 +16,7 @@ except ImportError:
 
 import aiohttp
 import numpy as np
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -106,6 +107,39 @@ MIN_ADX = float(os.getenv("MIN_ADX", "0"))
 FILTER_BTC_TREND = os.getenv("FILTER_BTC_TREND", "true").lower() == "true"
 # فاصله بین دو سیگنال یک کوین (به دقیقه)
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "240"))
+
+# ============ NEWS FILTERS | فیلتر خبرها ============
+# ⛔ توقف سیگنال موقع خبرهای بزرگ (FOMC خودکار + خبرهای دستی)
+NEWS_BLACKOUT_ENABLED = os.getenv("NEWS_BLACKOUT_ENABLED", "true").lower() == "true"
+NEWS_BLACKOUT_BEFORE_MIN = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "30"))   # 30 دقیقه قبل خبر توقف
+NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "60"))     # 60 دقیقه بعد خبر توقف
+# خبرهای دستی: فرمت UTC جدا با کاما → مثال: 2026-07-29 18:00,2026-08-01 12:30
+NEWS_MANUAL_EVENTS = os.getenv("NEWS_MANUAL_EVENTS", "")
+# 📰 فیلتر احساسات خبری CryptoPanic (نیاز به API Key رایگان از cryptopanic.com)
+NEWS_SENTIMENT_FILTER = os.getenv("NEWS_SENTIMENT_FILTER", "false").lower() == "true"
+CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
+NEWS_BLOCK_RATIO = float(os.getenv("NEWS_BLOCK_RATIO", "0.65"))   # اگر 65%+ خبرها برخلاف سیگنال بود، بلاک
+NEWS_MIN_VOTES = int(os.getenv("NEWS_MIN_VOTES", "5"))            # حداقل تعداد خبر برای قضاوت
+NEWS_CACHE_MINUTES = int(os.getenv("NEWS_CACHE_MINUTES", "15"))   # کش ۱۵ دقیقه‌ای
+# 📊 فیچر ۳: تقویت AI Score با احساسات خبری (نیاز به CRYPTOPANIC_API_KEY)
+NEWS_AI_SCORE = os.getenv("NEWS_AI_SCORE", "false").lower() == "true"
+NEWS_AI_BOOST = float(os.getenv("NEWS_AI_BOOST", "0.05"))         # +5% اگر خبرها همجهت، -5% اگر برخلاف
+# ⚠️ فیچر ۴: هشدار تلگرام قبل از خبرهای مهم
+NEWS_ALERT_ENABLED = os.getenv("NEWS_ALERT_ENABLED", "true").lower() == "true"
+NEWS_ALERT_BEFORE_MIN = int(os.getenv("NEWS_ALERT_BEFORE_MIN", "30"))  # 30 دقیقه قبل خبر هشدار
+
+# ============ WEEKLY MOVE REPORT | گزارش هفتگی کوین‌های آماده حرکت ============
+WEEKLY_REPORT_ENABLED = os.getenv("WEEKLY_REPORT_ENABLED", "true").lower() == "true"
+WEEKLY_REPORT_DAY = int(os.getenv("WEEKLY_REPORT_DAY", "0"))      # 0=دوشنبه ... 6=یکشنبه
+WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "6"))    # ساعت ارسال (UTC)
+WEEKLY_TOP_N = int(os.getenv("WEEKLY_TOP_N", "10"))               # چند کوین در لیست باشه
+
+# تقویم FOMC 2026 (ساعت ۱۸:۰۰ UTC = اعلان نرخ بهره)
+FOMC_DATES_2026 = [
+    "2026-01-28 18:00", "2026-03-18 17:00", "2026-04-29 18:00",
+    "2026-06-17 18:00", "2026-07-29 18:00", "2026-09-16 18:00",
+    "2026-10-28 18:00", "2026-12-09 19:00",
+]
 # تایم‌فریم‌های مجاز — اگر خالی باشد همه استفاده می‌شوند
 ALLOWED_TIMEFRAMES_STR = os.getenv("ALLOWED_TIMEFRAMES", "")
 if ALLOWED_TIMEFRAMES_STR:
@@ -370,6 +404,39 @@ def validate_klines(klines, symbol):
     if last <= 0 or last > 1e6 or last < 1e-6:
         return False, "range"
     return True, "ok"
+
+def weekly_move_score(klines):
+    """Score how likely a coin is to make a big move this week.
+    Combines: volatility (ATR%), range squeeze (tight range = explosion coming), volume surge."""
+    try:
+        H = [float(k[2]) for k in klines[:-1]]
+        L = [float(k[3]) for k in klines[:-1]]
+        C = [float(k[4]) for k in klines[:-1]]
+        V = [float(k[5]) for k in klines[:-1]]
+        if len(C) < 25:
+            return None
+        cc = C[-1]
+        # 1) Volatility: ATR% (higher = moves more)
+        atr = calc_atr(H, L, C, 14)
+        atr_pct = (atr / cc) * 100 if cc > 0 else 0
+        # 2) Squeeze: last 7 candles range vs previous 30 (tight range before big move)
+        r7 = (max(H[-7:]) - min(L[-7:])) / cc * 100
+        r30 = (max(H[-30:]) - min(L[-30:])) / cc * 100 if len(C) >= 30 else r7
+        squeeze = 1.0 - min(1.0, r7 / r30) if r30 > 0 else 0   # 1 = very tight = ready to explode
+        # 3) Volume surge: last 3 vs average 20
+        avg_v = sum(V[-20:]) / 20
+        vol_ratio = (sum(V[-3:]) / 3) / avg_v if avg_v > 0 else 1.0
+        vol_score = min(1.0, (vol_ratio - 1.0))                 # >1 means volume growing
+        score = (atr_pct / 8.0) * 0.4 + squeeze * 0.35 + max(0, vol_score) * 0.25
+        score = min(1.0, max(0.0, score))
+        reasons = []
+        if squeeze >= 0.5: reasons.append("Squeeze | فشردگی رنج")
+        if atr_pct >= 4: reasons.append("High volatility | نوسان بالا")
+        if vol_ratio >= 1.3: reasons.append("Volume surge | جهش حجم")
+        return {"score": score, "atr_pct": atr_pct, "squeeze": squeeze,
+                "vol_ratio": vol_ratio, "price": cc, "reasons": reasons}
+    except Exception:
+        return None
 
 async def fetch_klines(session, symbol, interval):
     # اگر نماد طلا باشد، از Spot exchanges استفاده کن
@@ -1076,6 +1143,58 @@ def _swing_low(L, order=5):
             return L[i]
     return None
 
+
+def _parse_event_times(raw):
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(datetime.strptime(part, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc))
+        except Exception:
+            LOGGER.warning("Bad NEWS_MANUAL_EVENTS entry: " + part)
+    return out
+
+def news_blackout_active():
+    """Returns (active: bool, reason: str). Checks FOMC calendar + manual events (all UTC)."""
+    if not NEWS_BLACKOUT_ENABLED:
+        return False, ""
+    now = datetime.now(timezone.utc)
+    events = _parse_event_times(",".join(FOMC_DATES_2026))
+    if NEWS_MANUAL_EVENTS:
+        events += _parse_event_times(NEWS_MANUAL_EVENTS)
+    for ev in events:
+        start = ev - timedelta(minutes=NEWS_BLACKOUT_BEFORE_MIN)
+        end = ev + timedelta(minutes=NEWS_BLACKOUT_AFTER_MIN)
+        if start <= now <= end:
+            return True, ev.strftime("%Y-%m-%d %H:%M UTC")
+    return False, ""
+
+async def fetch_news_sentiment(session, symbol):
+    """CryptoPanic sentiment for a coin. Returns (bull_ratio, n_votes) or (None, 0)."""
+    if not NEWS_SENTIMENT_FILTER or not CRYPTOPANIC_API_KEY:
+        return None, 0
+    currency = symbol.replace("USDT", "").replace("USD", "")
+    try:
+        url = "https://cryptopanic.com/api/free/v1/posts/?auth_token={}&currencies={}&filter=rising".format(
+            CRYPTOPANIC_API_KEY, currency)
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None, 0
+            data = await r.json()
+        bull = bear = 0
+        for p in (data.get("results") or [])[:20]:
+            votes = p.get("votes") or {}
+            bull += int(votes.get("positive", 0) or 0)
+            bear += int(votes.get("negative", 0) or 0)
+        total = bull + bear
+        if total < NEWS_MIN_VOTES:
+            return None, 0
+        return bull / float(total), total
+    except Exception as e:
+        LOGGER.error("News sentiment error {}: {}".format(symbol, e))
+        return None, 0
 
 def calc_ema(values, period):
     """Exponential Moving Average; returns None if not enough data"""
@@ -1951,6 +2070,35 @@ class SignalBot:
                 return
         except Exception as _e:
             LOGGER.error("Dedup DB check error: " + str(_e))
+
+        # ⛔ News blackout: no signals around FOMC / manual major events
+        _blk, _blk_ev = news_blackout_active()
+        if _blk:
+            LOGGER.info("Skipping {} {}: news blackout active (event {})".format(
+                symbol, signal["direction"], _blk_ev))
+            return
+
+        # 📰 News sentiment (CryptoPanic) - cached per symbol, used by block filter AND AI boost
+        _ratio, _votes = None, 0
+        if (NEWS_SENTIMENT_FILTER or NEWS_AI_SCORE) and CRYPTOPANIC_API_KEY:
+            try:
+                if not hasattr(self, "_news_cache"):
+                    self._news_cache = {}
+                _nc = self._news_cache.get(symbol)
+                if _nc and (now - _nc[0]) < NEWS_CACHE_MINUTES * 60:
+                    _ratio, _votes = _nc[1], _nc[2]
+                else:
+                    _ratio, _votes = await fetch_news_sentiment(session, symbol)
+                    self._news_cache[symbol] = (now, _ratio, _votes)
+                if _ratio is not None and NEWS_SENTIMENT_FILTER:
+                    if signal["direction"] == "LONG" and (1.0 - _ratio) >= NEWS_BLOCK_RATIO:
+                        LOGGER.info("Skipping {} LONG: bearish news {:.0%} ({} votes)".format(symbol, 1.0 - _ratio, _votes))
+                        return
+                    if signal["direction"] == "SHORT" and _ratio >= NEWS_BLOCK_RATIO:
+                        LOGGER.info("Skipping {} SHORT: bullish news {:.0%} ({} votes)".format(symbol, _ratio, _votes))
+                        return
+            except Exception as _ne:
+                LOGGER.error("News filter error: " + str(_ne))
         
         # Check daily signal limit
         if MAX_DAILY_SIGNALS > 0 and self._daily_signals_count >= MAX_DAILY_SIGNALS:
@@ -2017,7 +2165,25 @@ class SignalBot:
         )
 
         base_prob = await self.ai.predict(features)
-        prob = min(1.0, max(0.0, base_prob + mtf_adjustment))
+
+        # 📊 Feature 3: News sentiment boost/penalty on AI score
+        news_adjustment = 0.0
+        if NEWS_AI_SCORE and _ratio is not None:
+            if signal["direction"] == "LONG":
+                if _ratio >= NEWS_BLOCK_RATIO:
+                    news_adjustment = NEWS_AI_BOOST          # خبرها مثبت → تقویت لانگ
+                elif (1.0 - _ratio) >= NEWS_BLOCK_RATIO:
+                    news_adjustment = -NEWS_AI_BOOST         # خبرها منفی → جریمه لانگ
+            else:
+                if (1.0 - _ratio) >= NEWS_BLOCK_RATIO:
+                    news_adjustment = NEWS_AI_BOOST          # خبرها منفی → تقویت شارت
+                elif _ratio >= NEWS_BLOCK_RATIO:
+                    news_adjustment = -NEWS_AI_BOOST         # خبرها مثبت → جریمه شارت
+            if news_adjustment != 0.0:
+                LOGGER.info("News AI adjustment {} {}: {:+.1%} (bull ratio {:.0%}, {} votes)".format(
+                    symbol, signal["direction"], news_adjustment, _ratio, _votes))
+
+        prob = min(1.0, max(0.0, base_prob + mtf_adjustment + news_adjustment))
         conf_label = self.ai.confidence_label(prob)
         
         # Filter: minimum AI confidence
@@ -2232,6 +2398,71 @@ class SignalBot:
                             await asyncio.sleep(0.02)
 
                     symbols = await self.get_symbols(session)
+
+                    # ⚠️ Feature 4: Telegram warning before major news events
+                    if NEWS_ALERT_ENABLED:
+                        try:
+                            _now_utc = datetime.now(timezone.utc)
+                            if not hasattr(self, "_news_alerted"):
+                                self._news_alerted = set()
+                            _events = _parse_event_times(",".join(FOMC_DATES_2026))
+                            if NEWS_MANUAL_EVENTS:
+                                _events += _parse_event_times(NEWS_MANUAL_EVENTS)
+                            for _ev in _events:
+                                _mins = (_ev - _now_utc).total_seconds() / 60.0
+                                _key = _ev.strftime("%Y%m%d%H%M")
+                                if 0 < _mins <= NEWS_ALERT_BEFORE_MIN and _key not in self._news_alerted:
+                                    self._news_alerted.add(_key)
+                                    await self.tg.send(
+                                        "⚠️ *News Alert | هشدار خبر مهم*\n\n"
+                                        "Major event in ~{:.0f} min | رویداد مهم در ~{:.0f} دقیقه دیگر\n"
+                                        "Time | زمان: `{}`\n\n"
+                                        "ربات در پنجره خبر ساکت می‌شه — مراقب پوزیشن‌های باز باش!".format(
+                                            _mins, _mins, _ev.strftime("%Y-%m-%d %H:%M UTC")))
+                                    LOGGER.info("News alert sent for event {}".format(_key))
+                        except Exception as _ae:
+                            LOGGER.error("News alert error: " + str(_ae))
+
+                    # 📊 Weekly Move Report: coins likely to move this week
+                    if WEEKLY_REPORT_ENABLED:
+                        try:
+                            _nw = datetime.now(timezone.utc)
+                            _wk = _nw.isocalendar()[:2]  # (year, week) - send once per week
+                            if _nw.weekday() == WEEKLY_REPORT_DAY and _nw.hour == WEEKLY_REPORT_HOUR \
+                                    and getattr(self, "_weekly_sent", None) != _wk:
+                                self._weekly_sent = _wk
+                                LOGGER.info("Building weekly move report for {} symbols...".format(len(symbols)))
+                                _ranked = []
+                                for _sym in symbols:
+                                    try:
+                                        _dk = await fetch_klines(session, _sym, "1d")
+                                        if _dk:
+                                            _sc = weekly_move_score(_dk)
+                                            if _sc:
+                                                _ranked.append((_sym, _sc))
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(0.3)  # gentle on API rate limits
+                                _ranked.sort(key=lambda x: x[1]["score"], reverse=True)
+                                _top = _ranked[:WEEKLY_TOP_N]
+                                if _top:
+                                    _lines = ["📊 *Weekly Move Report | گزارش هفتگی حرکت*\n",
+                                              "Coins likely to move this week | کوین‌های آماده حرکت این هفته:\n"]
+                                    for _i, (_sym, _sc) in enumerate(_top, 1):
+                                        _bar = "🔥" if _sc["score"] >= 0.6 else ("⚡" if _sc["score"] >= 0.4 else "📈")
+                                        _rs = " + ".join(_sc["reasons"]) if _sc["reasons"] else "—"
+                                        _lines.append(
+                                            "{} `{}`\n"
+                                            "   Score: {:.0%} | ATR: {:.1f}% | Vol: x{:.1f}\n"
+                                            "   {}\n".format(
+                                                _bar, _sym, _sc["score"], _sc["atr_pct"],
+                                                _sc["vol_ratio"], _rs))
+                                    _lines.append("تحلیل بر اساس نوسان + فشردگی رنج + حجم")
+                                    await self.tg.send("\n".join(_lines))
+                                    LOGGER.info("Weekly move report sent: {} coins".format(len(_top)))
+                        except Exception as _we:
+                            LOGGER.error("Weekly report error: " + str(_we))
+
                     await asyncio.sleep(self.check_interval)
                 except Exception as e:
                     LOGGER.error("Scanner: " + str(e))
