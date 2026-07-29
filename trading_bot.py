@@ -151,6 +151,17 @@ S2_SR_PROXIMITY_PCT = float(os.getenv("S2_SR_PROXIMITY_PCT", "1.5"))  # فاصل
 S3_SMA7_FILTER = os.getenv("S3_SMA7_FILTER", "true").lower() == "true"  # شکست فقط در جهت SMA7
 S3_VOLUME_RATIO = float(os.getenv("S3_VOLUME_RATIO", "1.5"))            # حداقل ضریب حجم شکست
 
+# ==========================================================
+# Strategy 9 (Trendline Break) - شکست خط روند مایل - پیشرفته
+# ==========================================================
+S9_ENABLED = os.getenv("S9_ENABLED", "true").lower() == "true"          # روشن/خاموش
+S9_VOLUME_RATIO = float(os.getenv("S9_VOLUME_RATIO", "1.5"))            # حداقل ضریب حجم شکست
+S9_MIN_TOUCHES = int(os.getenv("S9_MIN_TOUCHES", "2"))                  # حداقل برخورد به خط روند
+S9_BREAK_MARGIN_ATR = float(os.getenv("S9_BREAK_MARGIN_ATR", "0.2"))    # حداقل فاصله شکست از خط (ATR)
+S9_SMA7_FILTER = os.getenv("S9_SMA7_FILTER", "true").lower() == "true"  # فقط در جهت SMA7
+S9_PIVOT_ORDER = int(os.getenv("S9_PIVOT_ORDER", "3"))                  # قدرت پیوت
+S9_MAX_PIVOT_AGE = int(os.getenv("S9_MAX_PIVOT_AGE", "60"))             # حداکثر قدمت آخرین پیوت (کندل)
+
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
@@ -1037,6 +1048,17 @@ def calc_ema(values, period):
         ema = v * k + ema * (1 - k)
     return ema
 
+def _pivot_points(H, L, order):
+    """Find swing highs and lows with indices: returns (ph, pl) lists of (index, price)"""
+    ph = []
+    pl = []
+    for i in range(order, len(H) - order):
+        if H[i] == max(H[i-order:i+order+1]):
+            ph.append((i, H[i]))
+        if L[i] == min(L[i-order:i+order+1]):
+            pl.append((i, L[i]))
+    return ph, pl
+
 def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h1_trend="NEUTRAL", h1_ob=[], h1_fvg=[], h1_liq=[], max_sl=2.0):
     if len(klines) < 50: return None
     closed = klines[:-1]
@@ -1198,6 +1220,51 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
         s3_long = s3_short = False
 
     # ==========================================================
+    # Strategy 9: Trendline Break (Advanced)
+    # Diagonal trendline breakout: multi-touch validation +
+    # ATR break margin + volume confirm + SMA7 direction filter
+    # ==========================================================
+    s9_long = s9_short = False
+    if S9_ENABLED and len(C) >= 60 and atr > 0:
+        order = S9_PIVOT_ORDER
+        ph, pl = _pivot_points(H, L, order)
+        cur = len(C) - 1
+        margin = S9_BREAK_MARGIN_ATR * atr
+
+        # --- Ascending support line (rising swing lows) -> SHORT on break ---
+        if len(pl) >= S9_MIN_TOUCHES:
+            (i1, p1), (i2, p2) = pl[-2], pl[-1]
+            if i2 > i1 and p2 > p1 and (cur - i2) <= S9_MAX_PIVOT_AGE:
+                slope = (p2 - p1) / (i2 - i1)
+                line_now = p2 + slope * (cur - i2)
+                line_prev = p2 + slope * (cur - 1 - i2)
+                touches = sum(1 for (i, p) in pl if abs(p - (p1 + slope * (i - i1))) <= 0.3 * atr)
+                if touches >= S9_MIN_TOUCHES:
+                    s9_short = (C[-2] > line_prev and cc < line_now - margin)
+
+        # --- Descending resistance line (falling swing highs) -> LONG on break ---
+        if len(ph) >= S9_MIN_TOUCHES:
+            (i1, p1), (i2, p2) = ph[-2], ph[-1]
+            if i2 > i1 and p2 < p1 and (cur - i2) <= S9_MAX_PIVOT_AGE:
+                slope = (p2 - p1) / (i2 - i1)
+                line_now = p2 + slope * (cur - i2)
+                line_prev = p2 + slope * (cur - 1 - i2)
+                touches = sum(1 for (i, p) in ph if abs(p - (p1 + slope * (i - i1))) <= 0.3 * atr)
+                if touches >= S9_MIN_TOUCHES:
+                    s9_long = (C[-2] < line_prev and cc > line_now + margin)
+
+        # --- Volume confirmation ---
+        if (s9_long or s9_short) and not (avg_v20 > 0 and cv >= S9_VOLUME_RATIO * avg_v20):
+            s9_long = s9_short = False
+
+        # --- SMA7 direction filter (anti-fakeout) ---
+        if S9_SMA7_FILTER and (s9_long or s9_short):
+            if s9_long and cc < sma7:
+                s9_long = False
+            if s9_short and cc > sma7:
+                s9_short = False
+
+    # ==========================================================
     # Strategy 4: Advanced Candle (Engulfing + Volume)
     # ==========================================================
     if len(C) >= 3 and body > 0:
@@ -1285,6 +1352,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     if s6_long: longs.append("SMC EQ Sweep")
     if s7_long: longs.append("OB Imbalance")
     if hidden_long: longs.append("Hidden Divergence")
+    if s9_long: longs.append("Trendline Break")
 
     if s1_short: shorts.append("RSI+DMI Breakout")
     if s2_short: shorts.append("Candle Setup")
@@ -1294,6 +1362,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     if s6_short: shorts.append("SMC EQ Sweep")
     if s7_short: shorts.append("OB Imbalance")
     if hidden_short: shorts.append("Hidden Divergence")
+    if s9_short: shorts.append("Trendline Break")
 
     # Build signal
     def build(direction, strategies, entry, sl, risk):
