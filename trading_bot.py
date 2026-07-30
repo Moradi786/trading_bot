@@ -253,6 +253,19 @@ OB_MIN_DEPTH_USDT = float(os.getenv("OB_MIN_DEPTH_USDT", "50000"))
 OB_MAX_STOP_HUNT_RISK = float(os.getenv("OB_MAX_STOP_HUNT_RISK", "0.6"))
 OB_MAX_SLIPPAGE_PCT = float(os.getenv("OB_MAX_SLIPPAGE_PCT", "0.3"))
 
+# 🧱 فیچر ۱: تشخیص دیوار (بزرگترین سفارش خرید/فروش)
+OB_WALL_FILTER = os.getenv("OB_WALL_FILTER", "true").lower() == "true"
+OB_WALL_MIN_MULT = float(os.getenv("OB_WALL_MIN_MULT", "5.0"))    # دیوار = 5 برابر سفارش متوسط
+OB_WALL_BLOCK_PCT = float(os.getenv("OB_WALL_BLOCK_PCT", "0.5"))  # دیوار برخلاف در فاصله 0.5% → بلاک
+# 📐 فیچر ۲: عدم تعادل سه‌لایه (تله: لایه نزدیک برخلاف لایه دور)
+OB_BAND_TRAP_FILTER = os.getenv("OB_BAND_TRAP_FILTER", "true").lower() == "true"
+# 📈 فیچر ۳: مومنتوم عدم تعادل (فشار پایدار خرید/فروش)
+OB_MOMENTUM_FILTER = os.getenv("OB_MOMENTUM_FILTER", "true").lower() == "true"
+OB_MOMENTUM_MIN = float(os.getenv("OB_MOMENTUM_MIN", "0.15"))     # آستانه فشار برخلاف
+OB_MOMENTUM_SAMPLES = int(os.getenv("OB_MOMENTUM_SAMPLES", "3"))  # میانگین 3 قرائت اخیر
+# 🎭 فیچر ۴: تشخیص دیوار فیک (اسپوفینگ - دیواری که ناگهان محو می‌شه)
+OB_SPOOF_FILTER = os.getenv("OB_SPOOF_FILTER", "true").lower() == "true"
+
 # ==========================================================
 # SYMBOL FILTERING - فقط کریپتو و طلا
 # ==========================================================
@@ -917,7 +930,10 @@ class OrderBookAnalyzer:
     @staticmethod
     def analyze(bids, asks, entry_price=0.0, sl_price=0.0):
         if not bids or not asks:
-            return {"imbalance": 0.0, "spread_pct": 0.0, "slippage": 0.0,
+            return {"imbalance": 0.0, "imb5": 0.0, "imb20": 0.0,
+                    "bid_wall": {"price": 0.0, "size": 0.0, "mult": 0.0, "dist_pct": 99.0},
+                    "ask_wall": {"price": 0.0, "size": 0.0, "mult": 0.0, "dist_pct": 99.0},
+                    "spread_pct": 0.0, "slippage": 0.0,
                     "stop_hunt_risk": 0.0, "iceberg_bids": 0, "iceberg_asks": 0,
                     "bid_depth": 0.0, "ask_depth": 0.0, "source": "none"}
         bv20 = sum(float(b[1]) for b in bids[:20])
@@ -944,8 +960,35 @@ class OrderBookAnalyzer:
                 min_dist = min(sl_distances)
                 if min_dist < 0.1:
                     stop_hunt_risk = round(1.0 - (min_dist / 0.1), 2)
+
+        # 📐 Multi-band imbalance: near(5) / mid(10) / far(20) - trap detection
+        bv5 = sum(float(b[1]) for b in bids[:5])
+        av5 = sum(float(a[1]) for a in asks[:5])
+        imb5 = (bv5 - av5) / (bv5 + av5 + 1e-9)
+        imb20 = (bv20 - av20) / (bv20 + av20 + 1e-9)
+
+        # 🧱 Wall detection: biggest order within ±2% of mid price
+        mid = (bb + ba) / 2 if bb > 0 and ba > 0 else 0
+        bid_wall = {"price": 0.0, "size": 0.0, "mult": 0.0, "dist_pct": 99.0}
+        ask_wall = {"price": 0.0, "size": 0.0, "mult": 0.0, "dist_pct": 99.0}
+        if mid > 0:
+            for b in bids[:50]:
+                p, s = float(b[0]), float(b[1])
+                d = (mid - p) / mid * 100
+                if 0 <= d <= 2.0 and avg_bid_size > 0 and (s / avg_bid_size) > bid_wall["mult"]:
+                    bid_wall = {"price": p, "size": s, "mult": round(s / avg_bid_size, 1), "dist_pct": round(d, 3)}
+            for a in asks[:50]:
+                p, s = float(a[0]), float(a[1])
+                d = (p - mid) / mid * 100
+                if 0 <= d <= 2.0 and avg_ask_size > 0 and (s / avg_ask_size) > ask_wall["mult"]:
+                    ask_wall = {"price": p, "size": s, "mult": round(s / avg_ask_size, 1), "dist_pct": round(d, 3)}
+
         return {
             "imbalance": round(float(imbalance), 4),
+            "imb5": round(float(imb5), 4),
+            "imb20": round(float(imb20), 4),
+            "bid_wall": bid_wall,
+            "ask_wall": ask_wall,
             "spread_pct": round(float(spread_pct), 4),
             "slippage": round(float(slippage), 4),
             "stop_hunt_risk": round(float(stop_hunt_risk), 2),
@@ -2112,6 +2155,61 @@ class SignalBot:
         bids, asks, ob_source = await fetch_order_book(session, symbol)
         ob = OrderBookAnalyzer.analyze(bids, asks, signal["entry_price"], signal["stop_loss"])
         ob["source"] = ob_source or "failed"
+
+        # ============ ADVANCED OB FILTERS | فیلترهای پیشرفته سفارشات ============
+        _dir_long = signal["direction"] == "LONG"
+
+        # 🎭 Feature 4: Spoof detection - walls that vanish between scans
+        if not hasattr(self, "_ob_walls_hist"):
+            self._ob_walls_hist = {}
+        if not hasattr(self, "_ob_spoof_until"):
+            self._ob_spoof_until = {}   # symbol_side -> time until which walls are distrusted
+        _hist = self._ob_walls_hist.get(symbol)
+        _now_t = time.time()
+        if OB_SPOOF_FILTER and _hist:
+            for _side, _wall_key, _cur in (("bid", "bid_wall", ob["bid_wall"]), ("ask", "ask_wall", ob["ask_wall"])):
+                _prev = _hist.get(_wall_key, {})
+                # previous big wall at similar price disappeared now => spoof
+                if _prev.get("mult", 0) >= OB_WALL_MIN_MULT and _cur.get("mult", 0) < OB_WALL_MIN_MULT \
+                        and abs(_prev.get("price", 0) - _cur.get("price", 0)) / max(_prev.get("price", 1), 1) < 0.005:
+                    self._ob_spoof_until["{}_{}".format(symbol, _side)] = _now_t + 1800  # 30 min distrust
+                    LOGGER.warning("SPOOF detected {}: {} wall x{:.0f} vanished - distrusting {} walls 30min".format(
+                        symbol, _side, _prev["mult"], _side))
+        self._ob_walls_hist[symbol] = {"bid_wall": ob["bid_wall"], "ask_wall": ob["ask_wall"], "ts": _now_t}
+
+        # 🧱 Feature 1: Wall filter - big opposing wall nearby blocks the signal
+        if OB_WALL_FILTER:
+            _blocking = ob["ask_wall"] if _dir_long else ob["bid_wall"]
+            _side = "ask" if _dir_long else "bid"
+            _spoofed = _now_t < self._ob_spoof_until.get("{}_{}".format(symbol, _side), 0)
+            if _blocking["mult"] >= OB_WALL_MIN_MULT and _blocking["dist_pct"] <= OB_WALL_BLOCK_PCT:
+                if _spoofed:
+                    LOGGER.info("Wall block SKIPPED {} ({} wall recently spoofed - likely fake)".format(symbol, _side))
+                else:
+                    LOGGER.warning("WALL BLOCK {} {}: {} wall x{:.0f} at {:.3f}% away".format(
+                        symbol, signal["direction"], _side, _blocking["mult"], _blocking["dist_pct"]))
+                    return
+
+        # 📐 Feature 2: Band trap - near layers oppose far layers (fake pressure)
+        if OB_BAND_TRAP_FILTER:
+            _near, _far = ob.get("imb5", 0), ob.get("imb20", 0)
+            if (_dir_long and _near < -0.10 and _far > 0.10) or (not _dir_long and _near > 0.10 and _far < -0.10):
+                LOGGER.warning("BAND TRAP {} {}: near={:.2f} vs far={:.2f} - fake pressure, blocked".format(
+                    symbol, signal["direction"], _near, _far))
+                return
+
+        # 📈 Feature 3: OB momentum - sustained opposing pressure blocks signal
+        if not hasattr(self, "_ob_imb_hist"):
+            self._ob_imb_hist = {}
+        _imbs = self._ob_imb_hist.setdefault(symbol, [])
+        _imbs.append(ob["imbalance"])
+        self._ob_imb_hist[symbol] = _imbs[-10:]
+        if OB_MOMENTUM_FILTER and len(_imbs) >= OB_MOMENTUM_SAMPLES:
+            _avg_imb = sum(_imbs[-OB_MOMENTUM_SAMPLES:]) / OB_MOMENTUM_SAMPLES
+            if (_dir_long and _avg_imb < -OB_MOMENTUM_MIN) or (not _dir_long and _avg_imb > OB_MOMENTUM_MIN):
+                LOGGER.warning("OB MOMENTUM BLOCK {} {}: sustained opposing pressure avg={:.2f}".format(
+                    symbol, signal["direction"], _avg_imb))
+                return
 
         ob_valid, ob_reason = validate_order_book(ob, signal["direction"], symbol)
         ob_conf = ob_confidence_score(ob, signal["direction"])
