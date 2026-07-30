@@ -130,7 +130,7 @@ NEWS_ALERT_BEFORE_MIN = int(os.getenv("NEWS_ALERT_BEFORE_MIN", "30"))  # 30 دق
 
 # ============ WEEKLY MOVE REPORT | گزارش هفتگی کوین‌های آماده حرکت ============
 WEEKLY_REPORT_ENABLED = os.getenv("WEEKLY_REPORT_ENABLED", "true").lower() == "true"
-WEEKLY_REPORT_DAY = int(os.getenv("WEEKLY_REPORT_DAY", "0"))      # 0=دوشنبه ... 6=یکشنبه
+WEEKLY_REPORT_DAY = int(os.getenv("WEEKLY_REPORT_DAY", "6"))      # 6=یکشنبه (پیش‌فرض) - گزارش قبل از شروع هفته معاملاتی
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "6"))    # ساعت ارسال (UTC)
 WEEKLY_TOP_N = int(os.getenv("WEEKLY_TOP_N", "10"))               # چند کوین در لیست باشه
 
@@ -444,14 +444,25 @@ def weekly_move_score(klines):
         avg_v = sum(V[-20:]) / 20
         vol_ratio = (sum(V[-3:]) / 3) / avg_v if avg_v > 0 else 1.0
         vol_score = min(1.0, (vol_ratio - 1.0))                 # >1 means volume growing
-        score = (atr_pct / 8.0) * 0.4 + squeeze * 0.35 + max(0, vol_score) * 0.25
+        # 4) Breakout proximity: price near 30d high/low = about to break
+        hi30 = max(H[-30:]) if len(H) >= 30 else max(H)
+        lo30 = min(L[-30:]) if len(L) >= 30 else min(L)
+        rng = (hi30 - lo30) / cc * 100 if cc > 0 else 0
+        breakout = 0.0
+        if rng > 0:
+            dist_hi = (hi30 - cc) / cc * 100
+            dist_lo = (cc - lo30) / cc * 100
+            near_edge = min(dist_hi, dist_lo)
+            breakout = max(0.0, 1.0 - near_edge / (rng * 0.2))  # near edge of range
+        score = (atr_pct / 8.0) * 0.30 + squeeze * 0.30 + max(0, vol_score) * 0.20 + breakout * 0.20
         score = min(1.0, max(0.0, score))
         reasons = []
         if squeeze >= 0.5: reasons.append("Squeeze | فشردگی رنج")
         if atr_pct >= 4: reasons.append("High volatility | نوسان بالا")
         if vol_ratio >= 1.3: reasons.append("Volume surge | جهش حجم")
+        if breakout >= 0.6: reasons.append("Near breakout | نزدیک شکست")
         return {"score": score, "atr_pct": atr_pct, "squeeze": squeeze,
-                "vol_ratio": vol_ratio, "price": cc, "reasons": reasons}
+                "vol_ratio": vol_ratio, "breakout": breakout, "price": cc, "reasons": reasons}
     except Exception:
         return None
 
@@ -2547,35 +2558,82 @@ class SignalBot:
                             if _nw.weekday() == WEEKLY_REPORT_DAY and _nw.hour == WEEKLY_REPORT_HOUR \
                                     and getattr(self, "_weekly_sent", None) != _wk:
                                 self._weekly_sent = _wk
-                                LOGGER.info("Building weekly move report for {} symbols...".format(len(symbols)))
-                                _ranked = []
+                                LOGGER.info("Building weekly report for {} symbols...".format(len(symbols)))
+                                _ranked, _new, _stats = [], [], []
                                 for _sym in symbols:
                                     try:
                                         _dk = await fetch_klines(session, _sym, "1d")
-                                        if _dk:
-                                            _sc = weekly_move_score(_dk)
-                                            if _sc:
-                                                _ranked.append((_sym, _sc))
+                                        if not _dk:
+                                            continue
+                                        _sc = weekly_move_score(_dk)
+                                        if _sc:
+                                            _ranked.append((_sym, _sc))
+                                        # weekly stats: 7d change + volume inflow vs previous week
+                                        _C = [float(k[4]) for k in _dk[:-1]]
+                                        _V = [float(k[5]) for k in _dk[:-1]]
+                                        if len(_C) >= 15:
+                                            _ch7 = (_C[-1] / _C[-8] - 1) * 100
+                                            _vw = sum(_V[-7:]) / 7
+                                            _vp = sum(_V[-14:-7]) / 7
+                                            _vflow = _vw / _vp if _vp > 0 else 1.0
+                                            _stats.append((_sym, _ch7, _vflow))
+                                        if 3 <= len(_C) < 45:
+                                            _new.append((_sym, len(_C), (_C[-1] / _C[0] - 1) * 100))
                                     except Exception:
                                         pass
                                     await asyncio.sleep(0.3)  # gentle on API rate limits
+
                                 _ranked.sort(key=lambda x: x[1]["score"], reverse=True)
+                                _lines = ["📊 *Weekly Report | گزارش هفتگی*\n"]
+
+                                # 🔥 بخش ۱: کوین‌های آماده حرکت
                                 _top = _ranked[:WEEKLY_TOP_N]
                                 if _top:
-                                    _lines = ["📊 *Weekly Move Report | گزارش هفتگی حرکت*\n",
-                                              "Coins likely to move this week | کوین‌های آماده حرکت این هفته:\n"]
-                                    for _i, (_sym, _sc) in enumerate(_top, 1):
+                                    _lines.append("*Ready to move | آماده حرکت:*\n")
+                                    for _sym, _sc in _top:
                                         _bar = "🔥" if _sc["score"] >= 0.6 else ("⚡" if _sc["score"] >= 0.4 else "📈")
                                         _rs = " + ".join(_sc["reasons"]) if _sc["reasons"] else "—"
                                         _lines.append(
-                                            "{} `{}`\n"
-                                            "   Score: {:.0%} | ATR: {:.1f}% | Vol: x{:.1f}\n"
-                                            "   {}\n".format(
-                                                _bar, _sym, _sc["score"], _sc["atr_pct"],
-                                                _sc["vol_ratio"], _rs))
-                                    _lines.append("تحلیل بر اساس نوسان + فشردگی رنج + حجم")
+                                            "{} `{}` — {:.0%} | ATR {:.1f}% | Vol x{:.1f}\n"
+                                            "   {}\n".format(_bar, _sym, _sc["score"], _sc["atr_pct"], _sc["vol_ratio"], _rs))
+
+                                # 🆕 بخش ۲: کوین‌های جدید
+                                if _new:
+                                    _lines.append("🆕 *New coins | کوین‌های جدید:*\n")
+                                    for _sym, _age, _ch in sorted(_new, key=lambda x: -abs(x[2]))[:5]:
+                                        _lines.append("`{}` — {} days old | {} روزه | {:+.1f}%\n".format(_sym, _age, _age, _ch))
+
+                                # 💰 بخش ۳: ورود حجم = نشانه حرکت آینده (آینده‌نگر)
+                                if _stats:
+                                    _vf = sorted(_stats, key=lambda x: -x[2])[:5]
+                                    _vf = [x for x in _vf if x[2] >= 1.3]
+                                    if _vf:
+                                        _lines.append("💰 *Volume inflow - move coming | ورود حجم، حرکت در راه:*")
+                                        for _sym, _ch, _v in _vf:
+                                            _lines.append("`{}` Vol x{:.1f} | حجم {:+.0f}% رشد کرده".format(_sym, _v, (_v - 1) * 100))
+
+                                # 📰 بخش ۶: خبرهای داغ (اگر CryptoPanic فعال باشه)
+                                if CRYPTOPANIC_API_KEY and _top:
+                                    try:
+                                        _news_lines = []
+                                        for _sym, _ in _top[:3]:
+                                            _cr = _sym.replace("USDT", "")
+                                            _url = "https://cryptopanic.com/api/free/v1/posts/?auth_token={}&currencies={}&filter=hot".format(
+                                                CRYPTOPANIC_API_KEY, _cr)
+                                            async with session.get(_url, timeout=aiohttp.ClientTimeout(total=8)) as _r:
+                                                if _r.status == 200:
+                                                    _res = (await _r.json()).get("results") or []
+                                                    if _res:
+                                                        _news_lines.append("`{}`: {}".format(_sym, (_res[0].get("title") or "")[:90]))
+                                    except Exception as _ne2:
+                                        LOGGER.error("Weekly news error: " + str(_ne2))
+                                    if _news_lines:
+                                        _lines.append("\n📰 *Hot news | خبرهای داغ:*")
+                                        _lines += _news_lines
+
+                                if len(_lines) > 2:
                                     await self.tg.send("\n".join(_lines))
-                                    LOGGER.info("Weekly move report sent: {} coins".format(len(_top)))
+                                    LOGGER.info("Weekly report sent: {} movers, {} new, {} stats".format(len(_top), len(_new), len(_stats)))
                         except Exception as _we:
                             LOGGER.error("Weekly report error: " + str(_we))
 
