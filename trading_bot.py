@@ -89,9 +89,8 @@ SCALER_PATH = "ai_scaler.joblib"
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
-# حجم BTC برای فیلتر حجم نمادها (به BTC)
-MIN_BTC_VOLUME = float(os.getenv("MIN_BTC_VOLUME", "1200.0"))
-MAX_BTC_VOLUME = float(os.getenv("MAX_BTC_VOLUME", "1600.0"))
+# فیلتر کوین‌ها: فقط حجم ۲۴ ساعته بالاتر از این مقدار BTC
+MIN_BTC_VOLUME = float(os.getenv("MIN_BTC_VOLUME", "250.0"))
 
 # ==========================================================
 # SIGNAL FILTERS - همه از .env خوانده می‌شوند
@@ -107,6 +106,11 @@ MIN_ADX = float(os.getenv("MIN_ADX", "0"))
 FILTER_BTC_TREND = os.getenv("FILTER_BTC_TREND", "true").lower() == "true"
 # فاصله بین دو سیگنال یک کوین (به دقیقه)
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "240"))
+# فیلتر AI حتی وقتی مدل هنوز آموزش ندیده — سیگنال با امتیاز زیر حد ارسال نمی‌شود
+AI_FILTER_UNTRAINED = os.getenv("AI_FILTER_UNTRAINED", "true").lower() == "true"
+# فیلتر ترند سراسری: LONG فقط بالای EMA / SHORT فقط زیر EMA (همه استراتژی‌ها)
+TREND_FILTER_ENABLED = os.getenv("TREND_FILTER_ENABLED", "true").lower() == "true"
+TREND_FILTER_EMA = int(os.getenv("TREND_FILTER_EMA", "50"))
 
 # ============ NEWS FILTERS | فیلتر خبرها ============
 # ⛔ توقف سیگنال موقع خبرهای بزرگ (FOMC خودکار + خبرهای دستی)
@@ -153,26 +157,11 @@ else:
 # استراتژی‌های مجاز — اگر خالی باشد همه مجازند
 ALLOWED_STRATEGIES_STR = os.getenv("ALLOWED_STRATEGIES", "")
 ALLOWED_STRATEGIES = [s.strip() for s in ALLOWED_STRATEGIES_STR.split(",") if s.strip()] if ALLOWED_STRATEGIES_STR else []
-# فیلتر حجم نسبت به بیت‌کوین (0 = غیرفعال، مثلاً 0.01 = حداقل ۱٪ حجم BTC)
-MIN_VOLUME_RATIO_TO_BTC = float(os.getenv("MIN_VOLUME_RATIO_TO_BTC", "0"))
-# حداقل حجم ۲۴ ساعته به دلار (0 = غیرفعال)
-MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "0"))
+
 # فیلتر RSI: سیگنال LONG فقط اگر RSI بالای این مقدار (0 = غیرفعال)
 MIN_RSI_LONG = float(os.getenv("MIN_RSI_LONG", "0"))
 # فیلتر RSI: سیگنال SHORT فقط اگر RSI پایین این مقدار (0 = غیرفعال)
 MAX_RSI_SHORT = float(os.getenv("MAX_RSI_SHORT", "0"))
-
-# ==========================================================
-# Strategy 1 (RSI+DMI) Advanced Upgrades - همه از .env
-# ==========================================================
-S1_EMA200_FILTER = os.getenv("S1_EMA200_FILTER", "true").lower() == "true"   # 1) فیلتر EMA ترند بزرگ
-S1_VOLUME_CONFIRM = os.getenv("S1_VOLUME_CONFIRM", "true").lower() == "true" # 2) تأیید حجم
-S1_VOLUME_RATIO = float(os.getenv("S1_VOLUME_RATIO", "1.5"))                 # حجم > 1.5x میانگین
-S1_DYNAMIC_ADX = os.getenv("S1_DYNAMIC_ADX", "true").lower() == "true"       # 3) ADX داینامیک
-S1_ANTI_CHASE = os.getenv("S1_ANTI_CHASE", "true").lower() == "true"         # 4) جلوگیری از خرید سقف
-S1_ANTI_CHASE_ATR = float(os.getenv("S1_ANTI_CHASE_ATR", "2.0"))             # حداکثر 2 ATR از EMA20
-S1_MTF_CONFIRM = os.getenv("S1_MTF_CONFIRM", "true").lower() == "true"       # 5) تأیید DMI تایم 4h
-S1_DI_EXIT_ALERT = os.getenv("S1_DI_EXIT_ALERT", "true").lower() == "true"   # 6) هشدار خروج با DI کراس
 
 # ==========================================================
 # Strategy 2 (Candle Setup) - قابل تنظیم از .env
@@ -188,45 +177,6 @@ S2_SR_PROXIMITY_PCT = float(os.getenv("S2_SR_PROXIMITY_PCT", "1.5"))  # فاصل
 # ==========================================================
 S3_SMA7_FILTER = os.getenv("S3_SMA7_FILTER", "true").lower() == "true"  # شکست فقط در جهت SMA7
 S3_VOLUME_RATIO = float(os.getenv("S3_VOLUME_RATIO", "1.5"))            # حداقل ضریب حجم شکست
-
-# ==========================================================
-# Strategy 4 (Advanced Candle / Engulfing) - قابل تنظیم از .env
-# ==========================================================
-S4_SR_FILTER = os.getenv("S4_SR_FILTER", "true").lower() == "true"      # فقط نزدیک حمایت/مقاومت
-S4_SR_PROXIMITY_PCT = float(os.getenv("S4_SR_PROXIMITY_PCT", "1.5"))    # فاصله مجاز از سطح (٪)
-S4_TREND_FILTER = os.getenv("S4_TREND_FILTER", "false").lower() == "true"  # فقط در جهت SMA7
-S4_MIN_BODY_ATR = float(os.getenv("S4_MIN_BODY_ATR", "0.8"))            # حداقل اندازه بدنه نسبت به ATR
-S4_VOLUME_RATIO = float(os.getenv("S4_VOLUME_RATIO", "1.2"))            # حداقل ضریب حجم
-
-# ==========================================================
-# Strategy 5 (ATR Breakout) - قابل تنظیم از .env
-# ==========================================================
-S5_ATR_EXPANSION = float(os.getenv("S5_ATR_EXPANSION", "1.5"))          # انبساط ATR حداقل چند برابر
-S5_MIN_MOVE_PCT = float(os.getenv("S5_MIN_MOVE_PCT", "1.0"))            # حداقل حرکت قیمت (٪)
-S5_TREND_FILTER = os.getenv("S5_TREND_FILTER", "true").lower() == "true"  # فقط در جهت EMA ترند
-S5_VOLUME_RATIO = float(os.getenv("S5_VOLUME_RATIO", "1.2"))            # حداقل ضریب حجم
-
-# ==========================================================
-# Strategy 6 (SMC EQ Sweep) - قابل تنظیم از .env
-# ==========================================================
-S6_LOOKBACK = int(os.getenv("S6_LOOKBACK", "10"))                       # تعداد کندل‌های جستجو
-S6_EQ_TOLERANCE_PCT = float(os.getenv("S6_EQ_TOLERANCE_PCT", "0.3"))    # تلرانس برابری سقف/کف‌ها (٪)
-S6_SWEEP_MAX_PCT = float(os.getenv("S6_SWEEP_MAX_PCT", "0.5"))          # حداکثر عمق سوییپ (٪)
-S6_VOLUME_RATIO = float(os.getenv("S6_VOLUME_RATIO", "1.2"))            # حداقل ضریب حجم
-S6_WICK_REJECT = os.getenv("S6_WICK_REJECT", "true").lower() == "true"  # فتیله برگشت الزامی
-
-# ==========================================================
-# Strategy 7 (OB Imbalance) - قابل تنظیم از .env
-# ==========================================================
-S7_MIN_BODY_ATR = float(os.getenv("S7_MIN_BODY_ATR", "0.8"))            # حداقل بدنه نسبت به ATR
-S7_VOLUME_RATIO = float(os.getenv("S7_VOLUME_RATIO", "1.2"))            # حداقل ضریب حجم
-S7_DISPLACEMENT = os.getenv("S7_DISPLACEMENT", "true").lower() == "true"  # شکست سقف/کف بلاک الزامی
-
-# ==========================================================
-# Strategy 8 (Hidden Divergence) - قابل تنظیم از .env
-# ==========================================================
-S8_TREND_FILTER = os.getenv("S8_TREND_FILTER", "true").lower() == "true"  # فقط در جهت SMA7
-S8_RSI_FILTER = os.getenv("S8_RSI_FILTER", "true").lower() == "true"      # فیلتر ناحیه RSI
 
 MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
@@ -260,14 +210,6 @@ OB_SPOOF_FILTER = os.getenv("OB_SPOOF_FILTER", "true").lower() == "true"
 # ==========================================================
 # نمادهای طلا که از CoinMarketCap گرفته می‌شوند
 GOLD_SYMBOLS = ["PAXGUSDT", "XAUTUSDT"]
-
-# اگر ALLOWED_SYMBOLS خالی باشد = همه کریپتوها + طلا
-# اگر پر باشد = فقط این نمادها
-ALLOWED_SYMBOLS_STR = os.getenv("ALLOWED_SYMBOLS", "")
-if ALLOWED_SYMBOLS_STR:
-    ALLOWED_SYMBOLS = [s.strip().upper() for s in ALLOWED_SYMBOLS_STR.split(",") if s.strip()]
-else:
-    ALLOWED_SYMBOLS = []
 
 # ==========================================================
 # 1. Async Database
@@ -729,15 +671,6 @@ def calc_dmi(highs, lows, closes, period=14):
     for i in range(period, len(dxs)):
         adx = (adx * (period - 1) + dxs[i][2]) / period
     return round(lp, 2), round(lm, 2), round(adx, 2)
-
-def detect_hidden_divergence(highs, lows, closes):
-    if len(closes) < 20: return False, False
-    price_lows = lows[-10:]
-    rsi_vals = [calc_rsi(closes[:len(closes)-10+i+1]) for i in range(10)]
-    if len(rsi_vals) < 10: return False, False
-    hidden_bull = (lows[-1] > min(price_lows)) and (rsi_vals[-1] < min(rsi_vals))
-    hidden_bear = (highs[-1] < max(highs[-10:])) and (rsi_vals[-1] > max(rsi_vals))
-    return hidden_bull, hidden_bear
 
 def find_pivots(highs, lows, lr=3):
     ph, pl = [], []
@@ -1313,7 +1246,8 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     # Need enough data
     if len(C) >= max(rsi_len, dmi_len, rsi_lookback, di_lookback) + 1:
         # Calculate RSI for lookback window
-        rsi_vals = [calc_rsi(C[:i+1]) for i in range(len(C)-rsi_lookback, len(C))]
+        # RSI high/low از ۲۰ کندل «قبلی» (بدون کندل فعلی) تا بریک‌اوت واقعی اندازه شود
+        rsi_vals = [calc_rsi(C[:i+1]) for i in range(len(C)-rsi_lookback-1, len(C)-1)]
         if len(rsi_vals) >= rsi_lookback:
             rsi_hi = max(rsi_vals)
             rsi_lo = min(rsi_vals)
@@ -1322,49 +1256,13 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
             pdi_prev = pdi
             mdi_prev = mdi
             if len(C) > di_lookback + dmi_len * 2:
-                _, pdi_prev, mdi_prev = calc_dmi(H[:-di_lookback], L[:-di_lookback], C[:-di_lookback])
+                pdi_prev, mdi_prev, _ = calc_dmi(H[:-di_lookback], L[:-di_lookback], C[:-di_lookback])
 
-            # --- Upgrade 3: Dynamic ADX (adapts to market, must be rising) ---
-            if S1_DYNAMIC_ADX:
-                adx_hist = []
-                start_i = max(dmi_len * 2 + 1, len(C) - 50)
-                for i in range(start_i, len(C)):
-                    _, _, _a = calc_dmi(H[:i+1], L[:i+1], C[:i+1])
-                    adx_hist.append(_a)
-                adx_avg = sum(adx_hist) / len(adx_hist) if adx_hist else float(adx_min)
-                adx_prev = adx_hist[-2] if len(adx_hist) >= 2 else adx
-                adx_thresh = max(20.0, min(adx_avg, 35.0))
-                adx_ok = (adx >= adx_thresh) and (adx >= adx_prev)
-            else:
-                adx_ok = adx >= adx_min
+            # ADX ساده: فقط باید از حداقل قدرت ترند بیشتر باشد
+            adx_ok = adx >= adx_min
 
             s1_long = (adx_ok and pdi > mdi and pdi > pdi_prev and rsi > rsi_hi)
             s1_short = (adx_ok and mdi > pdi and mdi > mdi_prev and rsi < rsi_lo)
-
-            # --- Upgrade 1: EMA big-trend filter (no LONG below trend EMA) ---
-            if S1_EMA200_FILTER and (s1_long or s1_short):
-                ema_period = min(200, max(50, len(C) - 10))
-                ema_t = calc_ema(C, ema_period)
-                if ema_t is not None:
-                    if s1_long and cc < ema_t:
-                        s1_long = False
-                    if s1_short and cc > ema_t:
-                        s1_short = False
-
-            # --- Upgrade 2: Volume confirmation (breakout must have volume) ---
-            if S1_VOLUME_CONFIRM and (s1_long or s1_short):
-                if avg_v20 <= 0 or cv < S1_VOLUME_RATIO * avg_v20:
-                    s1_long = False
-                    s1_short = False
-
-            # --- Upgrade 4: Anti-Chase (don't buy the top / sell the bottom) ---
-            if S1_ANTI_CHASE and (s1_long or s1_short):
-                ema20 = calc_ema(C, 20)
-                if ema20 is not None and atr > 0:
-                    if s1_long and (cc - ema20) > S1_ANTI_CHASE_ATR * atr:
-                        s1_long = False
-                    if s1_short and (ema20 - cc) > S1_ANTI_CHASE_ATR * atr:
-                        s1_short = False
         else:
             s1_long = s1_short = False
     else:
@@ -1425,155 +1323,6 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
         s3_long = s3_short = False
 
     # ==========================================================
-    # Strategy 4: Advanced Candle (Engulfing + Volume)
-    # ==========================================================
-    if len(C) >= 3 and body > 0:
-        prev_body = abs(C[-2] - O[-2])
-        prev_green = C[-2] > O[-2]
-        prev_red = C[-2] < O[-2]
-
-        # --- Upgrade: body must be significant vs ATR (filter tiny candles) ---
-        body_ok = (atr <= 0) or (body >= S4_MIN_BODY_ATR * atr)
-        # --- Upgrade: volume with configurable ratio ---
-        s4_vol_ok = (avg_v20 > 0 and cv >= S4_VOLUME_RATIO * avg_v20)
-        # --- Upgrade: S/R proximity (engulfing only matters at levels) ---
-        s4_near_support = _near_level(cl, htf_s) if S4_SR_FILTER else True
-        s4_near_resistance = _near_level(ch, htf_r) if S4_SR_FILTER else True
-
-        # Bullish Engulfing
-        s4_long = (prev_red and prev_body > 0 and
-                   body > prev_body * 1.5 and
-                   cc > O[-2] and co < C[-2] and
-                   s4_vol_ok and body_ok and s4_near_support)
-        # Bearish Engulfing
-        s4_short = (prev_green and prev_body > 0 and
-                    body > prev_body * 1.5 and
-                    cc < O[-2] and co > C[-2] and
-                    s4_vol_ok and body_ok and s4_near_resistance)
-
-        # --- Upgrade: optional trend filter (with SMA7) ---
-        if S4_TREND_FILTER and (s4_long or s4_short):
-            if s4_long and cc < sma7:
-                s4_long = False
-            if s4_short and cc > sma7:
-                s4_short = False
-    else:
-        s4_long = s4_short = False
-
-    # ==========================================================
-    # Strategy 5: ATR Breakout (ATR expansion + price move)
-    # ==========================================================
-    if len(C) >= 20:
-        atr_20 = calc_atr(H[-20:], L[-20:], C[-20:])
-        atr_expansion = atr > atr_20 * S5_ATR_EXPANSION if atr_20 > 0 else False
-        s5_vol_ok = (avg_v20 > 0 and cv >= S5_VOLUME_RATIO * avg_v20)
-
-        s5_long = (atr_expansion and cc > sma7 and
-                   (cc - C[-5]) / C[-5] * 100 > S5_MIN_MOVE_PCT and s5_vol_ok)
-        s5_short = (atr_expansion and cc < sma7 and
-                    (C[-5] - cc) / C[-5] * 100 > S5_MIN_MOVE_PCT and s5_vol_ok)
-
-        # --- Upgrade: EMA big-trend filter (volatility breakout only with trend) ---
-        if S5_TREND_FILTER and (s5_long or s5_short):
-            ema_period = min(200, max(50, len(C) - 10))
-            ema_t5 = calc_ema(C, ema_period)
-            if ema_t5 is not None:
-                if s5_long and cc < ema_t5:
-                    s5_long = False
-                if s5_short and cc > ema_t5:
-                    s5_short = False
-    else:
-        s5_long = s5_short = False
-
-    # ==========================================================
-    # Strategy 6: SMC EQ Sweep (Equal High/Low sweep)
-    # ==========================================================
-    if len(H) >= S6_LOOKBACK + 8 and len(L) >= S6_LOOKBACK + 8:
-        # --- Upgrade: detect REAL equal highs/lows via pivots (tolerance-based) ---
-        ph6, pl6 = _pivot_points(H[:-1], L[:-1], 3)
-        eq_high = None
-        if len(ph6) >= 2:
-            _, ep1 = ph6[-2]
-            _, ep2 = ph6[-1]
-            if abs(ep2 - ep1) / ep1 * 100 <= S6_EQ_TOLERANCE_PCT:
-                eq_high = max(ep1, ep2)
-        if eq_high is None:
-            eq_high = max(H[-S6_LOOKBACK:-1])
-        eq_low = None
-        if len(pl6) >= 2:
-            _, ep1 = pl6[-2]
-            _, ep2 = pl6[-1]
-            if abs(ep2 - ep1) / ep1 * 100 <= S6_EQ_TOLERANCE_PCT:
-                eq_low = min(ep1, ep2)
-        if eq_low is None:
-            eq_low = min(L[-S6_LOOKBACK:-1])
-
-        s6_vol_ok = (avg_v20 > 0 and cv >= S6_VOLUME_RATIO * avg_v20)
-
-        # Equal High sweep (price goes above then back below)
-        s6_short = (ch > eq_high * 1.002 and cc < eq_high and
-                    abs(ch - eq_high) / eq_high * 100 < S6_SWEEP_MAX_PCT and s6_vol_ok)
-        # Equal Low sweep (price goes below then back above)
-        s6_long = (cl < eq_low * 0.998 and cc > eq_low and
-                   abs(eq_low - cl) / eq_low * 100 < S6_SWEEP_MAX_PCT and s6_vol_ok)
-
-        # --- Upgrade: rejection wick required (sweep must leave a wick) ---
-        if S6_WICK_REJECT and body > 0:
-            if s6_short and uw < 1.0 * body:
-                s6_short = False
-            if s6_long and lw < 1.0 * body:
-                s6_long = False
-    else:
-        s6_long = s6_short = False
-
-    # ==========================================================
-    # Strategy 7: OB Imbalance (Order Block detection)
-    # ==========================================================
-    if len(C) >= 5:
-        # --- Upgrade: displacement (strong candle must break the block's high/low) ---
-        block_hi = max(H[-4:-1])
-        block_lo = min(L[-4:-1])
-        s7_body_ok = (atr <= 0) or (body >= S7_MIN_BODY_ATR * atr)
-        s7_vol_ok = (avg_v20 > 0 and cv >= S7_VOLUME_RATIO * avg_v20)
-        disp_bull = (not S7_DISPLACEMENT) or (cc > block_hi)
-        disp_bear = (not S7_DISPLACEMENT) or (cc < block_lo)
-
-        # Bullish OB: last 3 candles down, then strong green with volume
-        ob_bull = (C[-3] < O[-3] and C[-4] < O[-4] and
-                   C[-2] < O[-2] and cc > co and
-                   body > abs(C[-2] - O[-2]) * 1.5 and
-                   s7_vol_ok and s7_body_ok and disp_bull)
-        # Bearish OB: last 3 candles up, then strong red with volume
-        ob_bear = (C[-3] > O[-3] and C[-4] > O[-4] and
-                   C[-2] > O[-2] and cc < co and
-                   body > abs(C[-2] - O[-2]) * 1.5 and
-                   s7_vol_ok and s7_body_ok and disp_bear)
-
-        s7_long = ob_bull
-        s7_short = ob_bear
-    else:
-        s7_long = s7_short = False
-
-    # ==========================================================
-    # Strategy 8: Hidden Divergence (kept from original)
-    # ==========================================================
-    hidden_long, hidden_short = detect_hidden_divergence(H, L, C)
-
-    # --- Upgrades: hidden divergence is a CONTINUATION pattern ---
-    # LONG only in uptrend (above SMA7) + RSI pullback zone; SHORT mirror
-    if hidden_long or hidden_short:
-        if S8_TREND_FILTER:
-            if hidden_long and cc < sma7:
-                hidden_long = False
-            if hidden_short and cc > sma7:
-                hidden_short = False
-        if S8_RSI_FILTER:
-            if hidden_long and rsi > 55:
-                hidden_long = False
-            if hidden_short and rsi < 45:
-                hidden_short = False
-
-    # ==========================================================
     # Voting System (votes_needed=1 - any strategy triggers)
     # ==========================================================
     longs, shorts = [], []
@@ -1581,20 +1330,21 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     if s1_long: longs.append("RSI+DMI Breakout")
     if s2_long: longs.append("Candle Setup")
     if s3_long: longs.append("HH/LL Breakout")
-    if s4_long: longs.append("Advanced Candle")
-    if s5_long: longs.append("ATR Breakout")
-    if s6_long: longs.append("SMC EQ Sweep")
-    if s7_long: longs.append("OB Imbalance")
-    if hidden_long: longs.append("Hidden Divergence")
 
     if s1_short: shorts.append("RSI+DMI Breakout")
     if s2_short: shorts.append("Candle Setup")
     if s3_short: shorts.append("HH/LL Breakout")
-    if s4_short: shorts.append("Advanced Candle")
-    if s5_short: shorts.append("ATR Breakout")
-    if s6_short: shorts.append("SMC EQ Sweep")
-    if s7_short: shorts.append("OB Imbalance")
-    if hidden_short: shorts.append("Hidden Divergence")
+
+    # ==========================================================
+    # Global trend filter: LONG only above EMA / SHORT only below EMA
+    # فیلتر ترند سراسری — جلوی سیگنال خلاف ترند را می‌گیرد
+    # ==========================================================
+    if TREND_FILTER_ENABLED and len(C) >= TREND_FILTER_EMA + 5:
+        ema_tf = calc_ema(C, TREND_FILTER_EMA)
+        if cc < ema_tf and longs:
+            longs = []   # قیمت زیر EMA است → LONG ممنوع
+        if cc > ema_tf and shorts:
+            shorts = []  # قیمت بالای EMA است → SHORT ممنوع
 
     # Build signal
     def build(direction, strategies, entry, sl, risk):
@@ -1925,36 +1675,19 @@ class SignalBot:
                         data = await r.json()
                         btc_p = next((float(x["lastPrice"]) for x in data if x.get("symbol") == "BTCUSDT"), 60000)
                         min_vol_usdt = MIN_BTC_VOLUME * btc_p
-                        max_vol_usdt = MAX_BTC_VOLUME * btc_p
-                        
+
                         for x in data:
                             sym = x["symbol"]
                             # فقط کریپتوهای USDT
                             if not sym.endswith("USDT"):
                                 continue
-                            
-                            # فیلتر نمادهای مجاز (اگر تنظیم شده باشد)
-                            if ALLOWED_SYMBOLS and sym not in ALLOWED_SYMBOLS:
-                                continue
-                            
+
                             qv = float(x.get("quoteVolume", 0))
-                            if qv >= min_vol_usdt and qv <= max_vol_usdt:
+                            if qv >= min_vol_usdt:
                                 syms.append(sym)
                                 vols[sym] = qv
-                        LOGGER.info("{} crypto symbols loaded from Binance.".format(len(syms)))
-                        
-                        # Filter: minimum 24h volume in USDT
-                        # Filter: minimum volume relative to BTC
-                        if MIN_VOLUME_RATIO_TO_BTC > 0:
-                            btc_vol = vols.get("BTCUSDT", 0)
-                            if btc_vol > 0:
-                                min_vol = btc_vol * MIN_VOLUME_RATIO_TO_BTC
-                                syms = [s for s in syms if vols.get(s, 0) >= min_vol]
-                                LOGGER.info("{} symbols after BTC volume filter (min: {:,.0f} USDT = {}% of BTC)".format(
-                                    len(syms), min_vol, int(MIN_VOLUME_RATIO_TO_BTC * 100)))
-                            syms = [s for s in syms if vols.get(s, 0) >= MIN_24H_VOLUME_USDT]
-                            LOGGER.info("{} symbols after 24h volume filter (min: {:,.0f} USDT)".format(
-                                len(syms), MIN_24H_VOLUME_USDT))
+                        LOGGER.info("{} crypto symbols loaded from Binance (24h vol > {} BTC = {:,.0f} USDT).".format(
+                            len(syms), MIN_BTC_VOLUME, min_vol_usdt))
                     else:
                         LOGGER.error("Failed to fetch Binance 24hr ticker: HTTP {}".format(r.status))
             except Exception as e:
@@ -1983,11 +1716,9 @@ class SignalBot:
                             if price > 0:
                                 paxg_symbol = "PAXGUSDT"
                                 if paxg_symbol not in syms:
-                                    # فقط اگر در لیست مجاز باشد یا لیست مجاز خالی باشد
-                                    if not ALLOWED_SYMBOLS or paxg_symbol in ALLOWED_SYMBOLS:
-                                        syms.append(paxg_symbol)
-                                        vols[paxg_symbol] = volume_24h
-                                        LOGGER.info("PAX Gold added from CMC: price=${:,.2f}, vol=${:,.0f}".format(price, volume_24h))
+                                    syms.append(paxg_symbol)
+                                    vols[paxg_symbol] = volume_24h
+                                    LOGGER.info("PAX Gold added from CMC: price=${:,.2f}, vol=${:,.0f}".format(price, volume_24h))
                         else:
                             LOGGER.warning("CMC API returned HTTP {}".format(r.status))
                 except Exception as e:
@@ -2215,11 +1946,11 @@ class SignalBot:
         # Filter: minimum AI confidence
         # AI filter only applies when the model is actually trained
         # (untrained model always returns 0.50 and would block everything)
-        if self.ai.is_trained and prob < MIN_AI_CONFIDENCE:
-            LOGGER.info("AI confidence too low for {}: {:.1%} < {:.1%} (min required)".format(
-                symbol, prob, MIN_AI_CONFIDENCE))
+        if prob < MIN_AI_CONFIDENCE and (self.ai.is_trained or AI_FILTER_UNTRAINED):
+            LOGGER.info("AI confidence too low for {}: {:.1%} < {:.1%} (min required{})".format(
+                symbol, prob, MIN_AI_CONFIDENCE, "" if self.ai.is_trained else " — untrained AI"))
             return
-        if not self.ai.is_trained:
+        if not self.ai.is_trained and not AI_FILTER_UNTRAINED:
             LOGGER.info("AI not trained yet ({}). Skipping AI confidence filter for {}.".format(
                 "need {} feedbacks".format(self.ai.min_samples), symbol))
         
@@ -2301,12 +2032,6 @@ class SignalBot:
             self._last_signal_time = {}
         self._last_signal_time["{}_{}".format(symbol, signal["direction"])] = time.time()
 
-        # Register for DI-cross early exit alert (Strategy 1 upgrade 6)
-        if S1_DI_EXIT_ALERT and "RSI+DMI" in signal.get("strategy", ""):
-            if not hasattr(self, "_di_watch"):
-                self._di_watch = {}
-            self._di_watch[symbol] = {"direction": signal["direction"], "time": time.time(), "alerted": False}
-
         await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf, ob_quality_reason)
 
     async def scanner_loop(self):
@@ -2363,33 +2088,6 @@ class SignalBot:
                         k1d = await fetch_klines(session, symbol, "1d")
                         htf_s, htf_r = htf_sr(k4h, k1d)
 
-                        # DI-cross early exit alert for open Strategy-1 signals
-                        watch = getattr(self, "_di_watch", {}).get(symbol)
-                        if S1_DI_EXIT_ALERT and watch and k4h and len(k4h) > 40:
-                            if time.time() - watch["time"] > 86400:
-                                self._di_watch.pop(symbol, None)
-                            elif not watch["alerted"]:
-                                _wH = [float(k[2]) for k in k4h[:-1]]
-                                _wL = [float(k[3]) for k in k4h[:-1]]
-                                _wC = [float(k[4]) for k in k4h[:-1]]
-                                _wp, _wm, _wa = calc_dmi(_wH, _wL, _wC)
-                                crossed = (watch["direction"] == "LONG" and _wm > _wp) or \
-                                          (watch["direction"] == "SHORT" and _wp > _wm)
-                                if crossed:
-                                    try:
-                                        await self.tg.send(
-                                            "⚠️ *Early Exit Alert | هشدار خروج زودهنگام*\n\n"
-                                            "Symbol: `{}`\n"
-                                            "Direction: *{}*\n"
-                                            "DI Cross on 4H — momentum reversed!\n"
-                                            "+DI: `{:.1f}` | -DI: `{:.1f}`\n\n"
-                                            "کراس DI در تایم ۴ ساعته — مومنتوم برگشته. خروج دستی را بررسی کن.".format(
-                                                symbol, watch["direction"], _wp, _wm))
-                                        watch["alerted"] = True
-                                        LOGGER.info("DI exit alert sent for {} {}".format(symbol, watch["direction"]))
-                                    except Exception as e:
-                                        LOGGER.error("DI exit alert error: " + str(e))
-
                         # Filter: allowed timeframes only
                         for interval in ALLOWED_TIMEFRAMES:
                             klines = await fetch_klines(session, symbol, interval)
@@ -2420,19 +2118,6 @@ class SignalBot:
 
                             h4_trend, h4_levels, h4_ob = analyze_4h_direction(k4h_data)
                             h1_trend, h1_breaks, h1_fvg, h1_liq, h1_ob = analyze_1h_structure(k1h_data)
-
-                            # Filter: MTF DMI confirmation for Strategy 1 (RSI+DMI)
-                            if S1_MTF_CONFIRM and "RSI+DMI" in sig.get("strategy", "") and k4h_data and len(k4h_data) > 40:
-                                _H4 = [float(k[2]) for k in k4h_data[:-1]]
-                                _L4 = [float(k[3]) for k in k4h_data[:-1]]
-                                _C4 = [float(k[4]) for k in k4h_data[:-1]]
-                                _p4, _m4, _a4 = calc_dmi(_H4, _L4, _C4)
-                                if sig["direction"] == "LONG" and _p4 <= _m4:
-                                    LOGGER.info("MTF filter rejected LONG {}: 4h DMI bearish".format(symbol))
-                                    continue
-                                if sig["direction"] == "SHORT" and _m4 <= _p4:
-                                    LOGGER.info("MTF filter rejected SHORT {}: 4h DMI bullish".format(symbol))
-                                    continue
 
                             await self.process_signal(session, symbol, interval, sig, h4_trend, h1_trend, h1_ob, h1_fvg, h1_liq)
                             await asyncio.sleep(0.02)
