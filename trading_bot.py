@@ -388,8 +388,25 @@ def weekly_move_score(klines):
         if atr_pct >= 4: reasons.append("High volatility | نوسان بالا")
         if vol_ratio >= 1.3: reasons.append("Volume surge | جهش حجم")
         if breakout >= 0.6: reasons.append("Near breakout | نزدیک شکست")
+        # 5) جهت احتمالی حرکت: EMA20 روزانه + تغییر ۷ روزه
+        ema20 = sum(C[-20:]) / 20 if len(C) >= 20 else sum(C) / len(C)
+        ch7 = (cc / C[-8] - 1) * 100 if len(C) >= 8 else 0.0
+        up_votes = 0
+        down_votes = 0
+        if cc > ema20: up_votes += 1
+        else: down_votes += 1
+        if ch7 > 0: up_votes += 1
+        elif ch7 < 0: down_votes += 1
+        # حجم در جهت: اگر حجم رشد کرده و قیمت بالا/پایین رفته
+        if vol_ratio >= 1.2:
+            if ch7 > 0: up_votes += 1
+            elif ch7 < 0: down_votes += 1
+        if up_votes > down_votes: direction = "UP"
+        elif down_votes > up_votes: direction = "DOWN"
+        else: direction = "NEUTRAL"
         return {"score": score, "atr_pct": atr_pct, "squeeze": squeeze,
-                "vol_ratio": vol_ratio, "breakout": breakout, "price": cc, "reasons": reasons}
+                "vol_ratio": vol_ratio, "breakout": breakout, "price": cc, "reasons": reasons,
+                "direction": direction, "ch7": ch7}
     except Exception:
         return None
 
@@ -2226,16 +2243,30 @@ class SignalBot:
                                 _ranked.sort(key=lambda x: x[1]["score"], reverse=True)
                                 _lines = ["📊 *Weekly Report | گزارش هفتگی*\n"]
 
-                                # 🔥 بخش ۱: کوین‌های آماده حرکت
+                                # 🔥 بخش ۱: کوین‌های آماده حرکت — جدا شده به صعودی / نزولی
                                 _top = _ranked[:WEEKLY_TOP_N]
                                 if _top:
-                                    _lines.append("*Ready to move | آماده حرکت:*\n")
-                                    for _sym, _sc in _top:
-                                        _bar = "🔥" if _sc["score"] >= 0.6 else ("⚡" if _sc["score"] >= 0.4 else "📈")
+                                    def _fmt_coin(_sym, _sc):
+                                        _bar = "🔥" if _sc["score"] >= 0.6 else ("⚡" if _sc["score"] >= 0.4 else "📊")
                                         _rs = " + ".join(_sc["reasons"]) if _sc["reasons"] else "—"
-                                        _lines.append(
-                                            "{} `{}` — {:.0%} | ATR {:.1f}% | Vol x{:.1f}\n"
-                                            "   {}\n".format(_bar, _sym, _sc["score"], _sc["atr_pct"], _sc["vol_ratio"], _rs))
+                                        return ("{} `{}` — {:.0%} | ATR {:.1f}% | Vol x{:.1f} | 7d {:+.1f}%\n"
+                                                "   {}\n".format(_bar, _sym, _sc["score"], _sc["atr_pct"],
+                                                                 _sc["vol_ratio"], _sc.get("ch7", 0.0), _rs))
+                                    _ups = [(s, c) for s, c in _top if c.get("direction") == "UP"]
+                                    _downs = [(s, c) for s, c in _top if c.get("direction") == "DOWN"]
+                                    _neuts = [(s, c) for s, c in _top if c.get("direction") not in ("UP", "DOWN")]
+                                    if _ups:
+                                        _lines.append("🚀 *Ready to pump | آماده صعود:*\n")
+                                        for _sym, _sc in _ups:
+                                            _lines.append(_fmt_coin(_sym, _sc))
+                                    if _downs:
+                                        _lines.append("🔻 *Ready to dump | آماده نزول:*\n")
+                                        for _sym, _sc in _downs:
+                                            _lines.append(_fmt_coin(_sym, _sc))
+                                    if _neuts:
+                                        _lines.append("➖ *Direction unclear | جهت نامشخص:*\n")
+                                        for _sym, _sc in _neuts:
+                                            _lines.append(_fmt_coin(_sym, _sc))
 
                                 # 🆕 بخش ۲: کوین‌های جدید
                                 if _new:
