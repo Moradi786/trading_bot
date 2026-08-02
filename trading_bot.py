@@ -459,7 +459,7 @@ EXCHANGES = [
     {
         "name": "Bitget Futures",
         "limiter": bitget_limiter,
-        "url": _ob_url(BITGET_FUTURES_DEPTH_URL, "?symbol={symbol}_UMCBL&limit={limit}&productType=USDT-FUTURES"),
+        "url": _ob_url(BITGET_FUTURES_DEPTH_URL, "?symbol={symbol}&limit={limit}&productType=USDT-FUTURES"),
         "parser": lambda d: _parse_bitget_ob(d)
     },
     {
@@ -1680,7 +1680,61 @@ class SignalBot:
                         LOGGER.error("Failed to fetch Binance 24hr ticker: HTTP {}".format(r.status))
             except Exception as e:
                 LOGGER.error("Binance symbol fetch error: " + str(e))
-            
+
+            # === ۱.ب) Fallback: اگر Binance بلاک بود، از Bybit ===
+            if not syms:
+                try:
+                    bybit_url = os.getenv("BYBIT_TICKERS_URL", "https://api.bybit.com/v5/market/tickers?category=linear")
+                    async with session.get(bybit_url, timeout=15) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            items = data.get("result", {}).get("list", [])
+                            btc_p = next((float(x["lastPrice"]) for x in items if x.get("symbol") == "BTCUSDT"), 60000)
+                            min_vol_usdt = MIN_BTC_VOLUME * btc_p
+                            for x in items:
+                                sym = x.get("symbol", "")
+                                if not sym.endswith("USDT"):
+                                    continue
+                                qv = float(x.get("turnover24h", 0) or 0)
+                                if qv >= min_vol_usdt:
+                                    syms.append(sym)
+                                    vols[sym] = qv
+                            LOGGER.info("{} crypto symbols loaded from Bybit fallback (24h vol > {} BTC = {:,.0f} USDT).".format(
+                                len(syms), MIN_BTC_VOLUME, min_vol_usdt))
+                        else:
+                            LOGGER.error("Bybit ticker fallback failed: HTTP {}".format(r.status))
+                except Exception as e:
+                    LOGGER.error("Bybit symbol fallback error: " + str(e))
+
+            # === ۱.ج) Fallback دوم: اگر Bybit هم نشد، از OKX ===
+            if not syms:
+                try:
+                    okx_url = os.getenv("OKX_TICKERS_URL", "https://www.okx.com/api/v5/market/tickers?instType=SWAP")
+                    async with session.get(okx_url, timeout=15) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            items = data.get("data", [])
+                            btc_p = next((float(x["last"]) for x in items if x.get("instId") == "BTC-USDT-SWAP"), 60000)
+                            min_vol_usdt = MIN_BTC_VOLUME * btc_p
+                            for x in items:
+                                inst = x.get("instId", "")
+                                if not inst.endswith("-USDT-SWAP"):
+                                    continue
+                                sym = inst.replace("-USDT-SWAP", "USDT")
+                                try:
+                                    qv = float(x.get("volCcy24h", 0) or 0) * float(x.get("last", 0) or 0)
+                                except Exception:
+                                    qv = 0.0
+                                if qv >= min_vol_usdt:
+                                    syms.append(sym)
+                                    vols[sym] = qv
+                            LOGGER.info("{} crypto symbols loaded from OKX fallback (24h vol > {} BTC = {:,.0f} USDT).".format(
+                                len(syms), MIN_BTC_VOLUME, min_vol_usdt))
+                        else:
+                            LOGGER.error("OKX ticker fallback failed: HTTP {}".format(r.status))
+                except Exception as e:
+                    LOGGER.error("OKX symbol fallback error: " + str(e))
+
             # === ۲. گرفتن PAX Gold از CoinMarketCap ===
             if COINMARKETCAP_API_KEY:
                 try:
