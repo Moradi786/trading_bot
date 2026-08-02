@@ -108,9 +108,6 @@ FILTER_BTC_TREND = os.getenv("FILTER_BTC_TREND", "true").lower() == "true"
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "240"))
 # فیلتر AI حتی وقتی مدل هنوز آموزش ندیده — سیگنال با امتیاز زیر حد ارسال نمی‌شود
 AI_FILTER_UNTRAINED = os.getenv("AI_FILTER_UNTRAINED", "true").lower() == "true"
-# فیلتر ترند سراسری: LONG فقط بالای EMA / SHORT فقط زیر EMA (همه استراتژی‌ها)
-TREND_FILTER_ENABLED = os.getenv("TREND_FILTER_ENABLED", "true").lower() == "true"
-TREND_FILTER_EMA = int(os.getenv("TREND_FILTER_EMA", "50"))
 
 # ============ NEWS FILTERS | فیلتر خبرها ============
 # ⛔ توقف سیگنال موقع خبرهای بزرگ (FOMC خودکار + خبرهای دستی)
@@ -178,7 +175,6 @@ S2_SR_PROXIMITY_PCT = float(os.getenv("S2_SR_PROXIMITY_PCT", "1.5"))  # فاصل
 S3_SMA7_FILTER = os.getenv("S3_SMA7_FILTER", "true").lower() == "true"  # شکست فقط در جهت SMA7
 S3_VOLUME_RATIO = float(os.getenv("S3_VOLUME_RATIO", "1.5"))            # حداقل ضریب حجم شکست
 
-MAX_SIGNAL_AGE = 600
 MAX_SLIPPAGE = 1.0
 
 OB_MIN_BIDS = 5
@@ -1207,12 +1203,6 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     V = [float(k[5]) for k in closed]
     live = float(klines[-1][4])
 
-    current_time_ms = int(time.time() * 1000)
-    candle_start_ms = int(klines[-1][0])
-    elapsed = (current_time_ms - candle_start_ms) / 1000.0
-    if elapsed > MAX_SIGNAL_AGE:
-        return None
-
     # Calculate all indicators
     rsi = calc_rsi(C)
     atr = calc_atr(H, L, C)
@@ -1222,10 +1212,9 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     co, ch, cl, cc, cv = O[-1], H[-1], L[-1], C[-1], V[-1]
     bb = min(co, cc); bt = max(co, cc)
     body = abs(cc - co); rng = ch - cl
-    if rng == 0 or body == 0 or atr == 0: return None
+    if rng == 0 or body == 0 or atr == 0: return None  # محافظ ریاضی — بدون این تقسیم بر صفر می‌شود
     uw = ch - bt; lw = bb - cl
-    spread_pct = (rng / cl) * 100
-    if spread_pct > 5.0: return None
+    spread_pct = (rng / cl) * 100  # فقط برای فیچر AI — فیلتر نیست
 
     ph, pl = find_pivots(H, L)
     trend = dow_trend(ph, pl)
@@ -1335,17 +1324,6 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
     if s2_short: shorts.append("Candle Setup")
     if s3_short: shorts.append("HH/LL Breakout")
 
-    # ==========================================================
-    # Global trend filter: LONG only above EMA / SHORT only below EMA
-    # فیلتر ترند سراسری — جلوی سیگنال خلاف ترند را می‌گیرد
-    # ==========================================================
-    if TREND_FILTER_ENABLED and len(C) >= TREND_FILTER_EMA + 5:
-        ema_tf = calc_ema(C, TREND_FILTER_EMA)
-        if cc < ema_tf and longs:
-            longs = []   # قیمت زیر EMA است → LONG ممنوع
-        if cc > ema_tf and shorts:
-            shorts = []  # قیمت بالای EMA است → SHORT ممنوع
-
     # Build signal
     def build(direction, strategies, entry, sl, risk):
         sl_pct = (risk / entry) * 100 if entry > 0 else 999
@@ -1447,14 +1425,24 @@ class TelegramManager:
                 str(gemini_result.get('analysis_summary', 'N/A'))
             )
 
+        # فشار خریدار/فروشنده بر اساس عدم تعادل اردربوک
+        _imb_val = ob_data['imbalance']
+        if _imb_val >= 0.3:
+            ob_pressure = "خریدارها زیادتر هستند 🟢"
+        elif _imb_val <= -0.3:
+            ob_pressure = "فروشنده‌ها زیادتر هستند 🔴"
+        else:
+            ob_pressure = "خریدار و فروشنده تقریباً برابر هستند ⚪"
+
         msg = (
-            "🚨 *NEW TRADING SIGNAL*\n"
-            "🪙 *Symbol |* `#{symbol}`        🤖 *AI |* {conf} `{ai}`\n"
-            "📊 *Direction |* {direction} {emoji}\n"
+            "🚨 *NEW TRADING SIGNAL* 🚨\n"
+            "🪙 *Symbol |* `#{symbol}` |  {direction} {emoji} | {interval}\n"
+            "🤖 *AI |* {conf} `{ai}`      💵 *Entry Price |* `{entry}`\n"
             "🎯 *Strategy |* {strategy}\n"
-            "⏱️ *Timeframe |* {interval}\n"
-            "💵 *Entry Price |* `{entry}`\n"
-            "📖 *Order Book |* Imb `{imb}` | Depth `{bid:,.0f}`/`{ask:,.0f}` | {src}"
+            "📖 *Order Book*\n"
+            "├ ⚖️ Imbalance | `{imb}`\n"
+            "├ 📊 Depth | `{bid:,.0f}` / `{ask:,.0f}`\n"
+            "└ 💪 فشار | {pressure}"
         ).format(
             symbol=symbol,
             direction=signal['direction'], emoji=dir_emoji,
@@ -1464,7 +1452,7 @@ class TelegramManager:
             conf=conf_emoji, ai="{:.0%}".format(ai_prob),
             imb="{:.2f}".format(ob_data['imbalance']),
             bid=ob_data['bid_depth'], ask=ob_data['ask_depth'],
-            src=str(ob_data.get('source', 'unknown'))
+            pressure=ob_pressure
         )
 
         kb = InlineKeyboardMarkup([
