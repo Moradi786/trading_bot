@@ -1404,12 +1404,12 @@ class TelegramManager:
         target = chat_id if chat_id is not None else self.chat_id
         for i in range(retries):
             try:
-                await self.bot.send_message(chat_id=target, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-                return True
+                m = await self.bot.send_message(chat_id=target, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+                return m
             except Exception as e:
                 if i == retries - 1:
                     LOGGER.error("TG error: " + str(e))
-                    return False
+                    return None
                 await asyncio.sleep(2 ** i)
 
     async def notify_signal(self, signal, symbol, interval, ai_prob, ai_conf, ob_data, btc_trend, alert_id, gemini_result=None, ob_conf_score=None, ob_quality_status=None):
@@ -1483,7 +1483,16 @@ class TelegramManager:
 
     async def notify_feedback(self, alert_id, feedback_type):
         label = "Good signal (AI learning) ✅ | سیگنال خوب (یادگیری AI)" if feedback_type == "good" else "Bad signal (AI learning) ❌ | سیگنال بد (یادگیری AI)"
-        await self.send("Feedback recorded | بازخورد ثبت شد: " + label)
+        m = await self.send("Feedback recorded | بازخورد ثبت شد: " + label)
+        # 🗑️ بعد از ۳ ثانیه خودش حذف شود تا چت پر نشود
+        if m:
+            async def _auto_delete(msg):
+                await asyncio.sleep(3)
+                try:
+                    await self.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
+                except Exception:
+                    pass
+            asyncio.create_task(_auto_delete(m))
 
 
     async def command_listener(self):
