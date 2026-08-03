@@ -87,6 +87,20 @@ DB_NAME = "signal_bot.db"
 MODEL_PATH = "ai_model.joblib"
 SCALER_PATH = "ai_scaler.joblib"
 
+# ============ ☁️ TURSO CLOUD DATABASE | دیتابیس ابری (دائمی - پاک نمی‌شود) ============
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
+_turso_client = None
+if USE_TURSO:
+    try:
+        import libsql_client
+        _turso_client = libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+        LOGGER.info("Turso cloud database connected | دیتابیس ابری Turso وصل شد ✅")
+    except Exception as _te:
+        LOGGER.error("Turso connect failed, using local DB: " + str(_te))
+        USE_TURSO = False
+
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
 # فیلتر کوین‌ها: فقط حجم ۲۴ ساعته بالاتر از این مقدار BTC
@@ -211,6 +225,9 @@ GOLD_SYMBOLS = ["PAXGUSDT", "XAUTUSDT"]
 # 1. Async Database
 # ==========================================================
 def _sync_execute(query: str, params: tuple = ()):
+    if USE_TURSO and _turso_client:
+        rs = _turso_client.execute(query, list(params))
+        return [tuple(r) for r in rs.rows]
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(query, params)
@@ -218,6 +235,9 @@ def _sync_execute(query: str, params: tuple = ()):
         return cursor.fetchall()
 
 def _sync_fetch_df(query: str, params: tuple = ()) -> pd.DataFrame:
+    if USE_TURSO and _turso_client:
+        rs = _turso_client.execute(query, list(params))
+        return pd.DataFrame(list(rs.rows), columns=list(rs.columns))
     with sqlite3.connect(DB_NAME) as conn:
         return pd.read_sql_query(query, conn, params=params)
 
@@ -1700,6 +1720,14 @@ class SignalBot:
     async def start(self):
         await init_database()
         asyncio.create_task(self.tg.command_listener())
+        # 🧠 اگر مدل AI پاک شده (deploy جدید) ولی تاریخچه فیدبک در دیتابیس هست، دوباره آموزش بده
+        if not self.ai.is_trained:
+            try:
+                _ok = await self.ai.retrain()
+                if _ok:
+                    LOGGER.info("AI re-trained from saved feedback history after restart 🧠✅")
+            except Exception as _re:
+                LOGGER.warning("AI startup retrain skipped: " + str(_re))
         LOGGER.info("Signal Bot ready. Mode: CRYPTO + PAXG GOLD ONLY + AI Learning from Feedback")
 
     async def get_symbols(self, session):
