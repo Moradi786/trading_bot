@@ -95,7 +95,13 @@ _turso_client = None
 if USE_TURSO:
     try:
         import libsql_client
-        _turso_client = libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+        # آدرس libsql:// و wss:// را به https:// تبدیل کن (اتصال HTTP پایدارتر است)
+        _turso_url = TURSO_DATABASE_URL.strip()
+        if _turso_url.startswith("libsql://"):
+            _turso_url = "https://" + _turso_url[len("libsql://"):]
+        elif _turso_url.startswith("wss://"):
+            _turso_url = "https://" + _turso_url[len("wss://"):]
+        _turso_client = libsql_client.create_client_sync(url=_turso_url, auth_token=TURSO_AUTH_TOKEN)
         LOGGER.info("Turso cloud database connected | دیتابیس ابری Turso وصل شد ✅")
     except Exception as _te:
         LOGGER.error("Turso connect failed, using local DB: " + str(_te))
