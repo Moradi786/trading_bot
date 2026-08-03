@@ -1632,6 +1632,33 @@ class TelegramManager:
                                 await db_execute("UPDATE bot_stats SET value = value + 1 WHERE key = 'feedback_{}'".format(fb_type))
                                 await self.notify_feedback(alert_id, fb_type)
 
+                                # 🏷️ علامت‌گذاری روی خود پیام سیگنال تا معلوم شود فیدبک خورده
+                                try:
+                                    _orig = cq.message.text or ""
+                                    _mark = "✅ *Feedback: Good | فیدبک: خوب*" if fb_type == "good" else "❌ *Feedback: Bad | فیدبک: بد*"
+                                    if "Feedback:" in _orig:
+                                        _new_text = _orig.split("────────────────")[0].rstrip() + "\n────────────────\n" + _mark
+                                    else:
+                                        _new_text = _orig + "\n────────────────\n" + _mark
+                                    await self.bot.edit_message_text(
+                                        chat_id=cq.message.chat_id,
+                                        message_id=cq.message.message_id,
+                                        text=_new_text,
+                                        parse_mode="Markdown"
+                                    )
+                                    # دکمه‌های ✅/❌ را بردار، فقط TradingView بماند
+                                    try:
+                                        _tv_row = cq.message.reply_markup.inline_keyboard[0]
+                                        await self.bot.edit_message_reply_markup(
+                                            chat_id=cq.message.chat_id,
+                                            message_id=cq.message.message_id,
+                                            reply_markup=InlineKeyboardMarkup([_tv_row])
+                                        )
+                                    except Exception:
+                                        pass
+                                except Exception as _ee:
+                                    LOGGER.warning("Could not mark signal message: {}".format(_ee))
+
                                 # Trigger AI retrain
                                 asyncio.create_task(self.ai_engine.retrain())
 
