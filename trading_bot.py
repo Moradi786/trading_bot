@@ -91,21 +91,61 @@ SCALER_PATH = "ai_scaler.joblib"
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
-_turso_client = None
+_turso_http_url = None
 if USE_TURSO:
     try:
-        import libsql_client
-        # آدرس libsql:// و wss:// را به https:// تبدیل کن (اتصال HTTP پایدارتر است)
-        _turso_url = TURSO_DATABASE_URL.strip()
-        if _turso_url.startswith("libsql://"):
-            _turso_url = "https://" + _turso_url[len("libsql://"):]
-        elif _turso_url.startswith("wss://"):
-            _turso_url = "https://" + _turso_url[len("wss://"):]
-        _turso_client = libsql_client.create_client_sync(url=_turso_url, auth_token=TURSO_AUTH_TOKEN)
-        LOGGER.info("Turso cloud database connected | دیتابیس ابری Turso وصل شد ✅")
+        import urllib.request as _urllib_req
+        # آدرس را به https:// تبدیل کن — اتصال مستقیم HTTP (بدون WebSocket)
+        _u = TURSO_DATABASE_URL.strip()
+        for _scheme in ("libsql://", "wss://"):
+            if _u.startswith(_scheme):
+                _u = "https://" + _u[len(_scheme):]
+        _turso_http_url = _u.rstrip("/") + "/v2/pipeline"
+        LOGGER.info("Turso cloud database ready | دیتابیس ابری Turso آماده است ✅")
     except Exception as _te:
-        LOGGER.error("Turso connect failed, using local DB: " + str(_te))
+        LOGGER.error("Turso setup failed, using local DB: " + str(_te))
         USE_TURSO = False
+
+def _turso_arg(v):
+    """تبدیل مقدار پایتون به فرمت آرگومان Turso"""
+    if v is None: return {"type": "null"}
+    if isinstance(v, bool): return {"type": "integer", "value": "1" if v else "0"}
+    if isinstance(v, int): return {"type": "integer", "value": str(v)}
+    if isinstance(v, float): return {"type": "float", "value": v}
+    return {"type": "text", "value": str(v)}
+
+def _turso_val(cell):
+    """تبدیل مقدار برگشتی Turso به پایتون"""
+    t = cell.get("type")
+    if t == "null": return None
+    if t == "integer": return int(cell["value"])
+    if t == "float": return float(cell["value"])
+    return cell.get("value")
+
+def _turso_execute(query: str, params: tuple = ()):
+    """اجرای کوئری روی Turso از طریق HTTP pipeline — برمی‌گرداند (columns, rows)"""
+    import urllib.request, json as _json
+    body = _json.dumps({
+        "requests": [
+            {"type": "execute", "stmt": {"sql": query, "args": [_turso_arg(p) for p in params]}},
+            {"type": "close"}
+        ]
+    }).encode()
+    req = urllib.request.Request(
+        _turso_http_url, data=body,
+        headers={"Authorization": "Bearer " + TURSO_AUTH_TOKEN, "Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = _json.loads(resp.read().decode())
+    results = data.get("results", [])
+    r0 = results[0] if results else {}
+    if r0.get("type") == "error":
+        raise Exception("Turso SQL error: " + str(r0.get("error", {}).get("message")))
+    res = (r0.get("response") or {}).get("result") or {}
+    cols = [c.get("name") for c in res.get("cols", [])]
+    rows = [tuple(_turso_val(c) for c in row) for row in res.get("rows", [])]
+    return cols, rows
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 MAX_SL_PERCENT = 2.0
@@ -231,9 +271,9 @@ GOLD_SYMBOLS = ["PAXGUSDT", "XAUTUSDT"]
 # 1. Async Database
 # ==========================================================
 def _sync_execute(query: str, params: tuple = ()):
-    if USE_TURSO and _turso_client:
-        rs = _turso_client.execute(query, list(params))
-        return [tuple(r) for r in rs.rows]
+    if USE_TURSO and _turso_http_url:
+        _, rows = _turso_execute(query, params)
+        return rows
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(query, params)
@@ -241,9 +281,9 @@ def _sync_execute(query: str, params: tuple = ()):
         return cursor.fetchall()
 
 def _sync_fetch_df(query: str, params: tuple = ()) -> pd.DataFrame:
-    if USE_TURSO and _turso_client:
-        rs = _turso_client.execute(query, list(params))
-        return pd.DataFrame(list(rs.rows), columns=list(rs.columns))
+    if USE_TURSO and _turso_http_url:
+        cols, rows = _turso_execute(query, params)
+        return pd.DataFrame(rows, columns=cols)
     with sqlite3.connect(DB_NAME) as conn:
         return pd.read_sql_query(query, conn, params=params)
 
