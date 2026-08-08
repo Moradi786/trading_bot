@@ -247,6 +247,8 @@ OB_AUTO_FILTER_ENABLED = os.getenv("OB_AUTO_FILTER_ENABLED", "true").lower() == 
 OB_MIN_DEPTH_USDT = float(os.getenv("OB_MIN_DEPTH_USDT", "50000"))
 OB_MAX_STOP_HUNT_RISK = float(os.getenv("OB_MAX_STOP_HUNT_RISK", "0.6"))
 OB_MAX_SLIPPAGE_PCT = float(os.getenv("OB_MAX_SLIPPAGE_PCT", "0.3"))
+# حداکثر مجاز ریسک شکار استاپ در چک پایه validate_order_book (از .env قابل تنظیم)
+OB_STOP_HUNT_MAX = float(os.getenv("OB_STOP_HUNT_MAX", "0.7"))
 
 # 🧱 فیچر ۱: تشخیص دیوار (بزرگترین سفارش خرید/فروش)
 OB_WALL_FILTER = os.getenv("OB_WALL_FILTER", "true").lower() == "true"
@@ -485,6 +487,8 @@ async def fetch_klines(session, symbol, interval):
         exchanges_to_try = KLINES_EXCHANGES
 
     for ex in sorted(exchanges_to_try, key=lambda x: x["weight"], reverse=True):
+        if _binance_skip(ex):
+            continue
         try:
             await ex["limiter"].acquire()
             mi = ex["interval_map"].get(interval, interval)
@@ -496,6 +500,8 @@ async def fetch_klines(session, symbol, interval):
                     if klines and len(klines) >= 50:
                         ok, _ = validate_klines(klines, symbol)
                         if ok: return klines
+                elif r.status == 418:
+                    _mark_binance_banned()
         except: pass
         await asyncio.sleep(0.05)
     return None
@@ -560,6 +566,21 @@ OB_EXCHANGES = [e for e in EXCHANGES if "Spot" not in e["name"]]
 SPOT_OB_EXCHANGES = [e for e in EXCHANGES if "Spot" in e["name"]]
 LOGGER.info("Order book exchanges active: {}".format(", ".join(e["name"] for e in EXCHANGES)))
 
+# ⛔ Backoff اتوماتیک Binance وقتی ریتمیت (418) میشود — از ۵ دقیقه سکوت استفاده میکند
+BINANCE_BAN_SECONDS = int(os.getenv("BINANCE_BAN_SECONDS", "300"))
+_binance_ban_until = 0.0
+
+def _binance_skip(ex):
+    """بعد از 418، Binance را موقتاً رد کن و از بقیه صرافی‌ها استفاده کن"""
+    if "Binance" not in ex.get("name", ""):
+        return False
+    return time.time() < _binance_ban_until
+
+def _mark_binance_banned():
+    global _binance_ban_until
+    _binance_ban_until = time.time() + BINANCE_BAN_SECONDS
+    LOGGER.warning("Binance 418 → backoff {}s".format(BINANCE_BAN_SECONDS))
+
 def _parse_bybit_ob(data):
     try:
         if data.get("retCode") != 0: return [], []
@@ -604,6 +625,8 @@ async def fetch_order_book(session, symbol, limit=50):
         ob_to_try = OB_EXCHANGES
 
     for ex in ob_to_try:
+        if _binance_skip(ex):
+            continue
         for attempt in range(2):
             try:
                 await ex["limiter"].acquire()
@@ -617,6 +640,9 @@ async def fetch_order_book(session, symbol, limit=50):
                             return bids, asks, ex["name"]
                         else:
                             LOGGER.warning("{} OB shallow for {}: bids={}, asks={}".format(ex['name'], symbol, len(bids), len(asks)))
+                    elif r.status == 418:
+                        _mark_binance_banned()
+                        break
                     else:
                         LOGGER.warning("{} OB HTTP {} for {}".format(ex['name'], r.status, symbol))
             except Exception as e:
@@ -636,7 +662,7 @@ def validate_order_book(ob_data: dict, direction: str, symbol: str) -> Tuple[boo
         return False, "ob_against_long (imbalance: {:.2f})".format(imbalance)
     if direction == "SHORT" and imbalance > OB_MIN_IMBALANCE_CONF:
         return False, "ob_against_short (imbalance: {:.2f})".format(imbalance)
-    if ob_data["stop_hunt_risk"] > 0.7:
+    if ob_data["stop_hunt_risk"] > OB_STOP_HUNT_MAX:
         return False, "stop_hunt_risk_high ({})".format(ob_data['stop_hunt_risk'])
     return True, "ok"
 
