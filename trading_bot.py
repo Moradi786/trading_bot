@@ -160,6 +160,8 @@ MIN_BTC_VOLUME = float(os.getenv("MIN_BTC_VOLUME", "250.0"))
 MAX_DAILY_SIGNALS = int(os.getenv("MAX_DAILY_SIGNALS", "0"))
 # حداقل اطمینان AI برای ارسال سیگنال (0.0 - 1.0)
 MIN_AI_CONFIDENCE = float(os.getenv("MIN_AI_CONFIDENCE", "0.55"))
+# حداقل احتمال نهایی AI برای ارسال (فقط وقتی مدل آموزش دیده) — قابل تنظیم از .env
+MIN_AI_SEND_PROB = float(os.getenv("MIN_AI_SEND_PROB", "0.55"))
 # حداقل ADX (قدرت ترند) — 0 = غیرفعال
 MIN_ADX = float(os.getenv("MIN_ADX", "0"))
 # فیلتر جهت ترند بیت‌کوین (true/false)
@@ -2171,7 +2173,7 @@ class SignalBot:
         if mtf_reasons:
             LOGGER.info("MTF {}: {} | Adjustment: {:+.2f}".format(symbol, ", ".join(mtf_reasons), mtf_adjustment))
 
-        if prob < 0.55 and self.ai.is_trained:
+        if prob < MIN_AI_SEND_PROB and self.ai.is_trained:
             LOGGER.info("AI rejected {} (base: {:.2f}, mtf: {:+.2f}, final: {:.2f} — {})".format(
                 symbol, base_prob, mtf_adjustment, prob, conf_label))
             return
