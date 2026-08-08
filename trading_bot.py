@@ -242,7 +242,8 @@ MAX_SLIPPAGE = 1.0
 OB_MIN_BIDS = 5
 OB_MIN_ASKS = 5
 OB_MAX_SPREAD_PCT = 0.5
-OB_MIN_IMBALANCE_CONF = 0.15
+# آستانهٔ عدم تعادل اردربوک (قابل تنظیم از .env — برای دیتای Bitget باید بالاتر باشد)
+OB_MIN_IMBALANCE_CONF = float(os.getenv("OB_MIN_IMBALANCE_CONF", "0.15"))
 
 OB_QUALITY_MIN_SCORE = float(os.getenv("OB_QUALITY_MIN_SCORE", "0.45"))
 OB_AUTO_FILTER_ENABLED = os.getenv("OB_AUTO_FILTER_ENABLED", "true").lower() == "true"
