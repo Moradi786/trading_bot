@@ -325,6 +325,39 @@ async def init_database():
     ]
     for q in queries:
         await db_execute(q)
+    # 🛠️ مهاجرت خودکار: اگر جدول‌های قدیمی ستون‌های جدید را ندارند، اضافه کن
+    # (مثلاً جدول trade_features قدیمی ستون adx را نداشت و سیگنال ذخیره نمی‌شد)
+    _migrations = {
+        "trade_features": [
+            "rsi REAL", "spread_pct REAL", "vol_ratio REAL",
+            "lower_wick_ratio REAL", "upper_wick_ratio REAL", "trend_code INTEGER",
+            "adx REAL", "plus_di REAL", "minus_di REAL",
+            "price_to_sma7_ratio REAL", "atr_pct REAL", "orderbook_imbalance REAL",
+            "outcome INTEGER DEFAULT NULL",
+        ],
+        "signal_history": [
+            "interval TEXT", "direction TEXT", "strategy TEXT",
+            "entry_price REAL", "stop_loss REAL", "tp1 REAL", "tp2 REAL", "tp3 REAL",
+            "sl_percent REAL", "adx REAL", "ai_prob REAL", "ai_confidence TEXT",
+            "ob_imbalance REAL", "ob_slippage REAL", "ob_stop_hunt REAL",
+            "ob_iceberg_bids INTEGER", "ob_iceberg_asks INTEGER",
+            "ob_quality_score REAL", "ob_rejection_reason TEXT", "feedback TEXT DEFAULT NULL",
+        ],
+    }
+    for _t, _cols in _migrations.items():
+        try:
+            _existing = {_r[1] for _r in await db_execute("PRAGMA table_info({})".format(_t))}
+        except Exception as _e:
+            LOGGER.warning("Migration PRAGMA failed for {}: {}".format(_t, _e))
+            continue
+        for _col in _cols:
+            _name = _col.split(" ")[0]
+            if _name not in _existing:
+                try:
+                    await db_execute("ALTER TABLE {} ADD COLUMN {}".format(_t, _col))
+                    LOGGER.info("Migrated: added column {} to {}".format(_name, _t))
+                except Exception as _e:
+                    LOGGER.error("Migration ALTER failed {} {}: {}".format(_t, _name, _e))
     for k in ["total_signals","feedback_good","feedback_bad","ob_rejected","spread_rejected",
               "ob_quality_rejected","ob_depth_rejected","ob_stop_hunt_rejected","ob_slippage_rejected","volume_rejected"]:
         await db_execute("INSERT OR IGNORE INTO bot_stats (key, value) VALUES (?, 0)", (k,))
@@ -1064,7 +1097,15 @@ class ChartGenerator:
         return buf.getvalue()
 
 def klines_to_df(klines):
-    df = pd.DataFrame(klines, columns=["time", "open", "high", "low", "close", "volume", "_1", "_2", "_3", "_4", "_5", "_6"])
+    if not klines:
+        return pd.DataFrame()
+    # Binance ۱۲ ستون برمی‌گرداند ولی Bybit/OKX فقط ۶ ستون — هر دو را پشتیبانی کن
+    n = len(klines[0])
+    if n >= 6:
+        cols = ["time", "open", "high", "low", "close", "volume"] + ["_%d" % i for i in range(1, n - 5)]
+    else:
+        cols = ["time", "open", "high", "low", "close", "volume"][:n]
+    df = pd.DataFrame(klines, columns=cols)
     return df[["open", "high", "low", "close", "volume"]].astype(float)
 
 class ChartImageAnalyzer:
