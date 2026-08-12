@@ -271,6 +271,11 @@ OB_SPOOF_FILTER = os.getenv("OB_SPOOF_FILTER", "true").lower() == "true"
 # ==========================================================
 # نمادهای طلا که از CoinMarketCap گرفته می‌شوند
 GOLD_SYMBOLS = ["PAXGUSDT", "XAUTUSDT"]
+# سهم‌ها/کالاهای غیرکریپتو که نباید سیگنال بدهند (از .env قابل تنظیم — با کاما جدا)
+NON_CRYPTO_SYMBOLS = {s.strip().upper() for s in os.getenv(
+    "NON_CRYPTO_SYMBOLS",
+    "SOXL,SOX,XAG,XAU,CL,BZ,SPCX,SKHYNIX,KORU,SLX,QQQ,SPY,TSLA,NVDA,AAPL,AMZN"
+).split(",") if s.strip()}
 
 # ==========================================================
 # 1. Async Database
@@ -2272,6 +2277,7 @@ class SignalBot:
         self._last_signal_time["{}_{}".format(symbol, signal["direction"])] = time.time()
 
         await self.tg.notify_signal(signal, symbol, interval, prob, conf_label, ob, self.btc_trend, alert_id, gemini_result, ob_conf, ob_quality_reason)
+        return True  # ✅ سیگنال با موفقیت ارسال شد — برای جلوگیری از تکراری بین تایم‌فریم‌ها
 
     async def scanner_loop(self):
         async with aiohttp.ClientSession() as session:
@@ -2312,6 +2318,12 @@ class SignalBot:
                         # دوباره چک کن که فقط کریپتو و طلا باشد
                         if not (symbol.endswith("USDT") or symbol.endswith("BUSD") or symbol in GOLD_SYMBOLS):
                             LOGGER.debug("Skipping non-crypto/gold: {}".format(symbol))
+                            continue
+
+                        # رد کردن سهم‌ها و کالاهای غیرکریپتو — فقط کریپتو سیگنال بدهد
+                        _base = symbol.replace("USDT", "").replace("BUSD", "")
+                        if _base in NON_CRYPTO_SYMBOLS:
+                            LOGGER.debug("Skipping non-crypto stock/commodity: {}".format(symbol))
                             continue
 
                         # Slow-tier coins: only scanned on slow cycles
@@ -2358,7 +2370,10 @@ class SignalBot:
                             h4_trend, h4_levels, h4_ob = analyze_4h_direction(k4h_data)
                             h1_trend, h1_breaks, h1_fvg, h1_liq, h1_ob = analyze_1h_structure(k1h_data)
 
-                            await self.process_signal(session, symbol, interval, sig, h4_trend, h1_trend, h1_ob, h1_fvg, h1_liq)
+                            # فقط یک سیگنال برای هر کوین در هر سیکل (اولین تایم‌فریمی که رد شد)
+                            _sent = await self.process_signal(session, symbol, interval, sig, h4_trend, h1_trend, h1_ob, h1_fvg, h1_liq)
+                            if _sent:
+                                break
                             await asyncio.sleep(0.02)
 
                     symbols = await self.get_symbols(session)
