@@ -164,6 +164,8 @@ MIN_AI_CONFIDENCE = float(os.getenv("MIN_AI_CONFIDENCE", "0.55"))
 MIN_AI_SEND_PROB = float(os.getenv("MIN_AI_SEND_PROB", "0.55"))
 # حداقل ADX (قدرت ترند) — 0 = غیرفعال
 MIN_ADX = float(os.getenv("MIN_ADX", "0"))
+# فیلتر هم‌جهتی با روند 4H — سیگنال برخلاف روند بلندمدت فرستاده نشود (از .env)
+REQUIRE_MTF_ALIGNMENT = os.getenv("REQUIRE_MTF_ALIGNMENT", "true").lower() == "true"
 # فیلتر جهت ترند بیت‌کوین (true/false)
 FILTER_BTC_TREND = os.getenv("FILTER_BTC_TREND", "true").lower() == "true"
 # فاصله بین دو سیگنال یک کوین (به دقیقه)
@@ -2369,6 +2371,15 @@ class SignalBot:
 
                             h4_trend, h4_levels, h4_ob = analyze_4h_direction(k4h_data)
                             h1_trend, h1_breaks, h1_fvg, h1_liq, h1_ob = analyze_1h_structure(k1h_data)
+
+                            # 🎯 فیلتر کیفیت: سیگنال برخلاف روند 4H فرستاده نشود
+                            if REQUIRE_MTF_ALIGNMENT:
+                                if sig["direction"] == "LONG" and h4_trend == "BEARISH":
+                                    LOGGER.info("MTF alignment rejected {} LONG: 4H is BEARISH".format(symbol))
+                                    continue
+                                if sig["direction"] == "SHORT" and h4_trend == "BULLISH":
+                                    LOGGER.info("MTF alignment rejected {} SHORT: 4H is BULLISH".format(symbol))
+                                    continue
 
                             # فقط یک سیگنال برای هر کوین در هر سیکل (اولین تایم‌فریمی که رد شد)
                             _sent = await self.process_signal(session, symbol, interval, sig, h4_trend, h1_trend, h1_ob, h1_fvg, h1_liq)
