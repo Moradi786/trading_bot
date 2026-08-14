@@ -162,6 +162,12 @@ MAX_DAILY_SIGNALS = int(os.getenv("MAX_DAILY_SIGNALS", "0"))
 MIN_AI_CONFIDENCE = float(os.getenv("MIN_AI_CONFIDENCE", "0.55"))
 # حداقل احتمال نهایی AI برای ارسال (فقط وقتی مدل آموزش دیده) — قابل تنظیم از .env
 MIN_AI_SEND_PROB = float(os.getenv("MIN_AI_SEND_PROB", "0.55"))
+# ============ 🤖 خودآموزی خودکار ============
+# ربات خودش بر اساس قیمت، نتیجهٔ سیگنال‌ها را تشخیص می‌دهد و مدل AI را خودکار آموزش می‌دهد
+AUTO_LEARN_ENABLED = os.getenv("AUTO_LEARN_ENABLED", "true").lower() == "true"
+AUTO_LEARN_CHECK_MINUTES = int(os.getenv("AUTO_LEARN_CHECK_MINUTES", "5"))   # هر چند دقیقه بررسی شود
+AUTO_LEARN_MIN_MINUTES = int(os.getenv("AUTO_LEARN_MIN_MINUTES", "10"))      # حداقل سن سیگنال برای داوری
+AUTO_LEARN_MAX_HOURS = int(os.getenv("AUTO_LEARN_MAX_HOURS", "24"))          # بعد از این مدت با قیمت فعلی داوری شود
 # حداقل ADX (قدرت ترند) — 0 = غیرفعال
 MIN_ADX = float(os.getenv("MIN_ADX", "0"))
 # فیلتر هم‌جهتی با روند 4H — سیگنال برخلاف روند بلندمدت فرستاده نشود (از .env)
@@ -1851,7 +1857,90 @@ class SignalBot:
                     LOGGER.info("AI re-trained from saved feedback history after restart 🧠✅")
             except Exception as _re:
                 LOGGER.warning("AI startup retrain skipped: " + str(_re))
+        # 🤖 خودآموزی خودکار: ربات نتیجهٔ سیگنال‌ها را خودش تشخیص می‌دهد و مدل را آموزش می‌دهد
+        if AUTO_LEARN_ENABLED:
+            asyncio.create_task(self.auto_learn_loop())
         LOGGER.info("Signal Bot ready. Mode: CRYPTO + PAXG GOLD ONLY + AI Learning from Feedback")
+
+    async def auto_learn_loop(self):
+        """حلقهٔ خودآموزی: هر چند دقیقه نتیجهٔ سیگنال‌های باز را تشخیص می‌دهد و مدل را آموزش می‌دهد"""
+        if not AUTO_LEARN_ENABLED:
+            return
+        await asyncio.sleep(30)
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    await self.auto_label_signals(session)
+                except Exception as e:
+                    LOGGER.error("Auto learn loop: " + str(e))
+                await asyncio.sleep(AUTO_LEARN_CHECK_MINUTES * 60)
+
+    async def auto_label_signals(self, session):
+        """سیگنال‌های بدون نتیجه را با قیمت بازار برچسب‌گذاری می‌کند (برد/باخت) و مدل را آموزش می‌دهد"""
+        try:
+            rows = await db_execute(
+                "SELECT alert_id, symbol, interval, direction, entry_price, stop_loss, tp1, timestamp "
+                "FROM signal_history WHERE feedback IS NULL"
+            )
+        except Exception as e:
+            LOGGER.error("Auto learn query error: " + str(e))
+            return
+        labeled = 0
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            try:
+                alert_id, symbol, interval, direction = r[0], r[1], r[2], r[3]
+                entry = float(r[4] or 0); sl = float(r[5] or 0); tp1 = float(r[6] or 0)
+                try:
+                    ts_dt = datetime.fromisoformat(str(r[7]).replace("Z", "+00:00"))
+                    if ts_dt.tzinfo is None:
+                        ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                age_min = (now - ts_dt).total_seconds() / 60.0
+                if age_min < AUTO_LEARN_MIN_MINUTES:
+                    continue  # خیلی تازه — هنوز صبر کن
+                klines = await fetch_klines(session, symbol, interval)
+                if not klines:
+                    continue
+                start_ms = int(ts_dt.timestamp() * 1000)
+                after = [k for k in klines if int(k[0]) >= start_ms]
+                if not after:
+                    continue
+                outcome = None
+                fb = None
+                if direction == "LONG":
+                    for k in after:
+                        hi, lo = float(k[2]), float(k[3])
+                        if sl > 0 and lo <= sl:
+                            outcome, fb = 0, "bad"; break
+                        if tp1 > 0 and hi >= tp1:
+                            outcome, fb = 1, "good"; break
+                    if outcome is None and age_min > AUTO_LEARN_MAX_HOURS * 60 and entry > 0:
+                        outcome = 1 if float(after[-1][4]) > entry else 0
+                        fb = "good" if outcome else "bad"
+                else:
+                    for k in after:
+                        hi, lo = float(k[2]), float(k[3])
+                        if sl > 0 and hi >= sl:
+                            outcome, fb = 0, "bad"; break
+                        if tp1 > 0 and lo <= tp1:
+                            outcome, fb = 1, "good"; break
+                    if outcome is None and age_min > AUTO_LEARN_MAX_HOURS * 60 and entry > 0:
+                        outcome = 1 if float(after[-1][4]) < entry else 0
+                        fb = "good" if outcome else "bad"
+                if outcome is not None:
+                    await db_execute("UPDATE signal_history SET feedback = ? WHERE alert_id = ?", (fb, alert_id))
+                    await db_execute(
+                        "UPDATE trade_features SET outcome = ? WHERE id = (SELECT id FROM signal_history WHERE alert_id = ?)",
+                        (outcome, alert_id))
+                    labeled += 1
+                    LOGGER.info("Auto-learn labeled {} {} -> {} (outcome {})".format(symbol, direction, fb, outcome))
+            except Exception as e:
+                LOGGER.error("Auto learn row error: " + str(e))
+        if labeled > 0:
+            await self.ai.retrain()
+            LOGGER.info("AI retrained from {} auto-learned results 🧠".format(labeled))
 
     async def get_symbols(self, session):
         now = time.time()
@@ -2372,13 +2461,13 @@ class SignalBot:
                             h4_trend, h4_levels, h4_ob = analyze_4h_direction(k4h_data)
                             h1_trend, h1_breaks, h1_fvg, h1_liq, h1_ob = analyze_1h_structure(k1h_data)
 
-                            # 🎯 فیلتر کیفیت: سیگنال برخلاف روند 4H فرستاده نشود
+                            # 🎯 فیلتر کیفیت قوی: حداقل یکی از تایم‌فریم‌های بالاتر (4H یا 1H) باید هم‌جهت سیگنال باشد
                             if REQUIRE_MTF_ALIGNMENT:
-                                if sig["direction"] == "LONG" and h4_trend == "BEARISH":
-                                    LOGGER.info("MTF alignment rejected {} LONG: 4H is BEARISH".format(symbol))
+                                if sig["direction"] == "LONG" and h4_trend != "BULLISH" and h1_trend != "BULLISH":
+                                    LOGGER.info("MTF alignment rejected {} LONG: 4H={}, 1H={}".format(symbol, h4_trend, h1_trend))
                                     continue
-                                if sig["direction"] == "SHORT" and h4_trend == "BULLISH":
-                                    LOGGER.info("MTF alignment rejected {} SHORT: 4H is BULLISH".format(symbol))
+                                if sig["direction"] == "SHORT" and h4_trend != "BEARISH" and h1_trend != "BEARISH":
+                                    LOGGER.info("MTF alignment rejected {} SHORT: 4H={}, 1H={}".format(symbol, h4_trend, h1_trend))
                                     continue
 
                             # فقط یک سیگنال برای هر کوین در هر سیکل (اولین تایم‌فریمی که رد شد)
