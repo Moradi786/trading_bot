@@ -174,6 +174,8 @@ MIN_ADX = float(os.getenv("MIN_ADX", "0"))
 REQUIRE_MTF_ALIGNMENT = os.getenv("REQUIRE_MTF_ALIGNMENT", "true").lower() == "true"
 # فیلتر جهت ترند بیت‌کوین (true/false)
 FILTER_BTC_TREND = os.getenv("FILTER_BTC_TREND", "true").lower() == "true"
+# کوین‌هایی که برخلاف بیت‌کوین حرکت می‌کنند — از فیلتر روند BTC معاف‌اند (نام بدون USDT، با کاما)
+BTC_TREND_EXCEPTIONS = {s.strip().upper() for s in os.getenv("BTC_TREND_EXCEPTIONS", "").split(",") if s.strip()}
 # فاصله بین دو سیگنال یک کوین (به دقیقه)
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "240"))
 # فیلتر AI حتی وقتی مدل هنوز آموزش ندیده — سیگنال با امتیاز زیر حد ارسال نمی‌شود
@@ -229,6 +231,11 @@ ALLOWED_STRATEGIES = [s.strip() for s in ALLOWED_STRATEGIES_STR.split(",") if s.
 MIN_RSI_LONG = float(os.getenv("MIN_RSI_LONG", "0"))
 # فیلتر RSI: سیگنال SHORT فقط اگر RSI پایین این مقدار (0 = غیرفعال)
 MAX_RSI_SHORT = float(os.getenv("MAX_RSI_SHORT", "0"))
+# 🎯 فیلتر عبور RSI (خرید: رد شدن از آستانه به بالا / فروش برعکس) — 0 = غیرفعال
+RSI_LONG_CROSS = float(os.getenv("RSI_LONG_CROSS", "0"))    # خرید وقتی RSI از این رد شد به بالا
+RSI_LONG_BREAK = float(os.getenv("RSI_LONG_BREAK", "0"))    # خرید وقتی RSI از این بالا شکست
+RSI_SHORT_CROSS = float(os.getenv("RSI_SHORT_CROSS", "0"))  # فروش وقتی RSI از این رد شد به پایین
+RSI_SHORT_BREAK = float(os.getenv("RSI_SHORT_BREAK", "0"))  # فروش وقتی RSI از این پایین شکست
 
 # ==========================================================
 # Strategy 2 (Candle Setup) - قابل تنظیم از .env
@@ -245,7 +252,10 @@ S2_SR_PROXIMITY_PCT = float(os.getenv("S2_SR_PROXIMITY_PCT", "1.5"))  # فاصل
 S3_SMA7_FILTER = os.getenv("S3_SMA7_FILTER", "true").lower() == "true"  # شکست فقط در جهت SMA7
 S3_VOLUME_RATIO = float(os.getenv("S3_VOLUME_RATIO", "1.5"))            # حداقل ضریب حجم شکست
 
-MAX_SLIPPAGE = 1.0
+# تعداد استراتژی‌هایی که باید همزمان تأیید کنند تا سیگنال ارسال شود (2 = قوی‌تر و دقیق‌تر)
+VOTES_NEEDED = int(os.getenv("VOTES_NEEDED", "2"))
+# حداکثر فاصلهٔ قیمت لحظه‌ای از قیمت سیگنال (٪) — اگر قیمت جابه‌جا شده بود سیگنال ارسال نشود
+MAX_SLIPPAGE = float(os.getenv("MAX_SLIPPAGE", "0.5"))
 
 OB_MIN_BIDS = 5
 OB_MIN_ASKS = 5
@@ -284,6 +294,8 @@ NON_CRYPTO_SYMBOLS = {s.strip().upper() for s in os.getenv(
     "NON_CRYPTO_SYMBOLS",
     "SOXL,SOX,XAG,XAU,CL,BZ,SPCX,SKHYNIX,KORU,SLX,QQQ,SPY,TSLA,NVDA,AAPL,AMZN"
 ).split(",") if s.strip()}
+# فقط این کوین‌ها سیگنال بدهند (خالی = همه) — نام کوین بدون USDT، با کاما جدا
+ALLOWED_COINS = {s.strip().upper() for s in os.getenv("ALLOWED_COINS", "").split(",") if s.strip()}
 
 # ==========================================================
 # 1. Async Database
@@ -1371,6 +1383,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
 
     # Calculate all indicators
     rsi = calc_rsi(C)
+    rsi_prev = calc_rsi(C[:-1]) if len(C) > 15 else rsi
     atr = calc_atr(H, L, C)
     pdi, mdi, adx = calc_dmi(H, L, C)
     sma7 = sum(C[-7:]) / 7
@@ -1478,7 +1491,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
         s3_long = s3_short = False
 
     # ==========================================================
-    # Voting System (votes_needed=1 - any strategy triggers)
+    # Voting System (VOTES_NEEDED استراتژی باید همزمان تأیید کنند)
     # ==========================================================
     longs, shorts = [], []
 
@@ -1506,7 +1519,7 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
                 "strategy": " + ".join(strategies), "direction": direction,
                 "entry_price": entry, "stop_loss": round(sl, 5), "sl_percent": round(sl_pct, 2),
                 "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                "rsi": rsi, "adx": adx, "trend": trend, "sma7": round(sma7, 5),
+                "rsi": rsi, "rsi_prev": rsi_prev, "adx": adx, "trend": trend, "sma7": round(sma7, 5),
                 "atr": atr, "live": live, "vol_spike": vol_spike,
                 "lower_wick_ratio": round(lw / rng, 4), "upper_wick_ratio": round(uw / rng, 4),
                 "price_to_sma7_ratio": round(cc / sma7, 4), "atr_pct": round((atr / cc) * 100, 4),
@@ -1518,14 +1531,14 @@ def analyze_signal(klines, symbol, interval, htf_s, htf_r, h4_trend="NEUTRAL", h
             }
         return None
 
-    # votes_needed=1: any single strategy triggers
-    if longs:
+    # VOTES_NEEDED استراتژی باید همزمان تأیید کنند — سیگنال ضعیف رد می‌شود
+    if len(longs) >= VOTES_NEEDED:
         sl = max(cl, cc - 1.5 * atr)
         risk = cc - sl
         res = build("LONG", longs, cc, sl, risk)
         if res and abs((live - cc) / cc) * 100 <= MAX_SLIPPAGE:
             return res
-    if shorts:
+    if len(shorts) >= VOTES_NEEDED:
         sl = min(ch, cc + 1.5 * atr)
         risk = sl - cc
         res = build("SHORT", shorts, cc, sl, risk)
@@ -2214,10 +2227,14 @@ class SignalBot:
 
         LOGGER.info("OB ACCEPTED {} from {}: conf={:.2f}, imb={:.2f}".format(symbol, ob_source, ob_conf, ob['imbalance']))
         
-        # Filter: allowed strategies only
+        # Filter: allowed strategies only (عدد 1/2/3 یا نام استراتژی — هر دو قبول می‌شود)
         if ALLOWED_STRATEGIES:
             signal_strategies = signal.get("strategy", "").split(" + ")
-            if not any(s in ALLOWED_STRATEGIES for s in signal_strategies):
+            _strategy_map = {"1": "RSI+DMI Breakout", "2": "Candle Setup", "3": "HH/LL Breakout"}
+            _allowed = set()
+            for _s in ALLOWED_STRATEGIES:
+                _allowed.add(_strategy_map.get(_s, _s))
+            if not any(s in _allowed for s in signal_strategies):
                 LOGGER.info("Strategy filter rejected {}: {} not in allowed list".format(
                     symbol, signal.get("strategy", "")))
                 return
@@ -2289,16 +2306,29 @@ class SignalBot:
             LOGGER.info("AI not trained yet ({}). Skipping AI confidence filter for {}.".format(
                 "need {} feedbacks".format(self.ai.min_samples), symbol))
         
-        # Filter: RSI range check
-        if signal["direction"] == "LONG" and MIN_RSI_LONG > 0:
-            if signal["rsi"] < MIN_RSI_LONG:
-                LOGGER.info("RSI filter rejected LONG {}: RSI {:.1f} < {:.1f}".format(
-                    symbol, signal["rsi"], MIN_RSI_LONG))
+        # 🎯 فیلتر عبور RSI (خرید: رد شدن از ۳۲ به بالا یا شکست ۷۰ — فروش برعکس)
+        _rsi = signal.get("rsi", 50)
+        _rsi_prev = signal.get("rsi_prev", _rsi)
+        if signal["direction"] == "LONG":
+            if RSI_LONG_CROSS > 0:
+                _cross = _rsi_prev <= RSI_LONG_CROSS < _rsi
+                _break = RSI_LONG_BREAK > 0 and _rsi_prev <= RSI_LONG_BREAK < _rsi
+                if not (_cross or _break):
+                    LOGGER.info("RSI cross rejected LONG {}: RSI {:.1f}->{:.1f} (need cross>{} or break>{})".format(
+                        symbol, _rsi_prev, _rsi, RSI_LONG_CROSS, RSI_LONG_BREAK))
+                    return
+            elif MIN_RSI_LONG > 0 and _rsi < MIN_RSI_LONG:
+                LOGGER.info("RSI filter rejected LONG {}: RSI {:.1f} < {:.1f}".format(symbol, _rsi, MIN_RSI_LONG))
                 return
-        if signal["direction"] == "SHORT" and MAX_RSI_SHORT > 0:
-            if signal["rsi"] > MAX_RSI_SHORT:
-                LOGGER.info("RSI filter rejected SHORT {}: RSI {:.1f} > {:.1f}".format(
-                    symbol, signal["rsi"], MAX_RSI_SHORT))
+        if signal["direction"] == "SHORT":
+            if RSI_SHORT_CROSS > 0:
+                _cross = _rsi_prev >= RSI_SHORT_CROSS > _rsi
+                _break = RSI_SHORT_BREAK > 0 and _rsi_prev >= RSI_SHORT_BREAK > _rsi
+                if not (_cross or _break):
+                    LOGGER.info("RSI cross rejected SHORT {}: RSI {:.1f}->{:.1f}".format(symbol, _rsi_prev, _rsi))
+                    return
+            elif MAX_RSI_SHORT > 0 and _rsi > MAX_RSI_SHORT:
+                LOGGER.info("RSI filter rejected SHORT {}: RSI {:.1f} > {:.1f}".format(symbol, _rsi, MAX_RSI_SHORT))
                 return
         
         # Filter: minimum ADX
@@ -2417,6 +2447,11 @@ class SignalBot:
                             LOGGER.debug("Skipping non-crypto stock/commodity: {}".format(symbol))
                             continue
 
+                        # فقط کوین‌های مجاز (ALLOWED_COINS) — اگر خالی باشد همه مجازند
+                        if ALLOWED_COINS and _base not in ALLOWED_COINS:
+                            LOGGER.debug("Skipping {}: not in allowed coins".format(symbol))
+                            continue
+
                         # Slow-tier coins: only scanned on slow cycles
                         if symbol not in _fast_set and not _slow_cycle:
                             continue
@@ -2440,12 +2475,14 @@ class SignalBot:
                             if not sig:
                                 continue
 
-                            # Filter: BTC trend alignment (configurable)
+                            # Filter: BTC trend alignment (configurable) — با استثناها
                             if FILTER_BTC_TREND and symbol != "BTCUSDT":
-                                if sig["direction"] == "LONG" and self.btc_trend == "BEARISH":
-                                    continue
-                                if sig["direction"] == "SHORT" and self.btc_trend == "BULLISH":
-                                    continue
+                                _btc_ex = symbol.replace("USDT", "").replace("BUSD", "")
+                                if _btc_ex not in BTC_TREND_EXCEPTIONS:
+                                    if sig["direction"] == "LONG" and self.btc_trend == "BEARISH":
+                                        continue
+                                    if sig["direction"] == "SHORT" and self.btc_trend == "BULLISH":
+                                        continue
 
                             # Use rounded timestamp to prevent duplicate signals within 5 min window
                             ts_rounded = (int(klines[-2][0]) // 300000) * 300000
